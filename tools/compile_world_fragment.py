@@ -40,6 +40,7 @@ ASSETS = {
     'System/Gl/ARB_fragment_program/XREngine_Final5.fp': '04f4ac016bcb2d05ed6f8c59b0e388d09fd3360c12a2a2fd4d1d56abe1e02b8c',
     'System/Gl/ARB_fragment_program/XREngine_MulFilter.fp': '78e83bb6678b53ee9c2e79f79dc0b79d85a652289dbf7606e02c2e8758d0e3e3',
     'System/Gl/ARB_fragment_program/XREngine_ShadowProj.fp': 'f128ded198aa6c5313f8197d92537e80d05727e29ca4f2c5d25ae2731d49064f',
+    'System/Gl/ARB_fragment_program/TexEnvProj1.fp': '37436dd86a283197fe337255dd4e2be24a9c4d6f4bef16d3c71e22990e3ecb3b',
 }
 LANES = str.maketrans('rgba', 'xyzw')
 VARIANTS = {'XRShader_FP20_NDSP': [0], 'XRShader_FP20_NDS': [0], 'XRShader_MotionMap': [0], 'GUIFadeToWhite': [0],
@@ -50,6 +51,7 @@ VARIANTS = {'XRShader_FP20_NDSP': [0], 'XRShader_FP20_NDS': [0], 'XRShader_Motio
             'XREngine_RadialBlurInvert': [0], 'XRUtil_ShrinkTexture8': [0],
             'XREngine_CCFuser': [0, 1, 2, 4], 'XREngine_Final5': list(range(16)), 'XREngine_Histogram': [0],
             'XREngine_ShadowProj': [8],
+            'TexEnvProj1': [0],
             # Original RenderSurface's lighting/projector, fog and second
             # texture branches, including the two alpha-only fog variants.
             'XRUtil_RenderSurface': sorted({0, 64, 65, 67, 71, 128, 264, 328} |
@@ -205,9 +207,11 @@ def compile_source(source):
         args = [a.strip() for a in re.split(r',\s*(?![^{}]*\})', arguments)]
         saturate = opcode.endswith('_SAT')
         op = opcode.removesuffix('_SAT')
-        if op == 'TEX':
+        if op in ('TEX', 'TXP'):
             if len(args) != 3 or not (m := re.fullmatch(r'texture\[(\d+)\]', args[1])) or args[2] not in ('2D', 'CUBE', 'PCF4X42D'):
                 raise ValueError('Invalid texture instruction')
+            if op == 'TXP' and args[2] != '2D':
+                raise ValueError('Unsupported projected texture dimension')
             slot = int(m[1])
             dimension = '2D' if args[2] == 'PCF4X42D' else args[2]
             if slot >= 16 or (slot in textures and textures[slot] != dimension):
@@ -220,7 +224,12 @@ def compile_source(source):
                 expr = f'((float4)nativeShadow4x4({operand(args[0])}))'
             else:
                 coord = 'xy' if dimension == '2D' else 'xyz'
-                expr = f'(texture{slot}.Sample(sampler{slot}, {operand(args[0])}.{coord}) * sampleScale[{slot}])'
+                coordinates = f'{operand(args[0])}.{coord}'
+                if op == 'TXP':
+                    # The original projected fetch divides the interpolated
+                    # coordinates by Q, after applying any source swizzle.
+                    coordinates = f'({coordinates} / {operand(args[0])}.w)'
+                expr = f'(texture{slot}.Sample(sampler{slot}, {coordinates}) * sampleScale[{slot}])'
         elif op == 'SWZ':
             if len(args) != 5:
                 raise ValueError('Invalid SWZ arity')
@@ -267,13 +276,17 @@ def compile_source(source):
     if uses_pcf4x4:
         # The guest's four-by-four taps are spaced in logical shadow texels.
         # env[9] retains that pitch while the native depth map grows by 2x/3x.
+        # FPInclude_Xenon ShadowMapStep is step(reference, sampledDepth):
+        # reversed-depth occluders return one; a cleared zero texel returns
+        # zero. The projector emits this as shadow coverage in red and 1-red
+        # in alpha, so reversing the comparison darkens the empty atlas area.
         source += '''float nativeShadow4x4(float4 position) {
     float total = 0;
     [unroll] for (int y = 0; y < 4; ++y) {
         [unroll] for (int x = 0; x < 4; ++x) {
             float2 uv = position.xy + env[9].xy * float2(x - 1.5, y - 1.5);
             float depth = texture0.SampleLevel(sampler0, uv, 0).r * sampleScale[0].x;
-            total += position.z >= depth ? 1.0 : 0.0;
+            total += depth >= position.z ? 1.0 : 0.0;
         }
     }
     return total * (1.0 / 16.0);

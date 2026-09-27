@@ -71,7 +71,9 @@ END''')
         self.assertEqual(metadata['textures'], {0: '2D', 1: '2D'})
         self.assertIn('position.xy + env[9].xy * float2(x - 1.5, y - 1.5)', code)
         self.assertIn('texture0.SampleLevel(sampler0, uv, 0)', code)
-        self.assertIn('position.z >= depth', code)
+        # Original ShadowMapStep is step(receiver, sampledDepth). Its result
+        # is shadow coverage: cleared reversed depth (zero) must remain lit.
+        self.assertIn('depth >= position.z', code)
         self.assertNotIn('@', code)
 
     def test_original_programs_and_texture_dimensions(self):
@@ -88,6 +90,23 @@ END''')
             self.assertEqual(metadata['instruction_count'], count)
             self.assertEqual(metadata['textures'], textures)
             self.assertNotIn('@', code)
+
+    def test_original_projected_texture_divides_by_q_and_keeps_color(self):
+        source = (ROOT / 'Darkness/System/Gl/ARB_fragment_program/TexEnvProj1.fp').read_text(encoding='latin-1')
+        code, metadata = compile_source(select_template(source, 0))
+        self.assertEqual(VARIANTS['TexEnvProj1'], [0])
+        self.assertEqual(metadata['textures'], {0: '2D'})
+        self.assertEqual(metadata['instruction_count'], 2)
+        self.assertIn('texture0.Sample(sampler0, ((tc0).xy / (tc0).w)) * sampleScale[0]', code)
+        self.assertIn('oCol = ((tex0) * (v0));', code)
+        self.assertNotIn('max(', code)  # Negative Q is not clamped by TXP.
+        # Projection follows source swizzling; masked writes retain all other
+        # destination lanes, just as they do for ordinary texture fetches.
+        code, metadata = compile_source('OUTPUT o = result.color; ATTRIB tc = fragment.texcoord[0]; '
+                                        'TXP o.rg, tc.wzyx, texture[3], 2D; END')
+        self.assertEqual(metadata['textures'], {3: '2D'})
+        self.assertIn('texture3.Sample(sampler3, ((tc.wzyx).xy / (tc.wzyx).w))', code)
+        self.assertRegex(code, r'o\.xy = .*\.xy;')
 
     def test_sparse_constants_and_masked_output(self):
         code, _ = compile_source('OUTPUT o = result.color; PARAM a = program.env[19]; '
@@ -250,6 +269,8 @@ END''')
         prefix = 'OUTPUT o = result.color; TEMP t; '
         for tail in ('BAD o, t;', 'ADD o, t;', 'MOV o, missing;', 'PARAM a = program.env[256];',
                      'TEX o, t, texture[16], 2D;', 'TEX o, t, texture[4], CUBE; TEX o, t, texture[4], 2D;',
+                     'TXP o, t, texture[16], 2D;', 'TXP o, t, texture[0], CUBE;',
+                     'TXP o, t, texture[0], PCF4X42D;', 'TXP o, t, texture[0];',
                      '\n@if unknown\nMOV o, t;\n@endif', '\n@else', '\n@if dynmip'):
             with self.subTest(tail=tail), self.assertRaises(ValueError):
                 compile_source(prefix + tail)

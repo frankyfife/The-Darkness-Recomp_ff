@@ -10,7 +10,7 @@ import json
 import re
 from compile_vertex_template import ASSETS, parse
 
-MODES = {'texcoord': 0, 'linear': 1, 'void': 4, 'constant': 7, 'mspos': 8,
+MODES = {'texcoord': 0, 'linear': 1, 'void': 4, 'shadowvolume2': 7, 'mspos': 8, 'constant': 9,
          'wspos': 10, 'env': 13, 'LightField': 17, 'bumpcubeenv': 18, 'tslv': 20, 'depthoffset': 22, 'Lighting_Nonormal': 16}
 WORLD_ASSETS = ASSETS | {'System/Xenon/ProgramCache.xpc':
     'e5f5d6a29761cf884a11655911d3affcbb6024e59a5f7fb2c592a675a081966b'}
@@ -25,6 +25,12 @@ def condition(name):
         if m[2] == 'bumpcubeenv' and m[1] not in ('1', '5'):
             return False
         if m[2] == 'env' and m[1] != '0':
+            return False
+        # Cache 97/275 (unskinned), 276 (four weights), 408 (eight weights)
+        # subtract light c12, normalize, clamp radius-distance and multiply by
+        # the scalar vertex selector before adding to the skinned position.
+        # This is VP.xrg's shadowvolume2 branch, not a constant interpolator.
+        if m[2] == 'shadowvolume2' and m[1] != '0':
             return False
         if m[2] == 'LightField' and m[1] != '5':
             return False
@@ -43,8 +49,8 @@ def condition(name):
         # Cache record 23 exports c12/c13 unchanged for mode 9 in stages 3/4;
         # rec324 E3=c14/E4=c15 and rec326 E4=c16 extend the same constant
         # passthrough to stage 5.
-        if m[2] == 'constant' and m[1] in ('3', '4', '5'):
-            return f'(MODE_{m[1]} == 7 || MODE_{m[1]} == 9)'
+        if m[2] == 'constant' and m[1] not in ('3', '4', '5'):
+            return False
         return f'MODE_{m[1]} == {MODES[m[2]]}' if m[2] in MODES else False
     if m := re.fullmatch(r'TextureTrans([0-7])', name):
         return f'CONVERT_{m[1]}'
@@ -137,8 +143,9 @@ VertexOutput vertexMain(VertexInput input) {
     hlsl += '\n    return output;\n}\n'
     return hlsl, {'assets': WORLD_ASSETS, 'modes': MODES,
                   'constant_mode9_stages': [3, 4, 5],
+                  'shadowvolume2_mode7_stages': [0],
                   'wspos_mode10_stages': [1],
-                  'cache_evidence_records': [9, 13, 18, 23, 26, 37, 50, 75, 144, 145, 164, 165, 240, 250, 253, 283, 323, 324, 325, 326, 327, 328, 368, 369, 419, 423],
+                  'cache_evidence_records': [9, 13, 18, 23, 26, 37, 50, 75, 97, 144, 145, 164, 165, 240, 250, 253, 275, 276, 283, 323, 324, 325, 326, 327, 328, 368, 369, 408, 419, 423],
                   'instructions': retained}
 
 

@@ -585,16 +585,19 @@ static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b, 
         // Only this cache-verified form is supported; preserve other failures.
         if (d.modes[s]==18 && ((s!=1 && s!=5) || d.modes[s+1]!=4 || d.modes[s+2]!=4 ||
                               (d.flags&(1u<<(8+s))))) return reject("basis-mode",s,d.modes[s]);
-        if (((d.modes[s]==13 || d.modes[s]==22) && s!=0) || (d.modes[s]==17 && s!=5) ||
+        if (((d.modes[s]==7 || d.modes[s]==13 || d.modes[s]==22) && s!=0) || (d.modes[s]==17 && s!=5) ||
             (d.modes[s]==10 && s!=1) ||
             (d.modes[s]==9 && s!=3 && s!=4 && s!=5) ||
             (d.modes[s]==16 && s!=3 && s!=4 && s!=5)) return reject("mode-stage",s,d.modes[s]);
         o.modes[s]=d.modes[s]; o.coordinates[s]=uint8_t((d.coordinateMapping>>(8+3*s))&7);
         o.conversions[s]=(d.flags&(1u<<o.coordinates[s]))!=0; o.matrices[s]=(d.flags&(1u<<(8+s)))!=0;
         c.references[s+1]={d.conversions[s],d.matrices[s],d.parameters[s][0],0};
-        const bool input=o.modes[s]==0 || o.modes[s]==13 || o.modes[s]==22 || (o.tangents && (s==2 || s==3));
+        // Mode 7 is the original shadowvolume2 position extrusion. Its scalar
+        // selector consumes a vertex coordinate and optional conversion pair,
+        // but does not execute the ordinary texture-output matrix branch.
+        const bool input=o.modes[s]==0 || o.modes[s]==7 || o.modes[s]==13 || o.modes[s]==22 || (o.tangents && (s==2 || s==3));
         if ((input && o.conversions[s] && !take(d.conversions[s],2)) ||
-            (o.modes[s]!=4 && o.matrices[s] && !take(d.matrices[s],4)) ||
+            (o.modes[s]!=4 && o.modes[s]!=7 && o.matrices[s] && !take(d.matrices[s],4)) ||
             (o.modes[s]==1 && !take(d.parameters[s][0],4)) ||
             (o.modes[s]==10 && !take(d.parameters[s][0],3)) ||
             (o.modes[s]==18 && !take(d.parameters[s][0],s==1?8:3)) ||
@@ -756,16 +759,16 @@ bool prepareWorldVertexProgramWithGeometry(const EngineVertexBindingSnapshot& b,
             if (!supportedMode(d.modes[s])) return false;
             if (d.modes[s] == 18 && ((s != 1 && s != 5) || d.modes[s + 1] != 4 || d.modes[s + 2] != 4 ||
                                     (d.flags & (1u << (8 + s))))) return false;
-            if (((d.modes[s] == 13 || d.modes[s] == 22) && s != 0) || (d.modes[s] == 17 && s != 5) ||
+            if (((d.modes[s] == 7 || d.modes[s] == 13 || d.modes[s] == 22) && s != 0) || (d.modes[s] == 17 && s != 5) ||
                 (d.modes[s] == 10 && s != 1) ||
                 (d.modes[s] == 9 && s != 3 && s != 4 && s != 5) ||
                 (d.modes[s] == 16 && s != 3 && s != 4 && s != 5)) return false;
             o.modes[s] = d.modes[s]; o.coordinates[s] = uint8_t((d.coordinateMapping >> (8 + 3 * s)) & 7);
             o.conversions[s] = (d.flags & (1u << o.coordinates[s])) != 0; o.matrices[s] = (d.flags & (1u << (8 + s))) != 0;
             c.references[s + 1] = {d.conversions[s], d.matrices[s], d.parameters[s][0], 0};
-            const bool input = o.modes[s] == 0 || o.modes[s] == 13 || o.modes[s] == 22 || (o.tangents && (s == 2 || s == 3));
+            const bool input = o.modes[s] == 0 || o.modes[s] == 7 || o.modes[s] == 13 || o.modes[s] == 22 || (o.tangents && (s == 2 || s == 3));
             if ((input && o.conversions[s] && !takeStrict(d.conversions[s], 2)) ||
-                (o.modes[s] != 4 && o.matrices[s] && !takeStrict(d.matrices[s], 4)) ||
+                (o.modes[s] != 4 && o.modes[s] != 7 && o.matrices[s] && !takeStrict(d.matrices[s], 4)) ||
                 (o.modes[s] == 1 && !takeStrict(d.parameters[s][0], 4)) ||
                 (o.modes[s] == 10 && !takeStrict(d.parameters[s][0], 3)) ||
                 (o.modes[s] == 18 && !takeStrict(d.parameters[s][0], s == 1 ? 8 : 3)) ||

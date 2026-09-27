@@ -390,6 +390,7 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
         updateConstants(context_.Get(),constants_.Get(),mesh.projection.data(),sizeof(mesh.projection));
         context_->DrawIndexed(UINT(mesh.indices.size()),0,0);
     }
+    if(part.last)world_->endFrame();
 }
 void EnginePreviewD3D11::releaseDisplayTarget() {
     context_->OMSetRenderTargets(0, nullptr, nullptr);

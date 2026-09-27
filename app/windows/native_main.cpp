@@ -100,6 +100,7 @@ int wmain(int argc, wchar_t** argv) {
     unsigned targetFps = 60;
     bool rendererSmoke = false;
     std::filesystem::path rendererTrace;
+    bool manualShadowCapture=false;
     bool enginePreview = false;
     bool muted = false;
     bool sampleEngine=false,sampleWorkers=false;
@@ -136,6 +137,10 @@ int wmain(int argc, wchar_t** argv) {
             sceneWorkers=unsigned(value);
         }
         else if (arg == L"--trace-renderer" && i + 1 < argc) rendererTrace = argv[++i];
+        else if (arg == L"--shadow-capture" && i + 1 < argc) {
+            rendererTrace=argv[++i];manualShadowCapture=true;enginePreview=true;
+            if(rendererTrace.empty()) {fputs("Shadow capture requires a new directory.\n",stderr);return 1;}
+        }
         else if (arg == L"--test-input" && i + 1 < argc) testInputPath=argv[++i];
         else if (arg == L"--test-start") testStart=true;
         else if (arg == L"--test-skip-intros") testSkipIntros=true;
@@ -173,6 +178,7 @@ int wmain(int argc, wchar_t** argv) {
             fputs("  Options > Video Settings contains native PC graphics controls. Saved settings apply unless explicitly overridden. --vsync / --no-vsync overrides vertical sync; --fov 0 (Original) or 60..120 overrides horizontal FOV at 16:9 for this run.\n", stderr);
             fputs("  --trace-frame-hitches records bounded slow-frame stage timings without enabling per-draw profiling or instruction sampling.\n", stderr);
             fputs("  --sample-renderer samples only active rendering on this game's display thread; opt-in diagnostics add overhead.\n", stderr);
+            fputs("  --shadow-capture <new directory> enables two F8 captures of complete rendered frames, shadow resources and matching screenshots.\n",stderr);
             fputs("  --scene-workers N opts into experimental parallel geometry/texture jobs (up to N helpers); default 0, serial.\n",stderr);
             return 1;
         }
@@ -198,7 +204,8 @@ int wmain(int argc, wchar_t** argv) {
         renderHeight = activeGraphics.renderHeight;
         if (!AudioRenderDriver::instance().setMuted(muted))
             throw std::runtime_error("Cannot configure native audio output volume");
-        configureRenderTrace(rendererTrace);
+        if(manualShadowCapture)configureShadowCapture(rendererTrace);
+        else configureRenderTrace(rendererTrace);
         if (enginePreview) enableEnginePreview();
         if (!previewFrame.empty() && std::filesystem::exists(previewFrame))
             throw std::runtime_error("Preview frame path already exists");
@@ -314,12 +321,16 @@ int wmain(int argc, wchar_t** argv) {
         if (enginePreview) {
             preview = std::make_unique<DarkRecomp::EnginePreviewD3D11>(display.GetDevice(), display.GetContext(), display.GetSwapChain(),
                                                                     renderSize.width, renderSize.height, resolutionScale);
-            preview->setDiagnostics(!rendererTrace.empty());
+            preview->setDiagnostics(!rendererTrace.empty() && !manualShadowCapture);
             setPreviewTextureBudget(preview->textureBudget());
             setPreviewFrameBackpressure(true,true);
             puts("[EnginePreview] Experimental original text, YUV video and BC1/BC3 color rendering; unsupported materials are skipped.");
         }
         bool savedPreview = false;
+        unsigned shadowCaptureCount=0,shadowCaptureActive=0;
+        bool shadowCapturePending=false;
+        if(manualShadowCapture)
+            puts("[ShadowCapture] Press F8 once with the shadow visible, then once where it disappears. Two captures maximum; keep still until each capture finishes.");
         unsigned videoCaptureCount = 0;
         unsigned colorCaptureCount = 0, worldCaptureCount = 0;
         const auto inputTestEpoch=GetTickCount64();
@@ -384,6 +395,14 @@ int wmain(int argc, wchar_t** argv) {
                 outlier.onLoopTop(loopTop);
             }
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if(manualShadowCapture && message.hwnd==window && message.message==WM_KEYDOWN &&
+                   message.wParam==VK_F8 && !(message.lParam&(LPARAM(1)<<30))) {
+                    if(preview && !shadowCapturePending && !shadowCaptureActive && shadowCaptureCount<2) {
+                        shadowCapturePending=true;
+                        std::printf("[ShadowCapture] requested=%u; waiting for a complete render-frame boundary.\n",shadowCaptureCount+1);
+                    }
+                    continue;
+                }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -462,8 +481,13 @@ int wmain(int argc, wchar_t** argv) {
                         break;
                     }
                     if(command=="capture") {liveInputCount=count;captureInputCount=count;inputCaptureAt=inputNow;break;}
-                    if(command=="0"){liveInputCount=count;captureInputCount=count;inputCaptureAt=inputNow;
-                        inspectNextEngineFrame();if(preview)preview->inspectNextWorldFrame();break;}
+                    if(command=="0"){liveInputCount=count;captureInputCount=count;
+                        if(manualShadowCapture) {
+                            if(!shadowCapturePending && !shadowCaptureActive && shadowCaptureCount<2)shadowCapturePending=true;
+                        } else {
+                            inputCaptureAt=inputNow;inspectNextEngineFrame();if(preview)preview->inspectNextWorldFrame();
+                        }
+                        break;}
                     unsigned key=0;ULONGLONG hold=kTestInputMenuHoldMs;
                     if(!parseTestInputKeyLine(command,key,hold)) {
                         if(testInputInvalidLogs<8) {
@@ -506,6 +530,14 @@ int wmain(int argc, wchar_t** argv) {
                     PreviewFramePart part;
                     if (takePreviewFrame(previewMeshes,8,&part)) {
                         if(part.first) {
+                            if(shadowCapturePending) {
+                                shadowCapturePending=false;shadowCaptureActive=++shadowCaptureCount;
+                                // Arm the renderer before this first chunk. The
+                                // producer may already be building a later frame;
+                                // its boundary trace cannot identify this image.
+                                preview->inspectNextWorldFrame();
+                                std::printf("[ShadowCapture] begin=%u\n",shadowCaptureActive);
+                            }
                             pendingFrameRenderMs=0;pendingFrameMeshes=pendingSimpleSubmissions=0;
                             pendingFrameColor=false;pendingFirstColor=0;pendingFrameVideo.reset();
                         }
@@ -528,6 +560,16 @@ int wmain(int argc, wchar_t** argv) {
                         frameRenderMs=pendingFrameRenderMs;
                         frameWorld=preview->worldPresented();
                         if(frameRendered) {
+                        if(shadowCaptureActive) {
+                            const auto path=rendererTrace/(L"inspection-"+std::to_wstring(shadowCaptureActive)+L".bmp");
+                            if(std::filesystem::exists(path))throw std::runtime_error("Shadow capture screenshot already exists");
+                            preview->saveBmp(path);
+                            std::printf("[ShadowCapture] saved=%u worldPresented=%u screenshot=%s\n",
+                                shadowCaptureActive,unsigned(preview->worldPresented()),path.string().c_str());
+                            const auto title=L"The Darkness - Shadow capture "+std::to_wstring(shadowCaptureActive)+L"/2 saved";
+                            SetWindowTextW(window,title.c_str());
+                            shadowCaptureActive=0;
+                        }
                         if(preview->worldPresented() && !previewFrame.empty() && worldCaptureCount<4 && GetTickCount64()>=nextWorldCapture) {
                             ++worldCaptureCount;nextWorldCapture=GetTickCount64()+5000;
                             const auto path=previewFrame.parent_path()/(previewFrame.stem().wstring()+L"-world-"+std::to_wstring(worldCaptureCount)+L".bmp");

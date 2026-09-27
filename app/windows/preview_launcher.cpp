@@ -29,12 +29,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     try {
         bool muted = true;
         bool captureFrames = false;
+        bool shadowCapture = false;
         std::wistringstream options(arguments ? arguments : L"");
         for (std::wstring option; options >> option;) {
             if (option == L"--sound") muted = false;
             else if (option == L"--mute") muted = true;
             else if (option == L"--capture-frames") captureFrames = true;
-            else throw std::runtime_error("Supported launcher options: --sound, --mute, --capture-frames.");
+            else if (option == L"--shadow-capture") shadowCapture = true;
+            else throw std::runtime_error("Supported launcher options: --sound, --mute, --capture-frames, --shadow-capture.");
         }
         std::vector<wchar_t> module(32768);
         const DWORD length = GetModuleFileNameW(nullptr, module.data(), DWORD(module.size()));
@@ -73,6 +75,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         // Captures synchronously read back the GPU and write a full BMP on the
         // display thread. Keep that diagnostic work out of normal gameplay.
         if (captureFrames) command += L" --preview-frame " + quote(evidence / L"preview.bmp");
+        if (shadowCapture) command += L" --shadow-capture " + quote(evidence / L"render");
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.dwFlags = STARTF_USESTDHANDLES;
