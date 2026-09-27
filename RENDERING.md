@@ -101,8 +101,8 @@ the second stage uses that mask to fill only discarded pixels. Native depth
 writes remain enabled with an ALWAYS comparison in that first stage, matching
 the original state, so the second stage cannot overwrite the gold glow.
 GPU contracts cover both stages, all variants, atlas coordinates, nonuniform
-gold edge glow, the two-stage depth mask, intensity and near/far fades, and far-depth discard at scales
-1/2/3 on hardware and WARP. The original noise maps in stage-0 slots 2 and 4
+gold edge glow, the two-stage depth mask, intensity and near/far fades, and
+far-depth discard at scales 1/2/3 on hardware and WARP. The original noise maps in stage-0 slots 2 and 4
 can be recovered after a missed or evicted CPU texture upload. Scene, depth
 and effect-atlas inputs still come from their GPU resolves.
 

@@ -1173,7 +1173,7 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         boundColor_=color;boundDepth_=depth;
     }
     // Original82248680 selects ALWAYS when testing is off while retaining
-    // independent depth writes (82248118). D3D11 disables writes as well when
+    // independent depth writes. D3D11 disables writes as well when
     // DepthEnable is false; DV5 needs those writes to mask its second pass.
     D3D11_DEPTH_STENCIL_DESC ds{};ds.DepthEnable=(flags&6)!=0;ds.DepthWriteMask=(flags&4)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO;
     ds.DepthFunc=(flags&2)?WorldRenderState::depthComparison(a[96]):D3D11_COMPARISON_ALWAYS;
