@@ -96,8 +96,15 @@ programs, including their base, radial-add and radial-multiply variants. Missing
 native translations previously dropped these final draws, exposing the scene
 and radial-blur atlas as stacked quadrants. The translator selects the Xenon
 floating-depth branch and preserves ARB `KIL` as a conditional pixel discard.
-GPU contracts cover both stages, all variants, atlas coordinates and far-depth
-discard at scales 1/2/3 on hardware and WARP.
+The first stage writes a depth coverage mask with depth testing disabled;
+the second stage uses that mask to fill only discarded pixels. Native depth
+writes remain enabled with an ALWAYS comparison in that first stage, matching
+the original state, so the second stage cannot overwrite the gold glow.
+GPU contracts cover both stages, all variants, atlas coordinates, nonuniform
+gold edge glow, the two-stage depth mask, intensity and near/far fades, and far-depth discard at scales
+1/2/3 on hardware and WARP. The original noise maps in stage-0 slots 2 and 4
+can be recovered after a missed or evicted CPU texture upload. Scene, depth
+and effect-atlas inputs still come from their GPU resolves.
 
 Antialiasing offers Off (default) and FXAA, stored as `Antialiasing=0` or `1`.
 Missing or invalid values default to Off. Changes apply at the next presentation

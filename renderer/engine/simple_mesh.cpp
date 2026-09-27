@@ -925,7 +925,10 @@ void previewObserveWorld(uint8_t* base,const StoredDraw& geometry) {
                    draw->fragmentName=="VBOp_GenEnv2" || draw->fragmentName=="VBOp_Fresnel" ||
                    // CCFuser texture1 is its original 324x18 RGB lookup map.
                    // Reload the source pixels if its CPU cache entry expired.
-                   (draw->fragmentName=="XREngine_CCFuser" && s==1)) {
+                   (draw->fragmentName=="XREngine_CCFuser" && s==1) ||
+                   // DV5's pulse and perturbation tables are CPU noise images.
+                   // Scene/depth/atlas slots0/1/5 remain GPU resolve inputs.
+                   (draw->fragmentName=="WClientMod_DV5_0" && (s==2 || s==4))) {
                     auto decoded=std::make_shared<ColorImage>();
                     if(!decodeWorldTextureImage(base,draw->textureObjects[s].object,*decoded,draw->textureObjects[s].firstMip)) {
                         if(auto old=colorTextures.find(draw->textureIds[s]);old!=colorTextures.end()) {

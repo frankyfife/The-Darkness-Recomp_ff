@@ -1172,8 +1172,12 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         context_->OMSetRenderTargets(color?1:0,color?&color:nullptr,depth);
         boundColor_=color;boundDepth_=depth;
     }
-    D3D11_DEPTH_STENCIL_DESC ds{};ds.DepthEnable=(flags&2)!=0;ds.DepthWriteMask=(flags&4)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO;
-    ds.DepthFunc=WorldRenderState::depthComparison(a[96]);ds.StencilEnable=(flags&0x4000)!=0;ds.StencilReadMask=a[125];ds.StencilWriteMask=a[126];
+    // Original82248680 selects ALWAYS when testing is off while retaining
+    // independent depth writes (82248118). D3D11 disables writes as well when
+    // DepthEnable is false; DV5 needs those writes to mask its second pass.
+    D3D11_DEPTH_STENCIL_DESC ds{};ds.DepthEnable=(flags&6)!=0;ds.DepthWriteMask=(flags&4)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO;
+    ds.DepthFunc=(flags&2)?WorldRenderState::depthComparison(a[96]):D3D11_COMPARISON_ALWAYS;
+    ds.StencilEnable=(flags&0x4000)!=0;ds.StencilReadMask=a[125];ds.StencilWriteMask=a[126];
     ds.FrontFace=WorldRenderState::stencilFace(a+120);ds.BackFace=(flags&0x80)?WorldRenderState::stencilFace(a+122):ds.FrontFace;
     if(depthStates_.size()>512)depthStates_.clear();
     auto& depthState=depthStates_.entry(ds);
