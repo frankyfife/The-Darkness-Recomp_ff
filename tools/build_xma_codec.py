@@ -6,6 +6,7 @@ reviewable patch remain beside the DLLs. Requires existing MSYS2 MinGW + LLVM.
 """
 from pathlib import Path
 import argparse
+import os
 import difflib
 import hashlib
 import json
@@ -16,6 +17,7 @@ import tarfile
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
+MSYS2 = os.environ.get('MSYS2_ROOT', 'C:/msys64').replace(os.sep, '/').rstrip('/')
 DEPS = ROOT / 'build_native/deps'
 COMMIT = '1c2c67c0b9f7f66ab32c19dcf7f227bcd290aa4c'  # FFmpeg n8.1.2
 ARCHIVE_HASH = '1291ae49c285f7bd55c7c059aa43f1a0fd784a1ae22d5c76297dcd11c531248a'
@@ -140,7 +142,7 @@ static const AVClass darkrecomp_xma_class = {
         # Release DLLs must not reuse objects left by an earlier edited checkout.
         script += 'make clean\n'
     script += 'make -j8\nmake install\n'
-    subprocess.run(['C:/msys64/usr/bin/bash.exe', '-c', script], check=True)
+    subprocess.run([MSYS2 + '/usr/bin/bash.exe', '-c', script], check=True)
     config_stamp.write_text(json.dumps(configure))
     for name, version in [('avcodec', 62), ('avutil', 60)]:
         exports = build / ('lib' + name) / f'{name}-darkxma-{version}.def'
@@ -157,8 +159,8 @@ static const AVClass darkrecomp_xma_class = {
         (install / filename).write_bytes((source / filename).read_bytes())
     # MinGW's clock_gettime/nanosleep implementations remain a runtime dependency
     # even with the decoder using Win32 threads. Ship the existing runtime and license.
-    shutil.copy2('C:/msys64/mingw64/bin/libwinpthread-1.dll', install / 'bin')
-    shutil.copy2('C:/msys64/mingw64/share/licenses/winpthreads/COPYING', install / 'COPYING.winpthreads')
+    shutil.copy2(MSYS2 + '/mingw64/bin/libwinpthread-1.dll', install / 'bin')
+    shutil.copy2(MSYS2 + '/mingw64/share/licenses/winpthreads/COPYING', install / 'COPYING.winpthreads')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

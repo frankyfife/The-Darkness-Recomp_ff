@@ -120,6 +120,9 @@ CMake 3.24+, Python 3.11+, and ~15 GB free. Output lands in
 The XMA audio build also requires MSYS2 at `C:\msys64` with MinGW64 GCC and
 `make`, plus standalone LLVM at `C:\Program Files\LLVM` (for `llvm-lib.exe`).
 
+If MSYS2 is installed elsewhere, set `MSYS2_ROOT` before building, e.g.
+`$env:MSYS2_ROOT = 'D:\msys64'`.
+
 **3. Play** — double-click `Launch.cmd`:
 
 | Command | What it does |
