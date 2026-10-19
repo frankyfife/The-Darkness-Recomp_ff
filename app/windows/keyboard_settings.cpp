@@ -1,0 +1,102 @@
+#include "keyboard_settings.h"
+#include <cstdio>
+#include <optional>
+#include <utility>
+
+namespace DarkRecomp {
+using namespace Native;
+namespace {
+std::wstring settingName(size_t action, size_t slot) {
+    return std::wstring(keyboardActions()[action].setting) + (slot ? L"Secondary" : L"Primary");
+}
+std::optional<unsigned> readKey(const std::filesystem::path& path, const wchar_t* key) {
+    wchar_t text[32]{};
+    const auto length = GetPrivateProfileStringW(L"Keyboard", key, L"", text, 32, path.c_str());
+    if (!length || length >= 31) return {};
+    unsigned value = 0;
+    for (DWORD i = 0; i < length; ++i) {
+        if (text[i] < L'0' || text[i] > L'9') return {};
+        value = value * 10 + unsigned(text[i] - L'0');
+        if (value >= kBindingKeyCount) return {};
+    }
+    return assignableKeyboardKey(value) ? std::optional<unsigned>(value) : std::nullopt;
+}
+}
+KeyboardBindings loadKeyboardBindings(const std::filesystem::path& path) noexcept {
+    const auto defaults = defaultKeyboardBindings();
+    try {
+        auto loaded = defaults;
+        for (size_t action = 0; action < kKeyboardActionCount; ++action)
+            for (size_t slot = 0; slot < kKeyboardBindingSlots; ++slot) {
+                const auto value = readKey(path, settingName(action, slot).c_str());
+                if (value) loaded.keys[action][slot] = uint16_t(*value);
+            }
+        // Corrupt/partial files may introduce collisions with a default key.
+        // Keep the complete default selection rather than drop another action.
+        if (!validKeyboardBindings(loaded)) {
+            std::fputs("[Keyboard] Conflicting saved keys; using defaults.\n", stderr);
+            return defaults;
+        }
+        // Older files saved keyboard-only slots; the three mouse actions were
+        // always active outside that configuration. Restore them into vacant
+        // slots without displacing custom keys. Versioned files can explicitly
+        // clear or reassign mouse buttons and must keep that choice.
+        if (GetPrivateProfileIntW(L"Keyboard", L"BindingsVersion", 0, path.c_str()) < 2) {
+            constexpr std::array<std::pair<KeyboardAction, uint16_t>, 3> mouseDefaults{{
+                {KeyboardAction::FireRight, VK_LBUTTON},
+                {KeyboardAction::FireLeft, VK_RBUTTON},
+                {KeyboardAction::Zoom, VK_MBUTTON}
+            }};
+            for (const auto [action, key] : mouseDefaults) {
+                bool assigned = false;
+                for (size_t i = 0; i < loaded.keys.size(); ++i)
+                    if (!isDialogueBindingAction(KeyboardAction(i)))
+                        for (const auto existing : loaded.keys[i]) assigned = assigned || existing == key;
+                if (assigned) continue;
+                auto& slots = loaded.keys[size_t(action)];
+                if (!slots[1]) slots[1] = key;
+                else if (!slots[0]) slots[0] = key;
+            }
+        }
+        // Wheel cycling was fixed before version 3. Preserve it in a vacant
+        // slot when upgrading, without displacing a custom or wheel binding.
+        if (GetPrivateProfileIntW(L"Keyboard", L"BindingsVersion", 0, path.c_str()) < 3) {
+            constexpr std::array<std::pair<KeyboardAction, uint16_t>, 2> wheelDefaults{{
+                {KeyboardAction::PreviousWeapon, kMouseWheelDown},
+                {KeyboardAction::NextWeapon, kMouseWheelUp}
+            }};
+            for (const auto [action, key] : wheelDefaults) {
+                bool assigned = false;
+                for (size_t i = 0; i < loaded.keys.size(); ++i)
+                    if (!isDialogueBindingAction(KeyboardAction(i)))
+                        for (const auto existing : loaded.keys[i]) assigned = assigned || existing == key;
+                if (assigned) continue;
+                auto& slots = loaded.keys[size_t(action)];
+                if (!slots[1]) slots[1] = key;
+                else if (!slots[0]) slots[0] = key;
+            }
+        }
+        return loaded;
+    } catch (...) { return defaults; }
+}
+bool saveKeyboardBindings(const std::filesystem::path& path, const KeyboardBindings& bindings) noexcept {
+    if (!validKeyboardBindings(bindings)) return false;
+    try {
+        wchar_t temporary[MAX_PATH]{};
+        if (!GetTempFileNameW(path.parent_path().c_str(), L"dks", 0, temporary)) return false;
+        struct Cleanup { const wchar_t* path; ~Cleanup() { DeleteFileW(path); } } cleanup{temporary};
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (!CopyFileW(path.c_str(), temporary, FALSE)) return false;
+        } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+        if (!WritePrivateProfileStringW(L"Keyboard", L"BindingsVersion", L"3", temporary)) return false;
+        for (size_t action = 0; action < kKeyboardActionCount; ++action)
+            for (size_t slot = 0; slot < kKeyboardBindingSlots; ++slot) {
+                const auto text = std::to_wstring(bindings.keys[action][slot]);
+                if (!WritePrivateProfileStringW(L"Keyboard", settingName(action, slot).c_str(),
+                                                text.c_str(), temporary)) return false;
+            }
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, temporary);
+        return MoveFileExW(temporary, path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    } catch (...) { return false; }
+}
+}

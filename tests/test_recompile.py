@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import recompile
+from xex_image import read_image
 
 
 class OriginalSwitchMetadataTests(unittest.TestCase):
@@ -22,7 +23,7 @@ class OriginalSwitchMetadataTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.image = (ROOT / 'Darkness/basefile.exe').read_bytes()
+        cls.image = read_image(ROOT / 'Darkness/default.xex')
         config_path = ROOT / 'config/darkness.toml'
         config = tomllib.loads(config_path.read_text())['main']
         tables_path = config_path.parent / config['switch_table_file_path']
@@ -87,9 +88,9 @@ class RecompileTests(unittest.TestCase):
         self.xenon = self.root / 'refs/UnleashedRecomp/tools/XenonRecomp'
         self.generator = self.root / 'generator.exe'
         for name in (
-            'config/darkness.toml', 'runtime/guest/ppc_context.template.h',
-            'Darkness/_uncrypted.xex', 'Darkness/darkness_switch_tables.toml',
-            'Darkness/basefile.exe', 'tools/native_imports.py', 'tools/recompile.py',
+            'config/darkness.toml', 'config/game_revisions.toml', 'runtime/guest/ppc_context.template.h',
+            'Darkness/default.xex', 'Darkness/darkness_switch_tables.toml',
+            'tools/xex_image.py', 'tools/native_imports.py', 'tools/game_revisions.py', 'tools/recompile.py',
             'runtime/native/kernel.cpp', 'generator.exe',
         ):
             path = self.root / name
@@ -104,7 +105,7 @@ class RecompileTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('fixture input\n')
         (self.root / 'config/darkness.toml').write_text(
-            '[main]\nfile_path = "../Darkness/_uncrypted.xex"\n'
+            '[main]\nfile_path = "../Darkness/default.xex"\n'
             'switch_table_file_path = "../Darkness/darkness_switch_tables.toml"\n'
         )
         self.chunk_count = 1
@@ -116,6 +117,7 @@ class RecompileTests(unittest.TestCase):
             patch.object(recompile, 'ROOT', self.root),
             patch.object(recompile, 'XENON', self.xenon),
             patch.object(recompile, '__file__', str(self.root / 'tools/recompile.py')),
+            patch.object(recompile, 'validate_source', return_value=[]),
             patch.object(recompile.subprocess, 'run', side_effect=self.generate),
             patch.object(recompile, 'generate_imports', side_effect=self.generate_imports),
         ):
@@ -235,6 +237,26 @@ class RecompileTests(unittest.TestCase):
         (self.xenon / 'XenonUtils/xbox/xam_table.inc').unlink()
         with self.assertRaisesRegex(RuntimeError, r'Changed inputs: .*xam_table\.inc'):
             self.verify()
+
+    def test_revision_catalog_changes_invalidate_manifest(self):
+        self.regenerate()
+        (self.root / 'config/game_revisions.toml').write_text('changed approved revisions\n')
+        with self.assertRaisesRegex(RuntimeError, r'Changed inputs: .*game_revisions\.toml'):
+            self.verify()
+
+    def test_revision_validation_changes_invalidate_manifest(self):
+        self.regenerate()
+        (self.root / 'tools/game_revisions.py').write_text('changed compatibility validation\n')
+        with self.assertRaisesRegex(RuntimeError, r'Changed inputs: .*game_revisions\.py'):
+            self.verify()
+
+    def test_unapproved_revision_is_rejected_before_generator_runs(self):
+        with patch.object(recompile, 'validate_source', side_effect=RuntimeError('Unsupported default.xex revision')):
+            with patch.object(recompile.subprocess, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'Unsupported default.xex revision'):
+                    self.regenerate()
+                run.assert_not_called()
+        self.assertFalse((self.out / 'manifest.json').exists())
 
     def test_identical_outputs_keep_timestamps_and_unrelated_files(self):
         self.regenerate()

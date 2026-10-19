@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <algorithm>
+#include <optional>
 
 namespace DarkRecomp {
 using namespace Native;
@@ -67,19 +68,29 @@ bool saveFieldOfView(const std::filesystem::path& path, float value) noexcept {
 
 GraphicsSettings loadGraphicsSettings(const std::filesystem::path& path) noexcept {
     const GraphicsSettings defaults;
+    const auto anisotropy = readUnsigned(path, L"AnisotropyLevels", defaults.anisotropyLevels, 1, 16);
+    // Original gamma calibration is persisted by the guest profile. Legacy
+    // GammaPercent is an unrelated retired curve; ignore it and preserve it
+    // as an inert key when saving the remaining native preferences.
     return {readUnsigned(path, L"FrameRateLimit", defaults.frameRateLimit, 0, 1000),
             readUnsigned(path, L"RenderHeight", defaults.renderHeight, 180, kMaximumRenderHeight),
             readUnsigned(path, L"VerticalSync", defaults.verticalSync, 0, 1) != 0,
             readUnsigned(path, L"Fullscreen", defaults.fullscreen, 0, 1) != 0,
             readUnsigned(path, L"Bloom", defaults.bloom, 0, 1) != 0,
             readUnsigned(path, L"MotionBlur", defaults.motionBlur, 0, 1) != 0,
-            readUnsigned(path, L"Antialiasing", defaults.antialiasing, 0, 1) != 0,
-            readUnsigned(path, L"GammaPercent", defaults.gammaPercent, 50, 150),
-            readUnsigned(path, L"BrightnessPercent", defaults.brightnessPercent, 50, 200)};
+            AntialiasingMode(readUnsigned(path, L"Antialiasing", unsigned(defaults.antialiasing),
+                                         0, unsigned(AntialiasingMode::MSAA8x))),
+            readUnsigned(path, L"BrightnessPercent", defaults.brightnessPercent, 50, 200),
+            validAnisotropyLevels(anisotropy) ? anisotropy : defaults.anisotropyLevels,
+            readUnsigned(path, L"SubtitleScalePercent", defaults.subtitleScalePercent,
+                         kMinimumSubtitleScalePercent, kMaximumSubtitleScalePercent)};
 }
 
-bool saveDisplaySettings(const std::filesystem::path& path, float fov, const GraphicsSettings& settings) noexcept {
-    if (!isValidConfiguredHorizontalFovDegrees(fov) || !validGraphicsSettings(settings)) return false;
+namespace {
+bool saveSettings(const std::filesystem::path& path, float fov, const GraphicsSettings& settings,
+                  std::optional<GameLanguage> language) noexcept {
+    if (!isValidConfiguredHorizontalFovDegrees(fov) || !validGraphicsSettings(settings) ||
+        (language && !validGameLanguage(*language))) return false;
     try {
         // Commit the complete selection together. Work on a private adjacent
         // copy so a write failure cannot leave half of the settings saved.
@@ -98,12 +109,24 @@ bool saveDisplaySettings(const std::filesystem::path& path, float fov, const Gra
             !writeUnsigned(staging, L"Fullscreen", settings.fullscreen) ||
             !writeUnsigned(staging, L"Bloom", settings.bloom) ||
             !writeUnsigned(staging, L"MotionBlur", settings.motionBlur) ||
-            !writeUnsigned(staging, L"Antialiasing", settings.antialiasing) ||
-            !writeUnsigned(staging, L"GammaPercent", settings.gammaPercent) ||
-            !writeUnsigned(staging, L"BrightnessPercent", settings.brightnessPercent)) return false;
+            !writeUnsigned(staging, L"Antialiasing", unsigned(settings.antialiasing)) ||
+            !writeUnsigned(staging, L"BrightnessPercent", settings.brightnessPercent) ||
+            !writeUnsigned(staging, L"AnisotropyLevels", settings.anisotropyLevels) ||
+            !writeUnsigned(staging, L"SubtitleScalePercent", settings.subtitleScalePercent) ||
+            (language && !saveGameLanguage(staging, *language))) return false;
         WritePrivateProfileStringW(nullptr, nullptr, nullptr, temporary);
         return MoveFileExW(temporary, path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
     } catch (...) { return false; }
+}
+}
+
+bool saveDisplaySettings(const std::filesystem::path& path, float fov, const GraphicsSettings& settings) noexcept {
+    return saveSettings(path, fov, settings, std::nullopt);
+}
+
+bool saveDisplaySettings(const std::filesystem::path& path, float fov, const GraphicsSettings& settings,
+                         GameLanguage language) noexcept {
+    return saveSettings(path, fov, settings, language);
 }
 
 }

@@ -14,6 +14,7 @@
 #include <intrin.h>
 #include <tmmintrin.h>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace DarkRecomp::Native {
@@ -26,8 +27,44 @@ std::atomic<uint64_t> immediateCanonicalRecoveredTex1371{}, immediateCanonicalRe
 std::atomic<unsigned> immediateCanonicalLog1371{}, immediateCanonicalLog1477{};
 uint32_t word(const uint8_t* p) { return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3]; }
 uint16_t half(const uint8_t* p) { return uint16_t(uint16_t(p[0])<<8 | p[1]); }
+unsigned worldDescriptorKeyMismatch(const EngineVertexBindingSnapshot& binding) noexcept {
+    const auto& d=binding.descriptor;
+    // Only encoded descriptor bytes0..19 belong to key1..5. Compare these
+    // exact words in order, without encoding the unused descriptor tail.
+    if(d.coordinateMapping!=binding.key[1])return 0;
+    if(d.flags!=binding.key[2])return 1;
+    if(word(d.modes.data())!=binding.key[3])return 2;
+    if(word(d.modes.data()+4)!=binding.key[4])return 3;
+    if(d.declarationFlags!=binding.key[5])return 4;
+    return 5;
+}
+// Large immediate index lists are already owned before conversion. Keep this
+// work outside the tiny capture path, using only SSE2 integer operations.
+// Return the first invalid position, or count when every index is in range.
+__declspec(noinline) uint32_t convertImmediateIndices(uint16_t* indices,uint32_t count,uint32_t vertexCount) {
+    auto* bytes=reinterpret_cast<uint8_t*>(indices);
+    if(!vertexCount) {indices[0]=half(bytes);return 0;}
+    const auto sign=_mm_set1_epi16(-32768);
+    const auto maximum=_mm_set1_epi16(int16_t((std::min)(vertexCount-1,65535u)^0x8000u));
+    uint32_t i=0;
+    for(;count-i>=8;i+=8) {
+        const auto raw=_mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes+i*2));
+        const auto values=_mm_or_si128(_mm_slli_epi16(raw,8),_mm_srli_epi16(raw,8));
+        // Flipping the sign bit makes the signed SSE2 comparison unsigned.
+        // Counts above 65535 accept every uint16 value, as the scalar path does.
+        const auto invalid=_mm_cmpgt_epi16(_mm_xor_si128(values,sign),maximum);
+        const unsigned mask=unsigned(_mm_movemask_epi8(invalid));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(indices+i),values);
+        if(mask)return i+std::countr_zero(mask)/2;
+    }
+    for(;i<count;++i) {
+        indices[i]=half(bytes+i*2);
+        if(indices[i]>=vertexCount)return i;
+    }
+    return count;
+}
 bool finite(const EngineVector& v) { return std::all_of(v.begin(),v.end(),[](float x){return std::isfinite(x);}); }
-bool supportedMode(uint8_t m) { return m==0 || m==1 || m==4 || m==7 || m==8 || m==9 || m==10 || m==13 || m==16 || m==17 || m==18 || m==20 || m==22; }
+bool supportedMode(uint8_t m) { return m==0 || m==1 || m==4 || m==7 || m==8 || m==9 || m==10 || m==11 || m==13 || m==16 || m==17 || m==18 || m==20 || m==22 || m==23 || m==24; }
 __attribute__((target("ssse3"))) bool copyFiniteVectorsSimd(const uint8_t* source,EngineVector* output,unsigned count) {
     const auto endian=_mm_setr_epi8(3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12);
     const auto absolute=_mm_set1_epi32(0x7FFFFFFF),maximum=_mm_set1_epi32(0x7F7FFFFF);
@@ -123,6 +160,8 @@ void resetPartialWorldDraw(WorldDraw* raw) noexcept {
     raw->samplers.fill(WorldSampler{});
     raw->material = WorldMaterial::depth;
     raw->fragmentFlags = 0;
+    raw->promptContext = PromptRenderContext::Menu;
+    raw->subtitle = false;
 }
 void recycleWorldDraw(WorldDraw* raw) noexcept {
     if(!raw) return;
@@ -193,8 +232,8 @@ bool locateImmediateNonfinite(const StoredGeometry& g,ImmediateCaptureReason& ou
 }
 // Task-62b recovery: NaN/Inf allocator leftovers in immediate vertices that no
 // index references must not reject visible triangles (all-zero bytes decode
-// finite in every format). Zeroes every unreferenced vertex — tail and
-// interior holes alike — in a still-unpublished owned copy, preserving live
+// finite in every format). Zeroes every unreferenced vertex, including tail and
+// interior holes, in a still-unpublished owned copy, preserving live
 // bytes; indices are untouched, so order, winding and duplicates survive.
 // Takes the SAME owned index snapshot that the caller validated OOB-free and
 // will publish, so canonicalization and submission cannot disagree; OOB
@@ -287,6 +326,23 @@ bool worldVertexLayout(const StoredGeometry& g,std::array<uint32_t,16>& offsets)
     }
     return stride==g.stride && g.formats[0];
 }
+bool finiteBigEndianFloatBytes(const uint8_t* source,size_t bytes) noexcept {
+    // On x86 the big-endian IEEE exponent occupies these native integer bits.
+    // Test four words at a time without byte swapping or floating arithmetic;
+    // signaling NaNs, infinities, signed zero and subnormals keep scalar rules.
+    const auto exponent=_mm_set1_epi32(0x0000807F);
+    while(bytes>=16) {
+        const auto words=_mm_loadu_si128(reinterpret_cast<const __m128i*>(source));
+        if(_mm_movemask_epi8(_mm_cmpeq_epi32(_mm_and_si128(words,exponent),exponent)))return false;
+        source+=16;bytes-=16;
+    }
+    while(bytes) {
+        uint32_t bits;std::memcpy(&bits,source,sizeof(bits));
+        if((bits&0x0000807Fu)==0x0000807Fu)return false;
+        source+=4;bytes-=4;
+    }
+    return true;
+}
 }
 
 bool validateWorldVertices(const StoredGeometry& g) noexcept {
@@ -306,13 +362,12 @@ bool validateWorldVertices(const StoredGeometry& g) noexcept {
     }
     if(!spanCount)return true;
     return parallelSceneRange(g.vertexCount,16384,[&](size_t first,size_t end) {
+    if(spanCount==1 && !spans[0].offset && spans[0].bytes==g.stride)
+        return finiteBigEndianFloatBytes(g.vertices.data()+first*g.stride,(end-first)*g.stride);
     for(size_t vertex=first;vertex<end;++vertex) {
         const auto* start=g.vertices.data()+size_t(vertex)*g.stride;
-        for(unsigned s=0;s<spanCount;++s) {
-            const auto* field=start+spans[s].offset;
-            for(unsigned byte=0;byte<spans[s].bytes;byte+=4)
-                if((word(field+byte)&0x7F800000u)==0x7F800000u)return false;
-        }
+        for(unsigned s=0;s<spanCount;++s)
+            if(!finiteBigEndianFloatBytes(start+spans[s].offset,spans[s].bytes))return false;
     }
     return true;
     });
@@ -399,31 +454,47 @@ bool snapshotImmediateWorldGeometry(uint8_t* base,uint32_t descriptor,uint32_t i
             if(word(header.data()+64))fieldCode|=8;
             if(!g->vertexCount || g->vertexCount>16384)fieldCode|=16;
             if(fieldCode) return fail(Stage::headerBounds,g->vertexCount,fieldCode);
-            std::array<std::vector<uint8_t>,16> streams;
-            auto stream=[&](unsigned slot,uint32_t pointer,uint8_t format) {
-                if (!pointer || !format) return fail(Stage::streamBounds,slot,pointer,format);
-                g->formats[slot]=format;g->stride+=sizes[format];streams[slot].resize(size_t(g->vertexCount)*sizes[format]);
-                if(!copyRenderMemory(base,pointer,streams[slot].data(),streams[slot].size()))
-                    return fail(Stage::streamCopy,slot,pointer,format);
-                return true;
-            };
-            if (!stream(0,word(header.data()+4),3)) return false;
-            for(unsigned slot=0;slot<8;++slot) {
-                const auto pointer=word(header.data()+8+slot*4);const auto components=header[40+slot];
-                if(pointer && components>4) {
-                    if(reason){reason->stage=Stage::headerBounds;reason->detail0=g->vertexCount;reason->detail1=32u|slot;}
-                    return false;
-                }
-                if (pointer && !stream(slot+1,pointer,components)) return false;
+            bool directPositions=g->vertexCount>=128;
+            if(directPositions) {
+                for(unsigned slot=0;slot<8;++slot)if(word(header.data()+8+slot*4)) {directPositions=false;break;}
+                directPositions=directPositions && !word(header.data()+48) && !word(header.data()+52);
             }
-            if (word(header.data()+48) && !stream(9,word(header.data()+48),3)) return false;
-            if (word(header.data()+52) && !stream(10,word(header.data()+52),18)) return false;
-            g->vertices.resize(size_t(g->vertexCount)*g->stride);
-            for(unsigned vertex=0;vertex<g->vertexCount;++vertex) {
-                size_t offset=size_t(vertex)*g->stride;
-                for(unsigned slot=0;slot<16;++slot) if(g->formats[slot]) {
-                    const auto n=sizes[g->formats[slot]];
-                    std::memcpy(g->vertices.data()+offset,streams[slot].data()+size_t(vertex)*n,n);offset+=n;
+            if(directPositions) {
+                // Position-only input already has the final packed layout.
+                // Larger streams can copy directly without a scratch/weave
+                // pass; tiny meshes retain the existing allocation pattern.
+                const auto pointer=word(header.data()+4);
+                if(!pointer)return fail(Stage::streamBounds,0,pointer,3);
+                g->formats[0]=3;g->stride=12;g->vertices.resize(size_t(g->vertexCount)*g->stride);
+                if(!copyRenderMemory(base,pointer,g->vertices.data(),g->vertices.size()))
+                    return fail(Stage::streamCopy,0,pointer,3);
+            } else {
+                std::array<std::vector<uint8_t>,16> streams;
+                auto stream=[&](unsigned slot,uint32_t pointer,uint8_t format) {
+                    if (!pointer || !format) return fail(Stage::streamBounds,slot,pointer,format);
+                    g->formats[slot]=format;g->stride+=sizes[format];streams[slot].resize(size_t(g->vertexCount)*sizes[format]);
+                    if(!copyRenderMemory(base,pointer,streams[slot].data(),streams[slot].size()))
+                        return fail(Stage::streamCopy,slot,pointer,format);
+                    return true;
+                };
+                if (!stream(0,word(header.data()+4),3)) return false;
+                for(unsigned slot=0;slot<8;++slot) {
+                    const auto pointer=word(header.data()+8+slot*4);const auto components=header[40+slot];
+                    if(pointer && components>4) {
+                        if(reason){reason->stage=Stage::headerBounds;reason->detail0=g->vertexCount;reason->detail1=32u|slot;}
+                        return false;
+                    }
+                    if (pointer && !stream(slot+1,pointer,components)) return false;
+                }
+                if (word(header.data()+48) && !stream(9,word(header.data()+48),3)) return false;
+                if (word(header.data()+52) && !stream(10,word(header.data()+52),18)) return false;
+                g->vertices.resize(size_t(g->vertexCount)*g->stride);
+                for(unsigned vertex=0;vertex<g->vertexCount;++vertex) {
+                    size_t offset=size_t(vertex)*g->stride;
+                    for(unsigned slot=0;slot<16;++slot) if(g->formats[slot]) {
+                        const auto n=sizes[g->formats[slot]];
+                        std::memcpy(g->vertices.data()+offset,streams[slot].data()+size_t(vertex)*n,n);offset+=n;
+                    }
                 }
             }
             // Pass a copy so g survives for task-62b recovery below; the hot path
@@ -488,10 +559,13 @@ bool snapshotImmediateWorldGeometry(uint8_t* base,uint32_t descriptor,uint32_t i
             g->indices.resize(count);
             auto* bytes=reinterpret_cast<uint8_t*>(g->indices.data());
             if (!copyRenderMemory(base,indexAddress,bytes,count*sizeof(uint16_t))) return fail(Stage::indexCopy,indexAddress,count);
-            for (unsigned i=0;i<count;++i) {
-                g->indices[i]=half(bytes+i*2);
-                if (g->indices[i]>=stored->vertexCount) return fail(Stage::indexOob,i,g->indices[i],stored->vertexCount);
-            }
+            if(count>=24) {
+                const auto invalid=convertImmediateIndices(g->indices.data(),count,stored->vertexCount);
+                if(invalid<count)return fail(Stage::indexOob,invalid,g->indices[invalid],stored->vertexCount);
+            } else for (unsigned i=0;i<count;++i) {
+                    g->indices[i]=half(bytes+i*2);
+                    if (g->indices[i]>=stored->vertexCount) return fail(Stage::indexOob,i,g->indices[i],stored->vertexCount);
+                }
         }
         auto retainedIndices=retainImmediate(std::move(g));
         if(!retainedIndices)return fail(Stage::retainIndices);
@@ -530,11 +604,24 @@ bool snapshotImmediateWorldGeometry(uint8_t* base,uint32_t descriptor,uint32_t i
     }
 }
 
+WorldVertexOptions worldVertexOptions(const EngineVertexDescriptor& d) noexcept {
+    WorldVertexOptions o;
+    o.weights=(d.flags>>16)&15;
+    o.positionConversion=(d.flags&0x04000000)!=0; o.normal=(d.flags&0x00200000)!=0;
+    o.tangents=(d.flags&0x00400000)!=0; o.normalizeNormal=(d.flags&0x00800000)!=0;
+    o.vertexColor=(d.flags&0x01000000)==0;
+    for(unsigned s=0;s<8;++s) {
+        o.modes[s]=d.modes[s]; o.coordinates[s]=uint8_t((d.coordinateMapping>>(8+3*s))&7);
+        o.conversions[s]=(d.flags&(1u<<o.coordinates[s]))!=0; o.matrices[s]=(d.flags&(1u<<(8+s)))!=0;
+    }
+    return o;
+}
+
 // Internal callers own a fresh, unpublished result, so fill it directly.
 // The public wrapper below still leaves caller output unchanged on failure.
 static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b, WorldVertexOptions& o,
                                           WorldVertexConstants& c) noexcept {
-    const auto& d=b.descriptor; const auto bytes=encodeEngineVertexDescriptor(d);
+    const auto& d=b.descriptor;
     auto reject=[&](const char* reason,unsigned first,unsigned count,unsigned vector=UINT32_MAX,unsigned lane=0,uint32_t bits=0) {
         static std::atomic<unsigned> reports{};
         if(reports.fetch_add(1,std::memory_order_relaxed)<32)
@@ -542,12 +629,10 @@ static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b, 
                          reason,first,count,vector,lane,bits,d.flags,d.palette,b.deviceAddress);
         return false;
     };
-    for (unsigned i=0;i<5;++i) if (word(bytes.data()+i*4)!=b.key[i+1]) return reject("descriptor-key",i,1);
-    o.weights=(d.flags>>16)&15;
+    const auto mismatch=worldDescriptorKeyMismatch(b);
+    if(mismatch<5)return reject("descriptor-key",mismatch,1);
+    o=worldVertexOptions(d);
     if (o.weights>8) return reject("weight-count",o.weights,0);
-    o.positionConversion=(d.flags&0x04000000)!=0; o.normal=(d.flags&0x00200000)!=0;
-    o.tangents=(d.flags&0x00400000)!=0; o.normalizeNormal=(d.flags&0x00800000)!=0;
-    o.vertexColor=(d.flags&0x01000000)==0;
     c.references[0]={d.palette,d.positionConversion,d.color,0};
     auto take=[&](unsigned first,unsigned count) {
         if (first>=256 || count>256-first) return reject("constant-range",first,count);
@@ -587,10 +672,13 @@ static bool prepareWorldVertexProgramInto(const EngineVertexBindingSnapshot& b, 
                               (d.flags&(1u<<(8+s))))) return reject("basis-mode",s,d.modes[s]);
         if (((d.modes[s]==7 || d.modes[s]==13 || d.modes[s]==22) && s!=0) || (d.modes[s]==17 && s!=5) ||
             (d.modes[s]==10 && s!=1) ||
+            (d.modes[s]==11 && s!=3) || (d.modes[s]==23 && s!=4) || (d.modes[s]==24 && s!=5) ||
             (d.modes[s]==9 && s!=3 && s!=4 && s!=5) ||
             (d.modes[s]==16 && s!=3 && s!=4 && s!=5)) return reject("mode-stage",s,d.modes[s]);
-        o.modes[s]=d.modes[s]; o.coordinates[s]=uint8_t((d.coordinateMapping>>(8+3*s))&7);
-        o.conversions[s]=(d.flags&(1u<<o.coordinates[s]))!=0; o.matrices[s]=(d.flags&(1u<<(8+s)))!=0;
+        // Cache2/438/439 Water/CubeWater export the prepared basis. These
+        // modes have no parameter rows and require the original input flags.
+        if ((d.modes[s]==11 && !o.normal) || ((d.modes[s]==23 || d.modes[s]==24) && !o.tangents))
+            return reject("water-basis-input",s,d.modes[s]);
         c.references[s+1]={d.conversions[s],d.matrices[s],d.parameters[s][0],0};
         // Mode 7 is the original shadowvolume2 position extrusion. Its scalar
         // selector consumes a vertex coordinate and optional conversion pair,
@@ -736,8 +824,7 @@ bool prepareWorldVertexProgramWithGeometry(const EngineVertexBindingSnapshot& b,
         WorldVertexConstants c;
         WorldPaletteProof local;
         const auto& d = b.descriptor;
-        const auto bytes = encodeEngineVertexDescriptor(d);
-        for (unsigned i = 0; i < 5; ++i) if (word(bytes.data() + i * 4) != b.key[i + 1]) return false;
+        if(worldDescriptorKeyMismatch(b)<5)return false;
         o.weights = (d.flags >> 16) & 15;
         if (o.weights > 8) return false;
         o.positionConversion = (d.flags & 0x04000000) != 0; o.normal = (d.flags & 0x00200000) != 0;
@@ -761,8 +848,10 @@ bool prepareWorldVertexProgramWithGeometry(const EngineVertexBindingSnapshot& b,
                                     (d.flags & (1u << (8 + s))))) return false;
             if (((d.modes[s] == 7 || d.modes[s] == 13 || d.modes[s] == 22) && s != 0) || (d.modes[s] == 17 && s != 5) ||
                 (d.modes[s] == 10 && s != 1) ||
+                (d.modes[s] == 11 && s != 3) || (d.modes[s] == 23 && s != 4) || (d.modes[s] == 24 && s != 5) ||
                 (d.modes[s] == 9 && s != 3 && s != 4 && s != 5) ||
                 (d.modes[s] == 16 && s != 3 && s != 4 && s != 5)) return false;
+            if ((d.modes[s] == 11 && !o.normal) || ((d.modes[s] == 23 || d.modes[s] == 24) && !o.tangents)) return false;
             o.modes[s] = d.modes[s]; o.coordinates[s] = uint8_t((d.coordinateMapping >> (8 + 3 * s)) & 7);
             o.conversions[s] = (d.flags & (1u << o.coordinates[s])) != 0; o.matrices[s] = (d.flags & (1u << (8 + s))) != 0;
             c.references[s + 1] = {d.conversions[s], d.matrices[s], d.parameters[s][0], 0};
@@ -812,8 +901,8 @@ uint16_t worldFragmentTextureMask(std::string_view name,uint32_t flags) noexcept
 
 static bool snapshotWorldTargets(uint8_t* base,uint32_t device,WorldSurfaceTargets& output) noexcept {
     if(!device || uint64_t(device)+12452>0x100000000ull)return false;
-    std::array<uint8_t,20> objects{},objectsAfter{};
-    std::array<uint8_t,24> state{},stateAfter{};
+    std::array<uint8_t,20> objects,objectsAfter;
+    std::array<uint8_t,24> state,stateAfter;
     if(!copyRenderMemory(base,device+12432,objects.data(),objects.size()) ||
        !copyRenderMemory(base,device+10368,state.data(),state.size()) ||
        !copyRenderMemory(base,device+12432,objectsAfter.data(),objectsAfter.size()) ||
@@ -831,6 +920,8 @@ static bool snapshotWorldTargets(uint8_t* base,uint32_t device,WorldSurfaceTarge
     output=result;return true;
 }
 static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,WorldDraw& result) noexcept {
+    result.promptContext = currentPromptRenderContext();
+    result.subtitle = currentSubtitleRenderContext();
     ++observed;
     auto fail=[&](unsigned step) {
         ++rejected;
@@ -843,7 +934,6 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
     try {
         if (!geometry || !geometry.vertexBindings || !geometry.vertexBindings->deviceAddress ||
             uint64_t(geometry.vertexBindings->deviceAddress)+12600>0x100000000ull) return fail(1);
-        result.geometry={geometry.vertices,geometry.indices,geometry.firstIndex,geometry.indexCount};
         if (!prepareWorldVertexProgramInto(*geometry.vertexBindings,result.options,result.constants)) {
             // Strict full-palette validation failed. Retry once with a
             // geometry-aware proof that only proven-unread rows may be
@@ -863,17 +953,18 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
             }
             result.options=fallbackOptions;result.constants=fallbackConstants;
         }
-        std::array<uint8_t,20> program{}; std::array<uint8_t,24> viewport{};
+        std::array<uint8_t,20> program; std::array<uint8_t,24> viewport;
         if (!copyRenderMemory(base,context+16896,result.attributes.data(),160) ||
             !copyRenderMemory(base,context+17152,viewport.data(),24) ||
-            !snapshotWorldTargets(base,geometry.vertexBindings->deviceAddress,result)) return fail(3);
+            !snapshotWorldTargets(base,geometry.vertexBindings->deviceAddress,result) ||
+            !snapshotWorldClipPlanes(base,geometry.vertexBindings->deviceAddress,result.clipPlanes)) return fail(3);
         for (unsigned i=0;i<4;++i) result.viewport[i]=word(viewport.data()+4*i);
         result.depthRange={std::bit_cast<float>(word(viewport.data()+16)),std::bit_cast<float>(word(viewport.data()+20)),0,0};
         if(!finite(result.depthRange) || result.depthRange[0]<0 || result.depthRange[0]>1 || result.depthRange[1]<0 || result.depthRange[1]>1) return fail(4);
         if (!result.viewport[2] || !result.viewport[3] || result.viewport[2]>4096 || result.viewport[3]>4096) return fail(4);
         const auto* a=result.attributes.data(); const auto address=word(a);
         if (address) {
-            std::array<char,96> name{};
+            std::array<char,96> name;
             if (!copyRenderMemory(base,address,program.data(),20) || word(program.data())!=5 ||
                 !copyRenderMemory(base,word(program.data()+4),name.data(),name.size()) ||
                 std::find(name.begin(),name.end(),char(0))==name.end()) return fail(5);
@@ -883,10 +974,11 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
             else result.material=WorldMaterial::post;
             result.fragmentName=name.data();result.fragmentFlags=word(program.data()+16)>>8;
             const auto count=word(program.data()+16)&255u;
-            if (count>16 || (result.material==WorldMaterial::ndsp && count<4)) return fail(6);
-            std::array<uint8_t,256> env{};
+            if (count>result.fragmentConstants.size() || (result.material==WorldMaterial::ndsp && count<4)) return fail(6);
+            std::array<uint8_t,64*16> env;
             // Original822478C0 uploads to device+6016. Read that completed
             // copy, not the GUI's mutable program parameter allocation.
+            // Exactly the copied count vectors are consumed; count0 reads none.
             if (count && !copyRenderMemory(base,geometry.vertexBindings->deviceAddress+6016,env.data(),count*16)) return fail(7);
             for (unsigned v=0;v<count;++v) {
                 for (unsigned l=0;l<4;++l) result.fragmentConstants[v][l]=std::bit_cast<float>(word(env.data()+v*16+l*4));
@@ -925,8 +1017,8 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
             // and its fetch/sampler descriptor at1152+slot*24. 822569E0 skips
             // rebinding unchanged IDs: a subsequently switched resource-table
             // wrapper is NOT necessarily the texture used by this draw.
-            std::array<uint8_t,16*24> samplerBytes{};
-            std::array<uint8_t,16*4> boundObjects{};
+            std::array<uint8_t,16*24> samplerBytes;
+            std::array<uint8_t,16*4> boundObjects;
             if(!copyRenderMemory(base,device+1152,samplerBytes.data(),samplerBytes.size()) ||
                !copyRenderMemory(base,device+12536,boundObjects.data(),boundObjects.size()))return fail(11);
             std::array<uint8_t,4> tableBytes{};
@@ -936,7 +1028,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
             const auto table=word(tableBytes.data());
             for (unsigned s=0;s<16;++s)if(result.textureMask&(1u<<s)) {
                 const auto id=result.textureIds[s]=half(a+8+s*2);
-                std::array<uint32_t,6> state{};
+                std::array<uint32_t,6> state;
                 for(unsigned w=0;w<6;++w)state[w]=word(samplerBytes.data()+s*24+w*4);
                 auto& sampler=result.samplers[s];sampler=decodeWorldSampler(state);
                 const auto object=word(boundObjects.data()+s*4);
@@ -945,12 +1037,42 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
                 if(!object)continue;
                 WorldTexture texture;
                 if(!snapshotWorldTexture(base,object,texture))continue;
+                static const bool probe=[] {
+                    const auto* value=std::getenv("DARK_OW_PROBE");
+                    return value && std::strcmp(value,"1")==0;
+                }();
+                if(probe) {
+                    const bool otherWorldProbe=result.fragmentName=="WClientMod_OW1_1" || result.fragmentName=="WClientMod_OW1_2";
+                    const bool lightmapProbe=result.fragmentName=="XRShader_FP20_LFM";
+                    const bool dynamicLightProbe=result.fragmentName=="XRShader_FP20_NDSP";
+                    if(otherWorldProbe || lightmapProbe || dynamicLightProbe) {
+                        static std::atomic<unsigned> reports[3]{};
+                        const unsigned group=otherWorldProbe?0:lightmapProbe?1:2;
+                        const auto report=reports[group].fetch_add(1,std::memory_order_relaxed);
+                        if(report<(group?128u:16u)) {
+                            std::array<uint8_t,24> original{};
+                            const bool readable=copyRenderMemory(base,object+28,original.data(),original.size());
+                            std::fprintf(stderr,"[OtherWorldFetch] program=%s slot=%u object=%08X completed=%08X,%08X,%08X,%08X,%08X,%08X headerReadable=%u header=%08X,%08X,%08X,%08X,%08X,%08X\n",
+                                result.fragmentName.c_str(),s,object,state[0],state[1],state[2],state[3],state[4],state[5],unsigned(readable),
+                                word(original.data()),word(original.data()+4),word(original.data()+8),
+                                word(original.data()+12),word(original.data()+16),word(original.data()+20));
+                            if(group==0 && report==0) {
+                                std::array<uint8_t,1536> ramp{};
+                                const auto device=geometry.vertexBindings->deviceAddress;
+                                const bool rampReadable=copyRenderMemory(base,device+14980,ramp.data(),ramp.size());
+                                std::fprintf(stderr,"[OtherWorldDisplayGamma] device=%08X readable=%u rampBE=",device,unsigned(rampReadable));
+                                for(const auto byte:ramp)std::fprintf(stderr,"%02X",unsigned(byte));
+                                std::fprintf(stderr,"\n");
+                            }
+                        }
+                    }
+                }
                 // Retain the object's virtual storage address for resolve keys;
                 // the device fetch address is a translated physical alias.
                 // Without matching upload metadata, the completed sampler's
                 // minimum is a conservative readable tail, not a new binding.
                 texture.firstMip=sampler.lodValid?sampler.minLevel:0;
-                std::array<uint8_t,4> pointer{};std::array<uint8_t,184> resource{};
+                std::array<uint8_t,4> pointer;std::array<uint8_t,184> resource;
                 if(id && table && uint64_t(table)+(id+1ull)*4+4<=0x100000000ull &&
                    copyRenderMemory(base,table+(id+1)*4,pointer.data(),4) &&
                    copyRenderMemory(base,word(pointer.data()),resource.data(),resource.size())) {
@@ -965,8 +1087,8 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
                         // 82257450 publishes the skipped prefix. 82257010
                         // clears the integer when complete, even during fade.
                         texture.firstMip=fade>0?uint32_t(pending):0;
-                        std::array<uint8_t,184> after{};
-                        std::array<uint8_t,4> currentPointer{};
+                        std::array<uint8_t,184> after;
+                        std::array<uint8_t,4> currentPointer;
                         if(!copyRenderMemory(base,word(pointer.data()),after.data(),after.size()) ||
                            !copyRenderMemory(base,table+(id+1)*4,currentPointer.data(),4) || currentPointer!=pointer ||
                            word(after.data()+selected)!=word(resource.data()+selected) ||
@@ -986,7 +1108,7 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
                     }
                 }
                 if(texture.firstMip>=texture.mipLevels)continue;
-                std::array<uint8_t,4> currentObject{};std::array<uint8_t,24> currentSampler{};
+                std::array<uint8_t,4> currentObject;std::array<uint8_t,24> currentSampler;
                 if(!copyRenderMemory(base,device+12536+s*4,currentObject.data(),currentObject.size()) ||
                    word(currentObject.data())!=object ||
                    !copyRenderMemory(base,device+1152+s*24,currentSampler.data(),currentSampler.size()) ||
@@ -1000,12 +1122,29 @@ static bool snapshotWorldDrawInto(uint8_t* base,const StoredDraw& geometry,World
 bool snapshotWorldDraw(uint8_t* base,const StoredDraw& geometry,WorldDraw& output) noexcept {
     WorldDraw result;
     if(!snapshotWorldDrawInto(base,geometry,result))return false;
+    result.geometry={geometry.vertices,geometry.indices,geometry.firstIndex,geometry.indexCount};
     output=std::move(result);return true;
 }
 std::shared_ptr<WorldDraw> captureWorldDraw(uint8_t* base,const StoredDraw& geometry) noexcept {
     try {
         auto result=acquireWorldDraw();
-        if(snapshotWorldDrawInto(base,geometry,*result))return result;
+        if(snapshotWorldDrawInto(base,geometry,*result)) {
+            result->geometry={geometry.vertices,geometry.indices,geometry.firstIndex,geometry.indexCount};
+            return result;
+        }
+    }catch(...){}
+    return {};
+}
+std::shared_ptr<WorldDraw> captureWorldDraw(uint8_t* base,StoredDraw&& geometry) noexcept {
+    try {
+        auto result=acquireWorldDraw();
+        if(snapshotWorldDrawInto(base,geometry,*result)) {
+            // Guest validation is complete. Failed captures retain the caller's
+            // references; successful captures transfer their ownership once.
+            result->geometry={std::move(geometry.vertices),std::move(geometry.indices),
+                              geometry.firstIndex,geometry.indexCount};
+            return result;
+        }
     }catch(...){}
     return {};
 }
@@ -1029,8 +1168,24 @@ WorldSampler decodeWorldSampler(const std::array<uint32_t,6>& words) noexcept {
     if(result.border>1)return result;
     result.valid=true;return result;
 }
+bool snapshotWorldClipPlanes(uint8_t* base,uint32_t device,WorldClipPlanes& output) noexcept {
+    // 8285F428 updates the six user-plane enable bits in PA_CL_CLIP_CNTL;
+    // 8285FBD0 controls clip-disable. 82249250 writes the completed planes.
+    if(!device || uint64_t(device)+10568>0x100000000ull)return false;
+    std::array<uint8_t,4> control{};
+    if(!copyRenderMemory(base,device+10564,control.data(),control.size()))return false;
+    WorldClipPlanes result;result.control=word(control.data());
+    for(unsigned i=0;i<result.planes.size();++i)if(result.enabledMask()&(1u<<i)) {
+        std::array<uint8_t,16> plane{};
+        if(!copyRenderMemory(base,device+10272+i*16,plane.data(),plane.size()))return false;
+        for(unsigned lane=0;lane<4;++lane)
+            result.planes[i][lane]=std::bit_cast<float>(word(plane.data()+lane*4));
+        if(!finite(result.planes[i]))return false;
+    }
+    output=result;return true;
+}
 bool snapshotWorldTexture(uint8_t* base,uint32_t object,WorldTexture& output) noexcept {
-    std::array<uint8_t,64> header{};
+    std::array<uint8_t,64> header;
     if(!copyRenderMemory(base,object,header.data(),header.size())) return false;
     WorldTexture t;t.object=object;t.storage=word(header.data()+32)&0xFFFFF000u;
     t.format=word(header.data()+32)&63;t.width=(word(header.data()+36)&8191)+1;t.height=((word(header.data()+36)>>13)&8191)+1;

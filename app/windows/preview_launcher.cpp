@@ -1,6 +1,6 @@
 #include <windows.h>
+#include <shellapi.h>
 #include <filesystem>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,18 +25,28 @@ struct Handle {
 };
 }
 
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     try {
         bool muted = true;
         bool captureFrames = false;
         bool shadowCapture = false;
-        std::wistringstream options(arguments ? arguments : L"");
-        for (std::wstring option; options >> option;) {
+        int argumentCount=0;
+        auto rawArguments=CommandLineToArgvW(GetCommandLineW(),&argumentCount);
+        if(!rawArguments)throw std::runtime_error("Cannot parse launcher arguments.");
+        struct FreeArguments {wchar_t** value;~FreeArguments(){LocalFree(value);}} freeArguments{rawArguments};
+        std::vector<std::wstring> forwarded;
+        std::filesystem::path requestedGameDirectory;
+        for (int i=1;i<argumentCount;++i) {
+            const std::wstring option=rawArguments[i];
             if (option == L"--sound") muted = false;
             else if (option == L"--mute") muted = true;
             else if (option == L"--capture-frames") captureFrames = true;
             else if (option == L"--shadow-capture") shadowCapture = true;
-            else throw std::runtime_error("Supported launcher options: --sound, --mute, --capture-frames, --shadow-capture.");
+            else if(option==L"--game-dir") {
+                if(++i==argumentCount)throw std::runtime_error("--game-dir requires a directory.");
+                requestedGameDirectory=std::filesystem::absolute(rawArguments[i]);
+            }
+            else forwarded.push_back(option);
         }
         std::vector<wchar_t> module(32768);
         const DWORD length = GetModuleFileNameW(nullptr, module.data(), DWORD(module.size()));
@@ -45,8 +55,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         const auto executable = binaryDirectory / L"DarkRecomp.exe";
         auto root = binaryDirectory;
         bool found = false;
-        for (unsigned i = 0; i < 4; ++i) {
-            if (std::filesystem::is_regular_file(root / L"Darkness/basefile.exe")) { found = true; break; }
+        if(!requestedGameDirectory.empty()) {
+            found=std::filesystem::is_regular_file(requestedGameDirectory/L"default.xex");
+            root=requestedGameDirectory.parent_path();
+        }
+        else for (unsigned i = 0; i < 4; ++i) {
+            if (std::filesystem::is_regular_file(root / L"Darkness/default.xex")) { found = true; break; }
             root = root.parent_path();
         }
         if (!found || !std::filesystem::is_regular_file(executable))
@@ -72,6 +86,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
 
         std::wstring command = quote(executable) + L" --game-dir " + quote(root / L"Darkness") +
             L" --timeout-ms 0 --engine-preview --trace-frame-hitches" + (muted ? L" --mute" : L"");
+        if(!requestedGameDirectory.empty())command=quote(executable)+L" --game-dir "+quote(requestedGameDirectory)+
+            L" --timeout-ms 0 --engine-preview --trace-frame-hitches"+(muted?L" --mute":L"");
+        for(const auto& option:forwarded)command+=L" "+quote(std::filesystem::path(option));
         // Captures synchronously read back the GPU and write a full BMP on the
         // display thread. Keep that diagnostic work out of normal gameplay.
         if (captureFrames) command += L" --preview-frame " + quote(evidence / L"preview.bmp");

@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 #include "ppc_context.h"
+#include "native_menu_assets.h"
+#include "developer_weapon_assets.h"
 
 namespace DarkRecomp { class CDisplayContextD3D11; }
 
@@ -26,6 +28,9 @@ public:
     Memory& operator=(const Memory&) = delete;
     uint8_t* base() const { return base_; }
     const std::filesystem::path& gameDirectory() const { return gameDir_; }
+    const NativeMenuAssets& nativeMenuAssets() const { return nativeMenuAssets_; }
+    void enableDeveloperWeaponAssets(PPCContext& ctx, uint8_t* base);
+    std::shared_ptr<const CachedWeaponFile> developerWeaponFile(const std::filesystem::path& path) const;
     bool commit(uint32_t address, uint32_t size);
     uint32_t allocate(uint32_t size, uint32_t alignment = 4096,
                       uint32_t regionBase = 0x10000000, uint64_t regionEnd = 0x60000000);
@@ -36,7 +41,9 @@ public:
     static uint32_t physicalAddress(uint32_t address);
     static constexpr uint32_t cAliasBegin = 0xc0000000u;
     static constexpr uint32_t cAliasEnd = 0xe0000000u;
-    static constexpr uint32_t cViewBytes = 0x01000000u;
+    // Host query granularity. Guest physical page sizes and allocation
+    // alignment are handled independently by the allocation imports.
+    static constexpr uint32_t cViewBytes = 0x00040000u;
     static constexpr uint32_t cViewEnd(uint32_t address) {
         return (address & ~(cViewBytes - 1)) + cViewBytes;
     }
@@ -77,6 +84,8 @@ private:
     uint8_t* base_ = nullptr;
     std::vector<std::pair<uint32_t, bool>> memoryViews_;
     std::filesystem::path gameDir_;
+    NativeMenuAssets nativeMenuAssets_;
+    std::atomic<std::shared_ptr<const DeveloperWeaponAssets>> developerWeaponAssets_;
     uint32_t headerSize_ = 0;
     std::vector<uint8_t> tlsInitial_;
     std::map<uint32_t, uint32_t> allocations_;
@@ -105,6 +114,7 @@ uint32_t dispatcherWaiterCount(uint8_t* base, uint32_t address);
 using DispatcherWaitResumeHook = void (*)(void*) noexcept;
 void setDispatcherWaitResumeHook(DispatcherWaitResumeHook hook, void* context);
 void initializeKernel();
+void publishSystemUiNotification(bool open);
 // Optional worker profiler snapshot: at most 64 live registered guest threads.
 // Caller owns/closes the duplicate handles; no registry lock survives this call.
 // Threads can exit after the snapshot. Does not suspend or modify guest state.

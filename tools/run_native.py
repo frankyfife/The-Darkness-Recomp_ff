@@ -4,6 +4,7 @@ import hashlib
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -24,13 +25,16 @@ parser.add_argument("--height", type=int, help="Window height / requested aspect
 parser.add_argument("--render-height", type=int, default=720, help="Internal render height, 180..2160 (default: 720)")
 parser.add_argument("--fov", type=float, help="Horizontal FOV at 16:9; 0 keeps Original, otherwise 60..120")
 parser.add_argument("--profile-engine", action="store_true", help="Measure inclusive CPU time at engine preparation boundaries")
+parser.add_argument("--stall-profile", action="store_true", help="Enable lightweight runtime stall profiling in the evidence log")
 parser.add_argument("--sample-engine", action="store_true", help="Sample our engine thread's native instruction addresses for profiling")
 parser.add_argument("--sample-workers", action="store_true", help="Sample registered guest worker threads (diagnostic only)")
 parser.add_argument("--test-start", action="store_true", help="Integration test: press Start once after the world begins")
 parser.add_argument("--test-skip-intros", action="store_true", help="Integration test: send bounded Space pulses until the world begins")
 parser.add_argument("--test-input", type=Path, help="Integration test: read up to 64 keyboard commands from this file "
                     "(numeric '<key> [<holdMs 1..10000>]'; bare menu keys hold 250ms, I/J/K/L hold 2000ms; "
-                    "'mouse <dx> <dy>'; 'capture'; '0' inspects; an invalid line blocks later commands until fixed)")
+                    "'mouse <dx> <dy>'; 'capture'; '0' inspects; an invalid line blocks later commands until fixed). "
+                    "Newline completes a command; maximum file size 256KiB. Background polling and stable snapshots "
+                    "take about 500ms, plus up to 250ms before display dispatch.")
 args = parser.parse_args()
 if not 100 <= args.timeout_ms <= 1800000:
     parser.error("--timeout-ms must be between 100 and 1800000")
@@ -60,6 +64,8 @@ if args.trace_renderer:
     command += ["--trace-renderer", str(log.with_suffix(".render"))]
 if args.engine_preview:
     command += ["--engine-preview", "--preview-frame", str(log.with_suffix(".bmp"))]
+else:
+    command += ["--no-engine-preview"]
 if args.mute:
     command += ["--mute"]
 if args.profile_engine:
@@ -71,6 +77,10 @@ if args.sample_workers:
 if args.test_input: command += ["--test-input", str(args.test_input.resolve())]
 if args.test_start: command += ["--test-start"]
 if args.test_skip_intros: command += ["--test-skip-intros"]
+environment = None
+if args.stall_profile:
+    environment = os.environ.copy()
+    environment["DARKRECOMP_STALL_PROFILE"] = "1"
 with Path(command[0]).open("rb") as executable:
     executable_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
 external_timeout = False
@@ -85,7 +95,7 @@ if sys.platform == "win32":
 with log.open("w", encoding="utf-8") as stream:
     try:
         result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
-                                startupinfo=startupinfo, cwd=root,
+                                startupinfo=startupinfo, cwd=root, env=environment,
                                 timeout=args.timeout_ms / 1000 + 10)
         code = result.returncode
     except subprocess.TimeoutExpired:
@@ -94,7 +104,7 @@ with log.open("w", encoding="utf-8") as stream:
         stream.write("[TIMEOUT] Host process exceeded its external deadline.\n")
 summary = {"command": command, "exit_code": code, "log": str(log), "gameplay_verified": False,
            "executable_sha256": executable_sha256, "external_timeout": external_timeout,
-           "window_mode": window_mode}
+           "window_mode": window_mode, "stall_profile_requested": args.stall_profile}
 if args.engine_preview:
     summary["renderer_subset"] = "original text/video plus engine world depth, stencil, motion, NDSP lighting, post-processing, resolves and frontbuffer presentation"
     summary["native_frame_capture"] = str(log.with_suffix(".bmp")) if log.with_suffix(".bmp").is_file() else None

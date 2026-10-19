@@ -240,6 +240,26 @@ static void testMouseLookContract(PPCContext& ctx) {
         input.setMouseLookEnabled(false); input.setMouseLookEnabled(true);
         tick(); commands.clear();
     };
+    input.setMouseLookEnabled(false, true);
+    input.mouseMotion(1000, -1000);
+    base[client + 8816] = 2;
+    tick();
+    check(!input.mouseLookEnabled(), "Authored camera mode enabled loading capture");
+    base[client + 8816] = 0;
+    memory->write32(client + 516, 0x21);
+    tick();
+    check(!input.mouseLookEnabled() && commands.empty(),
+          "Input-disabled client enabled loading capture or replayed mouse motion");
+    memory->write32(client + 516, 1);
+    memory->write32(client + 7360, block + 0xA500);
+    tick();
+    check(!input.mouseLookEnabled(), "Active GUI enabled loading mouse look");
+    memory->write32(client + 7360, 0);
+    tick(0x823FC99C);
+    check(!input.mouseLookEnabled(), "Unrelated caller enabled loading mouse look");
+    tick();
+    check(input.mouseLookEnabled() && commands.empty(),
+          "First eligible client tick must enable look without load-time movement");
     commands.clear(); input.mouseMotion(12, -7); tick(0x823FC99C);
     check(commands.empty(), "Call instruction address must not be mistaken for its return LR");
     tick();
@@ -296,6 +316,106 @@ static void testMouseLookContract(PPCContext& ctx) {
         tick(); input.mouseMotion(1, 1); tick();
         check(commands.empty(), "Returning from menu must replay neither counts nor fractional carry");
     }
+    // The production wrapper must publish original GUI ownership, not just
+    // discard camera movement. Wheel input reaches the same original SDK ABI.
+    auto wheelButtons = [&] {
+        check(input.getState(*memory, 0, 0, decoded) == ERROR_SUCCESS, "GUI wheel SDK query failed");
+        return PPC_LOAD_U16(decoded + 4);
+    };
+    newEpoch();
+    memory->write32(client + 7360, block + 0xA500);
+    tick();
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    check((wheelButtons() & XINPUT_GAMEPAD_DPAD_UP) != 0,
+          "Original active GUI did not route captured mouse wheel to dialogue choices");
+    memory->write32(client + 7360, 0); tick();
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    check((wheelButtons() & XINPUT_GAMEPAD_DPAD_RIGHT) != 0,
+          "Original GUI exit did not restore gameplay weapon wheel input");
+    input.setMouseLookEnabled(false);
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    check(wheelButtons() == 0,"Original gameplay signal allowed power cycling after F2 capture release");
+    memory->write32(client + 7360, block + 0xA500); tick();
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    check((wheelButtons() & XINPUT_GAMEPAD_DPAD_UP) != 0,
+          "Original active GUI did not accept released mouse wheel input");
+    memory->write32(client + 7360, 0); tick();
+    check(wheelButtons() == 0,"Original released GUI exit retained wheel input");
+
+    // Actual conversation choices are player-client data, with no active GUI.
+    // Build the original client actor vector and leave the weapon wheel binds
+    // intact. Camera actor choices must not be mistaken for local choices.
+    const auto originalBindings = input.keyboardBindings();
+    memory->write32(client + 536, 1); memory->write32(client + 540, 2);
+    memory->write32(client + 3956, 3);
+    memory->write32(block + 0xA404, 3);
+    memory->write32(block + 0xA418, block + 0xA600);
+    memory->write32(block + 0xA604, player);
+    const auto npc = block + 0xC000, npcState = block + 0xD000;
+    memory->write32(block + 0xA608, npc);
+    PPC_STORE_U16(player + 368, 1); PPC_STORE_U16(player + 370, 1);
+    PPC_STORE_U16(npc + 368, 2); PPC_STORE_U16(npc + 370, 1);
+    memory->write32(npc + 396, npcState); memory->write32(npcState + 16, npc);
+    base[npcState + 4296] = 3;
+    newEpoch();
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    check(wheelButtons() == XINPUT_GAMEPAD_DPAD_RIGHT,
+          "Camera NPC choices stole the local player's weapon wheel");
+    base[state + 4296] = 3; base[state + 4297] = 1;
+    PPC_STORE_U16(state + 7196, 0xffff); // No companion dialogue owner.
+    tick();
+    check(wheelButtons() == 0, "Opening actual dialogue replayed a weapon wheel press");
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, 240), 0);
+    check(wheelButtons() == XINPUT_GAMEPAD_DPAD_UP && PPC_LOAD_U32(client + 7360) == 0,
+          "Actual dialogue without a GUI required unbinding wheel from weapons");
+    const auto dialogueMessage = block + 0xB200;
+    const auto choose = [&](uint32_t control) {
+        memory->write32(dialogueMessage, 4380); memory->write32(dialogueMessage + 4, control);
+        auto call = fresh(); call.r3.u64 = player; call.r4.u64 = client; call.r5.u64 = dialogueMessage;
+        sub_821570E8(call, base);
+    };
+    choose(0x100); tick();
+    check(base[state + 4297] == 0, "Original dialogue handler did not select the previous choice");
+    Sleep(45);
+    check(wheelButtons() == 0, "Actual dialogue wheel lacked a release edge");
+    newEpoch();
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, short(-WHEEL_DELTA)), 0);
+    check(wheelButtons() == XINPUT_GAMEPAD_DPAD_DOWN, "Actual dialogue wheel down missed next choice input");
+    choose(0x200); tick();
+    check(base[state + 4297] == 1 && input.keyboardBindings() == originalBindings,
+          "Original next-choice navigation failed or changed saved weapon bindings");
+    auto customDialogue = originalBindings;
+    check(assignKeyboardKey(customDialogue, KeyboardAction::PreviousDialogueChoice, 0, 'H') &&
+          assignKeyboardKey(customDialogue, KeyboardAction::NextDialogueChoice, 0, 'N') &&
+          assignKeyboardKey(customDialogue, KeyboardAction::PreviousDialogueChoice, 1, 0) &&
+          assignKeyboardKey(customDialogue, KeyboardAction::NextDialogueChoice, 1, 0) &&
+          input.setKeyboardBindings(customDialogue), "Cannot configure original dialogue's independent keys");
+    newEpoch();
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    check(wheelButtons() == 0 && base[state + 4297] == 1,
+          "Original dialogue ignored a cleared wheel binding");
+    input.windowMessage(window, WM_KEYDOWN, 'H', 0);
+    check(wheelButtons() == XINPUT_GAMEPAD_DPAD_UP, "Custom previous key missed actual dialogue context");
+    choose(0x100); tick();
+    input.windowMessage(window, WM_KEYUP, 'H', 0);
+    check(base[state + 4297] == 0, "Custom previous binding did not reach original dialogue selection");
+    input.windowMessage(window, WM_KEYDOWN, 'N', 0);
+    check(wheelButtons() == XINPUT_GAMEPAD_DPAD_DOWN, "Custom next key missed actual dialogue context");
+    choose(0x200); tick();
+    input.windowMessage(window, WM_KEYUP, 'N', 0);
+    check(base[state + 4297] == 1 &&
+          customDialogue.keys[size_t(KeyboardAction::PreviousWeapon)] == originalBindings.keys[size_t(KeyboardAction::PreviousWeapon)] &&
+          customDialogue.keys[size_t(KeyboardAction::NextWeapon)] == originalBindings.keys[size_t(KeyboardAction::NextWeapon)],
+          "Custom original dialogue navigation failed or displaced weapon bindings");
+    base[state + 4296] = 0; tick();
+    check(wheelButtons() == 0, "Closing actual dialogue replayed a choice as a weapon switch");
+    input.windowMessage(window, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    check(wheelButtons() == XINPUT_GAMEPAD_DPAD_RIGHT,
+          "Actual dialogue exit did not restore the unchanged weapon wheel binding");
+    check(input.setKeyboardBindings(originalBindings), "Cannot restore original dialogue fixture controls");
+    input.setMouseLookEnabled(true);
+    memory->write32(client + 536, 0); memory->write32(client + 540, 0);
+    tick();
     newEpoch(); base[client + 8816] = 2;
     std::array<uint8_t, 64> cameraBefore{};
     std::memcpy(cameraBefore.data(), base + client + 8880, cameraBefore.size());
@@ -321,6 +441,14 @@ static void testMouseLookContract(PPCContext& ctx) {
     check(input.setMouseSensitivity(10), "Maximum mouse sensitivity accepted");
     newEpoch(); input.mouseMotion(20, -10); tick();
     check(totals() == std::array<int64_t, 2>{800, 1600}, "Mouse sensitivity must scale physical distance linearly");
+    newEpoch(); input.mouseMotion(1000, -500); tick();
+    check(commands.size() > 1 && totals() == std::array<int64_t, 2>{40000, 80000},
+          "Maximum sensitivity must split fast mouse motion without clipping or wrapping");
+    const auto fastMaximumSensitivity = totals();
+    newEpoch();
+    for (unsigned i = 0; i < 100; ++i) { input.mouseMotion(10, -5); tick(); }
+    check(totals() == fastMaximumSensitivity,
+          "Maximum sensitivity must preserve distance across fast and slow delivery");
     check(input.setMouseSensitivity(1), "Default mouse sensitivity restored after scaling");
     newEpoch();
     memory->write32(client, 0x82081BF0);

@@ -9,7 +9,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from compile_vertex_template import ASSETS, parse, translate
-from compile_world_template import translate as translate_world
+from compile_world_template import translate as translate_world, vertex_program_descriptors
 
 
 class VertexTemplateTests(unittest.TestCase):
@@ -35,9 +35,32 @@ class VertexTemplateTests(unittest.TestCase):
     def test_original_world_assets_translate_deterministically(self):
         first = translate_world(ROOT / 'Darkness')
         self.assertEqual(first, translate_world(ROOT / 'Darkness'))
-        self.assertEqual(len(first[1]['instructions']), 611)
+        self.assertEqual(len(first[1]['instructions']), 614)
         self.assertNotIn('$', first[0])
         self.assertNotIn('@', first[0])
+
+    def test_world_prewarm_keys_cover_original_cache(self):
+        raw = (ROOT / 'Darkness/System/Xenon/ProgramCache.xpc').read_bytes()
+        # Independent walk retains exactly the descriptor portion, excluding
+        # declaration identity, original GPU code and record metadata.
+        offset, expected = 100, []
+        for _ in range(struct.unpack_from('>I', raw, 96)[0]):
+            expected.append(raw[offset + 17:offset + 37].hex())
+            offset += 41 + struct.unpack_from('>I', raw, offset + 37)[0]
+        manifest = translate_world(ROOT / 'Darkness')[1]
+        self.assertEqual(len(expected), 442)
+        self.assertEqual(manifest['vertex_program_descriptors'], expected)
+        self.assertTrue(all(len(bytes.fromhex(key)) == 20 for key in expected))
+
+    def test_world_prewarm_keys_reject_truncated_records(self):
+        descriptor = bytes(range(20))
+        bytecode = b'gpu-bytecode-must-not-be-retained'
+        header = bytes(96) + struct.pack('>I', 1)
+        record = bytes(17) + descriptor + struct.pack('>I', len(bytecode)) + bytecode
+        self.assertEqual(vertex_program_descriptors(header + record), [descriptor.hex()])
+        for size in (0, 99, 100, 140, len(header + record) - 1):
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, 'Truncated vertex cache'):
+                vertex_program_descriptors((header + record)[:size])
 
     def test_world_lighting_branch_selection(self):
         from compile_world_template import condition, MODES
@@ -160,6 +183,52 @@ class VertexTemplateTests(unittest.TestCase):
                 self.assertLess(blob.index(dots), blob.index(one))
                 self.assertLess(blob.index(one), blob.index(export))
             offset += 41 + length
+
+    def test_world_water_basis_branch_selection(self):
+        from compile_world_template import condition, MODES
+        code, manifest = translate_world(ROOT / 'Darkness')
+        for name, mode, stage, register in (
+                ('normalmap', 11, 3, 'R9'), ('tang_u', 23, 4, 'R0'), ('tang_v', 24, 5, 'R1')):
+            self.assertEqual(MODES[name], mode)
+            self.assertEqual(manifest['water_basis_stages'][name], [stage])
+            for other in range(8):
+                self.assertEqual(condition(f'texgen{other}_{name}'),
+                                 f'MODE_{stage} == {mode}' if other == stage else False)
+            self.assertIn(f'#if MODE_{stage} == {mode}\nR3 = MOV({register});\n#endif', code)
+            # The original common output path preserves all four lanes and
+            # applies an optional matrix; basis branches consume no TEXPARAM.
+            self.assertIn(f'_oT{stage} = MOV(R3);', code)
+            self.assertIn(f'_oT{stage}.w = DP4(R3, c[refs[{stage+1}].y+3]).w;', code)
+
+    def test_world_water_basis_mapping_in_original_cache(self):
+        cache = (ROOT / 'Darkness/System/Xenon/ProgramCache.xpc').read_bytes()
+        big = lambda at: struct.unpack_from('>I', cache, at)[0]
+        # Actual authored CubeWater and Water programs (with and without fog).
+        # Their basis interpolators are straight MAX rN,rN exports, proving
+        # no per-stage TEXPARAM transform precedes the normal/tangent output.
+        wanted = {
+            2: ((0, 20, 1, 11, 23, 24, 1, 1), (5, 3, 2)),
+            438: ((0, 0, 8, 11, 23, 24, 1, 1), (3, 2, 1)),
+            439: ((0, 0, 8, 11, 23, 24, 4, 4), (1, 5, 6)),
+        }
+        manifest = translate_world(ROOT / 'Darkness')[1]
+        offset, seen = 0x64, set()
+        for record in range(big(0x60)):
+            length = big(offset + 37)
+            if record in wanted:
+                modes, basis = wanted[record]
+                self.assertIn(record, manifest['cache_evidence_records'])
+                self.assertEqual(big(offset + 21), 0x41600000)
+                self.assertEqual(big(offset + 17), 0xFAC68800)
+                self.assertEqual(cache[offset + 25:offset + 33], bytes(modes))
+                blob = cache[offset + 41:offset + 41 + length]
+                exports = b''.join(struct.pack('>III', 0xC80F8000 | stage, 0,
+                                              0xC2000000 | (source << 16) | (source << 8))
+                                   for stage, source in zip((3, 4, 5), basis))
+                self.assertEqual(blob.count(exports), 1)
+                seen.add(record)
+            offset += 41 + length
+        self.assertEqual(seen, set(wanted))
 
     def test_quoted_comments_are_code_and_outer_comments_are_ignored(self):
         tree = parse('/* *bogus { */ *Root { // outside\n *Code "// inside { }" }')

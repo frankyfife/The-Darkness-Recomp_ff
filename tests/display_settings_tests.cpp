@@ -4,13 +4,21 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 using namespace DarkRecomp;
 using namespace DarkRecomp::Native;
 static void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 static bool approximatelyEqual(double a, double b) { return std::abs(a - b) < 0.00002; }
+static std::string fileBytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    check(input.good(), "cannot read isolated settings fixture");
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
 int main() {
     const auto path = std::filesystem::temp_directory_path() /
         (L"DarkRecomp-display-test-" + std::to_wstring(GetCurrentProcessId()) + L".ini");
@@ -28,11 +36,19 @@ int main() {
             check(loadGraphicsSettings(path) == GraphicsSettings{120,720,true,true,false} && loadFieldOfView(path) == 114,
                   "unsafe saved resolution did not recover independently");
         }
-        for (const auto requested : {720u, 1080u, 1440u}) {
-            const auto render = renderSizeForDisplay({3440,1440}, requested);
-            check(render.width == requested * 3440 / 1440 && render.height == requested,
-                  "supported native resolution was silently downscaled");
+        for (const NativeDisplaySize expected : {NativeDisplaySize{1720,720}, {2576,1080}, {3440,1440}}) {
+            const auto render = renderSizeForDisplay({3440,1440}, expected.height);
+            check(render.width == expected.width && render.height == expected.height,
+                  "supported native resolution did not preserve the aligned guest viewport");
         }
+        // The physical ultrawide display hits the host width cap at 2160p.
+        // The former even-only mode was 1364x570, while the original camera
+        // produced 1364x568 and every startup video draw failed the native gate.
+        const auto cappedUltrawide = renderSizeForDisplay({3440,1440}, 2160);
+        const auto cappedScale = nativeResolutionScale(cappedUltrawide);
+        check(cappedUltrawide.width == 4092 && cappedUltrawide.height == 1704 && cappedScale == 3 &&
+              cappedUltrawide.width / cappedScale == 1364 && cappedUltrawide.height / cappedScale == 568,
+              "capped ultrawide mode differs from the original fullscreen camera viewport");
         const auto native4k = renderSizeForDisplay({3840,2160}, 2160);
         check(native4k.width == 3840 && native4k.height == 2160, "4K resolution was silently downscaled");
         const auto superwide = renderSizeForDisplay({5120,1440}, 2160);
@@ -41,8 +57,8 @@ int main() {
             for (uint32_t height = 180; height <= 2160; ++height) {
                 const auto render = renderSizeForDisplay(output, height);
                 const auto scale = nativeResolutionScale(render);
-                check(scale >= 1 && scale <= 3 && render.width % (2 * scale) == 0 && render.height % (2 * scale) == 0,
-                      "native scaling did not retain exact integer edges and even guest dimensions");
+                check(scale >= 1 && scale <= 3 && render.width % (4 * scale) == 0 && render.height % (4 * scale) == 0,
+                      "native scaling did not retain exact integer edges and four-pixel guest viewports");
                 check(render.width / scale <= 2560 && render.height / scale <= 720,
                       "native scaling exceeded the guest allocation limits");
             }
@@ -52,42 +68,120 @@ int main() {
             check(saveDisplaySettings(path,114,high) && loadGraphicsSettings(path)==high,
                   "high internal resolution did not persist");
         }
-        const GraphicsSettings custom{137, 719, true, false, false, true, true};
+        const GraphicsSettings custom{137, 719, true, false, false, true, AntialiasingMode::FXAA};
         check(saveDisplaySettings(path, 93.125f, custom), "save custom graphics values");
         check(loadGraphicsSettings(path) == custom && loadFieldOfView(path) == 93.125f,
               "complete graphics round trip including bloom, motion blur and antialiasing");
-        auto aaOff = custom; aaOff.antialiasing = false;
+        check(GraphicsSettings{}.antialiasing == AntialiasingMode::Off, "antialiasing must default to Off");
+        for (const auto mode : {AntialiasingMode::Off, AntialiasingMode::FXAA, AntialiasingMode::SMAA,
+                               AntialiasingMode::MSAA2x, AntialiasingMode::MSAA4x, AntialiasingMode::MSAA8x}) {
+            auto selected = custom; selected.antialiasing = mode;
+            check(saveDisplaySettings(path, 93.125f, selected) && loadGraphicsSettings(path) == selected &&
+                  loadFieldOfView(path) == 93.125f, "antialiasing mode did not persist independently");
+            wchar_t savedMode[16]{};
+            GetPrivateProfileStringW(L"Display", L"Antialiasing", L"missing", savedMode, 16, path.c_str());
+            check(std::wstring_view(savedMode) == std::to_wstring(unsigned(mode)),
+                  "antialiasing did not save the stable numeric mode");
+        }
+        auto aaOff = custom; aaOff.antialiasing = AntialiasingMode::Off;
         check(saveDisplaySettings(path, 93.125f, aaOff) && loadGraphicsSettings(path) == aaOff,
               "antialiasing Off did not persist independently");
-        check(saveDisplaySettings(path, 93.125f, custom), "restore FXAA");
+        check(WritePrivateProfileStringW(L"Display", L"Antialiasing", L"1", path.c_str()) &&
+              loadGraphicsSettings(path) == custom, "legacy antialiasing 1 must retain FXAA");
+        check(WritePrivateProfileStringW(L"Display", L"Antialiasing", L"0", path.c_str()) &&
+              loadGraphicsSettings(path) == aaOff, "legacy antialiasing 0 must retain Off");
         check(WritePrivateProfileStringW(L"Display", L"Antialiasing", nullptr, path.c_str()), "remove antialiasing for legacy settings");
         check(loadGraphicsSettings(path) == aaOff, "legacy settings must default antialiasing to Off");
-        for (const auto bad : {L"-1", L"2", L"FXAA", L"42949672960"}) {
+        for (const auto bad : {L"-1", L"6", L"255", L"FXAA", L"1.0", L"42949672960"}) {
             WritePrivateProfileStringW(L"Display", L"Antialiasing", bad, path.c_str());
             check(loadGraphicsSettings(path) == aaOff, "invalid antialiasing did not fall back independently");
         }
         check(saveDisplaySettings(path, 93.125f, custom), "restore FXAA after invalid values");
-        for (unsigned gamma : {50u, 85u, 100u, 150u}) {
-            auto selected = custom; selected.gammaPercent = gamma;
-            check(saveDisplaySettings(path, 93.125f, selected) && loadGraphicsSettings(path) == selected,
-                  "gamma did not persist independently");
+        check(setGraphicsSettings(custom), "select valid antialiasing before invalid-mode checks");
+        for (unsigned mode : {6u, 7u, 255u}) {
+            auto invalid = custom; invalid.antialiasing = AntialiasingMode(mode);
+            check(!validGraphicsSettings(invalid) && !setGraphicsSettings(invalid) && graphicsSettings() == custom &&
+                  !saveDisplaySettings(path, 90, invalid) && loadGraphicsSettings(path) == custom &&
+                  loadFieldOfView(path) == 93.125f, "invalid antialiasing mode partially applied settings");
         }
-        WritePrivateProfileStringW(L"Display", L"GammaPercent", nullptr, path.c_str());
-        check(loadGraphicsSettings(path) == custom, "legacy settings must default gamma to neutral");
+        check(GraphicsSettings{}.anisotropyLevels == 16, "new settings must default to 16x anisotropic filtering");
+        for (unsigned levels : {1u, 2u, 4u, 8u, 16u}) {
+            auto selected = custom; selected.anisotropyLevels = levels;
+            check(setGraphicsSettings(selected) && graphicsSettings() == selected,
+                  "anisotropic filtering packing changed another preference");
+            check(saveDisplaySettings(path, 93.125f, selected) && loadGraphicsSettings(path) == selected,
+                  "anisotropic filtering selection did not persist");
+        }
+        check(WritePrivateProfileStringW(L"Display", L"AnisotropyLevels", nullptr, path.c_str()),
+              "remove anisotropy for legacy settings");
+        check(loadGraphicsSettings(path) == custom, "legacy settings must default anisotropic filtering to 16x");
+        for (const auto bad : {L"0", L"3", L"15", L"17", L"-1", L"16x", L"42949672960"}) {
+            WritePrivateProfileStringW(L"Display", L"AnisotropyLevels", bad, path.c_str());
+            check(loadGraphicsSettings(path) == custom, "invalid anisotropic filtering changed another preference");
+        }
+        check(saveDisplaySettings(path, 93.125f, custom), "restore anisotropic filtering");
+        for (unsigned levels : {0u, 3u, 15u, 17u, 32u}) {
+            auto invalid = custom; invalid.anisotropyLevels = levels;
+            check(!setGraphicsSettings(invalid) && graphicsSettings() == custom &&
+                  !saveDisplaySettings(path, 90, invalid) && loadGraphicsSettings(path) == custom,
+                  "invalid anisotropic filtering partially applied settings");
+        }
+        check(GraphicsSettings{}.subtitleScalePercent == 100, "subtitles must default to the original size");
+        for (unsigned scale : {50u, 73u, 90u, 100u, 110u, 137u, 150u, 200u}) {
+            auto selected = custom; selected.subtitleScalePercent = scale;
+            check(setGraphicsSettings(selected) && graphicsSettings() == selected,
+                  "subtitle scale packing changed another preference");
+            check(saveDisplaySettings(path, 93.125f, selected) && loadGraphicsSettings(path) == selected &&
+                  loadFieldOfView(path) == 93.125f, "subtitle scale did not persist independently");
+            wchar_t savedScale[16]{};
+            GetPrivateProfileStringW(L"Display", L"SubtitleScalePercent", L"missing", savedScale, 16, path.c_str());
+            check(std::wstring_view(savedScale) == std::to_wstring(scale), "subtitle scale did not save its percentage");
+        }
+        check(WritePrivateProfileStringW(L"Display", L"SubtitleScalePercent", nullptr, path.c_str()),
+              "remove subtitle scale for legacy settings");
+        check(loadGraphicsSettings(path) == custom, "legacy settings must preserve original subtitle size");
+        for (const auto bad : {L"0", L"49", L"201", L"-1", L"150%", L"1.50", L"42949672960"}) {
+            WritePrivateProfileStringW(L"Display", L"SubtitleScalePercent", bad, path.c_str());
+            check(loadGraphicsSettings(path) == custom, "invalid subtitle scale changed another preference");
+        }
+        check(saveDisplaySettings(path, 93.125f, custom) && setGraphicsSettings(custom), "restore original subtitle size");
+        for (unsigned scale : {0u, 49u, 201u, 256u, 0xffffffffu}) {
+            auto invalid = custom; invalid.subtitleScalePercent = scale;
+            check(!validGraphicsSettings(invalid) && !setGraphicsSettings(invalid) && graphicsSettings() == custom &&
+                  !saveDisplaySettings(path, 90, invalid) && loadGraphicsSettings(path) == custom &&
+                  loadFieldOfView(path) == 93.125f, "invalid subtitle scale partially applied settings");
+        }
+        // The retired native power curve has no mapping to the original
+        // profile's gamma calibration. Loading ignores its key without
+        // rewriting the file; unrelated saves preserve the inert value.
+        wchar_t legacyGamma[32]{};
+        GetPrivateProfileStringW(L"Display", L"GammaPercent", L"missing", legacyGamma, 32, path.c_str());
+        check(std::wstring_view(legacyGamma) == L"missing", "fresh settings created a retired gamma key");
+        for (unsigned gamma = 50; gamma <= 150; ++gamma) {
+            const auto text = std::to_wstring(gamma);
+            check(WritePrivateProfileStringW(L"Display", L"GammaPercent", text.c_str(), path.c_str()), "seed legacy gamma");
+            WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+            const auto beforeLoad = fileBytes(path);
+            check(loadGraphicsSettings(path) == custom && loadFieldOfView(path) == 93.125f,
+                  "retired gamma changed graphics settings or FOV");
+            check(fileBytes(path) == beforeLoad, "loading retired gamma rewrote the settings file");
+            check(saveDisplaySettings(path, 93.125f, custom), "save settings with inert legacy gamma");
+            GetPrivateProfileStringW(L"Display", L"GammaPercent", L"missing", legacyGamma, 32, path.c_str());
+            check(std::wstring_view(legacyGamma) == text, "saving settings replaced the inert legacy gamma value");
+        }
         for (const auto bad : {L"49", L"151", L"-1", L"nan", L"1.00", L"42949672960"}) {
-            WritePrivateProfileStringW(L"Display", L"GammaPercent", bad, path.c_str());
-            check(loadGraphicsSettings(path) == custom, "invalid gamma did not fall back independently");
+            check(WritePrivateProfileStringW(L"Display", L"GammaPercent", bad, path.c_str()), "seed malformed retired gamma");
+            WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+            const auto beforeLoad = fileBytes(path);
+            check(loadGraphicsSettings(path) == custom && fileBytes(path) == beforeLoad,
+                  "malformed retired gamma changed settings or rewrote the file");
         }
-        check(saveDisplaySettings(path, 93.125f, custom), "restore gamma after invalid values");
-        auto badGamma = custom; badGamma.gammaPercent = 0;
-        check(!saveDisplaySettings(path, 90, badGamma) && loadGraphicsSettings(path) == custom && loadFieldOfView(path)==93.125f,
-              "invalid gamma save changed existing preferences");
         for (unsigned brightness : {50u, 95u, 100u, 125u, 200u}) {
-            auto selected = custom; selected.gammaPercent = 85; selected.brightnessPercent = brightness;
+            auto selected = custom; selected.brightnessPercent = brightness;
             check(saveDisplaySettings(path, 93.125f, selected) && loadGraphicsSettings(path) == selected,
-                  "brightness did not persist independently of gamma and other settings");
+                  "brightness did not persist independently of other settings");
         }
-        auto legacyBrightness = custom; legacyBrightness.gammaPercent = 85;
+        const auto legacyBrightness = custom;
         WritePrivateProfileStringW(L"Display", L"BrightnessPercent", nullptr, path.c_str());
         check(loadGraphicsSettings(path) == legacyBrightness, "legacy settings must default brightness to neutral");
         for (const auto bad : {L"49", L"201", L"-1", L"nan", L"100%", L"1.00", L"42949672960"}) {
@@ -131,6 +225,31 @@ int main() {
         wchar_t unrelated[8]{};
         GetPrivateProfileStringW(L"Other", L"Preserve", L"", unrelated, 8, path.c_str());
         check(std::wstring_view(unrelated) == L"yes", "saving display setting preserves other sections");
+        for (const auto language : {GameLanguage::System, GameLanguage::English, GameLanguage::German,
+                                   GameLanguage::French, GameLanguage::Spanish, GameLanguage::Italian}) {
+            check(saveDisplaySettings(path, 100.125f, custom, language) && loadGameLanguage(path) == language &&
+                  loadGraphicsSettings(path) == custom && loadFieldOfView(path) == 100.125f,
+                  "language and display selection did not persist together");
+        }
+        check(saveDisplaySettings(path, 100.125f, custom) && loadGameLanguage(path) == GameLanguage::Italian,
+              "display-only save replaced the stored language");
+        check(!saveDisplaySettings(path, 90, aaOff, GameLanguage(2)) &&
+              loadGameLanguage(path) == GameLanguage::Italian && loadGraphicsSettings(path) == custom &&
+              loadFieldOfView(path) == 100.125f, "invalid language partially saved the selection");
+        // A failed final replacement must preserve both sections, even after
+        // the staged copy has successfully received all new preferences.
+        {
+            const HANDLE locked = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            check(locked != INVALID_HANDLE_VALUE, "cannot lock isolated settings fixture");
+            struct Unlock { HANDLE handle; ~Unlock() { CloseHandle(handle); } } unlock{locked};
+            check(!saveDisplaySettings(path, 90, aaOff, GameLanguage::German),
+                  "locked destination unexpectedly accepted a settings replacement");
+        }
+        check(loadGameLanguage(path) == GameLanguage::Italian && loadGraphicsSettings(path) == custom &&
+              loadFieldOfView(path) == 100.125f, "failed settings replacement partially changed preferences");
+        GetPrivateProfileStringW(L"Other", L"Preserve", L"", unrelated, 8, path.c_str());
+        check(std::wstring_view(unrelated) == L"yes", "language save replaced an unrelated section");
         check(!saveFieldOfView(path, 121) && loadFieldOfView(path) == 100.125f, "invalid write preserves file");
         check(WritePrivateProfileStringW(L"Display", L"FieldOfView", L"not-a-number", path.c_str()), "seed corrupt config");
         check(loadFieldOfView(path) == 0, "corrupt config uses Original");

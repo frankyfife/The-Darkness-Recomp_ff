@@ -1,6 +1,8 @@
 #pragma once
 #include "renderer/engine/simple_mesh.h"
+#include "renderer/engine/display_gamma.h"
 #include "world_renderer.h"
+#include "smaa_d3d11.h"
 #include <d3d11.h>
 #include <dxgi.h>
 #include <wrl/client.h>
@@ -21,7 +23,16 @@ class EnginePreviewD3D11 {
     Ptr<ID3D11RenderTargetView> presentationTarget_;
     Ptr<ID3D11VertexShader> presentationVs_;
     Ptr<ID3D11PixelShader> presentationPs_, antialiasingPs_;
+    std::unique_ptr<SmaaD3D11> smaa_;
     Ptr<ID3D11Buffer> presentationConstants_;
+    Ptr<ID3D11Buffer> displayGammaBuffer_;
+    Ptr<ID3D11ShaderResourceView> displayGammaView_, calibratedSource_;
+    Ptr<ID3D11Texture2D> calibrated_,calibratedStaging_;
+    Ptr<ID3D11RenderTargetView> calibratedTarget_;
+    Ptr<ID3D11PixelShader> displayGammaPs_;
+    std::shared_ptr<const Native::DisplayGamma> displayGamma_;
+    bool highPrecisionDisplay_=false,calibrationDirty_=true;
+    void updateCalibratedImage();
     Ptr<ID3D11VertexShader> vs_;
     Ptr<ID3D11PixelShader> ps_, videoPs_, colorPs_;
     Ptr<ID3D11InputLayout> layout_;
@@ -34,10 +45,15 @@ class EnginePreviewD3D11 {
     Ptr<ID3D11DepthStencilState> depth_;
     Ptr<ID3D11RasterizerState> raster_;
     Ptr<ID3D11SamplerState> sampler_;
+    Ptr<ID3D11SamplerState> subtitleSampler_;
     struct CachedImage { std::shared_ptr<const AlphaImage> image; Ptr<ID3D11ShaderResourceView> view; };
     std::unordered_map<const AlphaImage*, CachedImage> textures_;
     struct CachedColor { std::shared_ptr<const ColorImage> image; Ptr<ID3D11ShaderResourceView> view; uint64_t used = 0; size_t bytes = 0; Ptr<ID3D11SamplerState> sampler; };
     std::unordered_map<const ColorImage*, CachedColor> colorTextures_;
+    CachedColor& colorImage(const std::shared_ptr<const ColorImage>& image);
+    struct FailedSubtitle { std::weak_ptr<const void> source; unsigned factor = 0; };
+    std::array<FailedSubtitle,16> failedSubtitles_{};
+    unsigned failedSubtitleNext_ = 0;
     size_t colorBytes_ = 0;
     uint64_t colorUse_ = 0;
     std::shared_ptr<const VideoFrame> videoImage_;
@@ -52,7 +68,14 @@ class EnginePreviewD3D11 {
 public:
     // Output dimensions are physical pixels; scale applies to guest world commands.
     EnginePreviewD3D11(ID3D11Device*, ID3D11DeviceContext*, IDXGISwapChain*,
-                       uint32_t renderWidth = 0, uint32_t renderHeight = 0, uint32_t scale = 1);
+                       uint32_t renderWidth = 0, uint32_t renderHeight = 0, uint32_t scale = 1,
+                       bool highPrecisionDisplay = false);
+    // Window-thread-only, after the last part of a frame. Logical guest extents
+    // must stay fixed; all old targets remain usable if preparing a resize fails.
+    bool resizeRenderTarget(uint32_t width,uint32_t height,uint32_t scale);
+    uint32_t renderWidth() const {return width_;}
+    uint32_t renderHeight() const {return height_;}
+    uint32_t renderScale() const {return world_->renderScale();}
     void releaseDisplayTarget();
     void render(const std::vector<SimpleMesh>& meshes,Native::PreviewFramePart part={});
     void copyToDisplay();
@@ -62,6 +85,8 @@ public:
     void setDiagnostics(bool enabled) {if(world_)world_->setDiagnostics(enabled);}
     void printPerformance() const {if(world_)world_->printPerformance();}
     size_t textureBudget() const {return world_->textureBudget();}
+    // Between complete frames only; optional preloading cannot change bindings.
+    bool preloadImage(const std::shared_ptr<const ColorImage>& image);
     uint32_t readPixel(uint32_t x, uint32_t y);
     void saveBmp(const std::filesystem::path& path);
     // Optional F8 evidence must not terminate gameplay or replace an existing capture.

@@ -1,7 +1,10 @@
 #include "engine_preview.h"
+#include "stall_profile_d3d11.h"
 #include "renderer/engine/engine_performance.h"
 #include "runtime/native/graphics_settings.h"
 #include "renderer/engine/prompt_icons.h"
+#include "renderer/engine/prompt_layout.h"
+#include "renderer/engine/subtitle_font.h"
 #include "renderer/engine/display_layout.h"
 #include "renderer/engine/video_layout.h"
 #include "runtime/native/input.h"
@@ -26,9 +29,14 @@ void check(HRESULT result, const char* operation) {
 // buffers. Preview constant uploads use DISCARD mapping.
 void updateConstants(ID3D11DeviceContext* context,ID3D11Buffer* buffer,const void* data,size_t bytes) {
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    check(context->Map(buffer,0,D3D11_MAP_WRITE_DISCARD,0,&mapped),"preview constant map");
+    check(stallProfileMap(context,buffer,0,D3D11_MAP_WRITE_DISCARD,0,&mapped,
+                         "preview constants Map"),"preview constant map");
     std::memcpy(mapped.pData,data,bytes);
     context->Unmap(buffer,0);
+}
+uint32_t rgba8From10(uint32_t value) {
+    auto channel=[&](unsigned shift){return (((value>>shift)&1023)*255+511)/1023;};
+    return channel(0)|(channel(10)<<8)|(channel(20)<<16)|((value>>30)*85<<24);
 }
 constexpr char shader[] = R"(
 cbuffer Transform : register(b0) { row_major float4x4 projection; };
@@ -49,8 +57,9 @@ float4 colorMain(Fragment f) : SV_TARGET {
     return colorImage.Sample(imageSampler, f.uv) * f.color;
 }
 float4 videoMain(Fragment f) : SV_TARGET {
-    // Original CMWnd_ModTexture_PaintVideo_YUV2RGB.fp: U in luminance,
-    // V in alpha. BE A8L8 storage is V,U, uploaded unchanged as host R,G.
+    // The captured decoder CImage has BE A8L8 bytes V,U. A saved TopCow
+    // frame matches FFmpeg's decoded Y and pair-reversed NV12 exactly;
+    // host R8G8 preserves these physical bytes, so select logical U,V.
     float y = alphaImage.Sample(imageSampler, f.uv);
     float2 uv = chromaImage.Sample(imageSampler, f.uv).yx - 0.5;
     float3 rgb = y * 1.164 - 0.073035294117647058823529411764044;
@@ -65,9 +74,25 @@ Presentation presentationVertex(uint id : SV_VertexID) {
     return o;
 }
 Texture2D<float4> presentationImage : register(t3);
+Buffer<uint2> displayGammaRamp : register(t4);
 cbuffer PresentationSettings : register(b1) { float4 displayTone; };
+float displayGammaChannel(float value,uint channel) {
+    if(displayTone.z!=0.0) {
+        uint q=(uint)(saturate(value)*1023.0+0.5);
+        uint2 ramp=displayGammaRamp[(q>>3)*3+channel];
+        return saturate((float(ramp.x)+float((q&7)*ramp.y)/8.0)/(64.0*1023.0));
+    }
+    uint q=(uint)(saturate(value)*255.0+0.5);
+    return saturate(float(displayGammaRamp[q*3+channel].x)/(64.0*1023.0));
+}
+float4 displayGammaPixel(Presentation f) : SV_TARGET {
+    // Apply the Xbox LUT to source texels before scaling or post-process AA.
+    float4 color=presentationImage.Load(int3(int2(f.position.xy),0));
+    color.rgb=float3(displayGammaChannel(color.r,0),displayGammaChannel(color.g,1),displayGammaChannel(color.b,2));
+    color.a=1.0;
+    return color;
+}
 float4 applyDisplayTone(float4 color) {
-    if (displayTone.x != 1.0) color.rgb = pow(saturate(color.rgb), displayTone.xxx);
     if (displayTone.y != 1.0) color.rgb = saturate(color.rgb * displayTone.y);
     return color;
 }
@@ -108,8 +133,8 @@ float4 antialiasingPixel(Presentation f) : SV_TARGET {
 }
 
 EnginePreviewD3D11::EnginePreviewD3D11(ID3D11Device* device, ID3D11DeviceContext* context, IDXGISwapChain* swapChain,
-                                     uint32_t renderWidth, uint32_t renderHeight, uint32_t scale)
-    : device_(device), context_(context), swapChain_(swapChain) {
+                                     uint32_t renderWidth, uint32_t renderHeight, uint32_t scale,bool highPrecisionDisplay)
+    : device_(device), context_(context), swapChain_(swapChain),highPrecisionDisplay_(highPrecisionDisplay) {
     if (!device || !context || !swapChain) throw std::invalid_argument("Engine preview requires initialized display");
     if (scale<1 || scale>3) throw std::invalid_argument("World render scale must be between one and three");
     Ptr<ID3D11Texture2D> back;
@@ -117,6 +142,7 @@ EnginePreviewD3D11::EnginePreviewD3D11(ID3D11Device* device, ID3D11DeviceContext
     D3D11_TEXTURE2D_DESC desc{}; back->GetDesc(&desc);
     if (renderWidth && renderHeight) { desc.Width = renderWidth; desc.Height = renderHeight; }
     width_ = desc.Width; height_ = desc.Height;
+    if(highPrecisionDisplay_)desc.Format=DXGI_FORMAT_R10G10B10A2_UNORM;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE; desc.MiscFlags = 0;
     check(device_->CreateTexture2D(&desc, nullptr, &target_), "create target");
     check(device_->CreateRenderTargetView(target_.Get(), nullptr, &rtv_), "create target view");
@@ -152,6 +178,14 @@ EnginePreviewD3D11::EnginePreviewD3D11(ID3D11Device* device, ID3D11DeviceContext
     check(device_->CreateBuffer(&buffer, nullptr, &constants_), "create matrix buffer");
     buffer.ByteWidth = 16;
     check(device_->CreateBuffer(&buffer, nullptr, &presentationConstants_), "create presentation settings buffer");
+    D3D11_BUFFER_DESC gammaBuffer{};
+    gammaBuffer.ByteWidth=sizeof(Native::DisplayGamma{}.entries);
+    gammaBuffer.Usage=D3D11_USAGE_DEFAULT;gammaBuffer.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    check(device_->CreateBuffer(&gammaBuffer,nullptr,&displayGammaBuffer_),"create display gamma buffer");
+    D3D11_SHADER_RESOURCE_VIEW_DESC gammaView{};
+    gammaView.Format=DXGI_FORMAT_R32G32_UINT;gammaView.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;
+    gammaView.Buffer.NumElements=768;
+    check(device_->CreateShaderResourceView(displayGammaBuffer_.Get(),&gammaView,&displayGammaView_),"create display gamma view");
     // Worst-case single immediate mesh: 16384 vertices (36 bytes each) and
     // 49152 indices. One DISCARD upload per mesh avoids per-frame kernel
     // allocations while keeping each draw's contents independent.
@@ -177,6 +211,9 @@ EnginePreviewD3D11::EnginePreviewD3D11(ID3D11Device* device, ID3D11DeviceContext
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampler.MaxLOD = D3D11_FLOAT32_MAX; sampler.ComparisonFunc = D3D11_COMPARISON_NEVER;
     check(device_->CreateSamplerState(&sampler, &sampler_), "create sampler");
+    sampler.MaxLOD=0;sampler.Filter=D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    if(FAILED(device_->CreateSamplerState(&sampler,&subtitleSampler_)))
+        std::fputs("[SubtitleFont] GPU sampler unavailable; retaining original\n",stderr);
     vertex.Reset(); pixel.Reset();
     check(D3DCompile(shader, sizeof(shader)-1, "presentation", nullptr, nullptr,
                     "presentationVertex", "vs_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &vertex, nullptr), "compile presentation vertex");
@@ -184,6 +221,10 @@ EnginePreviewD3D11::EnginePreviewD3D11(ID3D11Device* device, ID3D11DeviceContext
                     "presentationPixel", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pixel, nullptr), "compile presentation pixel");
     check(device_->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &presentationVs_), "create presentation vertex");
     check(device_->CreatePixelShader(pixel->GetBufferPointer(), pixel->GetBufferSize(), nullptr, &presentationPs_), "create presentation pixel");
+    pixel.Reset();errors.Reset();
+    check(D3DCompile(shader,sizeof(shader)-1,"display_gamma",nullptr,nullptr,
+                    "displayGammaPixel","ps_5_0",D3DCOMPILE_ENABLE_STRICTNESS,0,&pixel,&errors),"compile display gamma shader");
+    check(device_->CreatePixelShader(pixel->GetBufferPointer(),pixel->GetBufferSize(),nullptr,&displayGammaPs_),"create display gamma shader");
     pixel.Reset(); errors.Reset();
     hr = D3DCompile(shader, sizeof(shader)-1, "presentation", nullptr, nullptr,
                     "antialiasingPixel", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pixel, &errors);
@@ -191,10 +232,63 @@ EnginePreviewD3D11::EnginePreviewD3D11(ID3D11Device* device, ID3D11DeviceContext
     check(hr, "compile FXAA pixel shader");
     check(device_->CreatePixelShader(pixel->GetBufferPointer(), pixel->GetBufferSize(), nullptr, &antialiasingPs_), "create FXAA pixel shader");
     world_=std::make_unique<WorldRendererD3D11>(device,context,scale);
+    world_->setSubtitleRenderHeight(height_);
     render({});
 }
 
+bool EnginePreviewD3D11::resizeRenderTarget(uint32_t width,uint32_t height,uint32_t scale) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "EnginePreviewD3D11::resizeRenderTarget");
+    if(frameOpen_)throw std::logic_error("Cannot resize an unfinished preview frame");
+    if(scale<1 || scale>3 || !width || !height ||
+       width>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || height>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        throw std::invalid_argument("Invalid preview render size or scale");
+    const auto previousScale=world_->renderScale();
+    if(width_%previousScale || height_%previousScale || width%scale || height%scale ||
+       width/scale!=width_/previousScale || height/scale!=height_/previousScale)
+        throw std::invalid_argument("Live resizing must preserve logical guest dimensions");
+    world_->requireResizeBoundary();
+    if(width==width_ && height==height_ && scale==previousScale)return false;
+    context_->ClearState();world_->invalidateBindings();
+    // Prepare the preview target and all of its views before changing world
+    // scale. After world migration commits, only nonthrowing owner moves remain.
+    auto target=world_->resizedTexture(target_.Get(),width,height);
+    Ptr<ID3D11RenderTargetView> rtv;
+    Ptr<ID3D11ShaderResourceView> presentationSource;
+    Ptr<ID3D11Texture2D> staging;
+    check(device_->CreateRenderTargetView(target.Get(),nullptr,&rtv),"resized target view");
+    check(device_->CreateShaderResourceView(target.Get(),nullptr,&presentationSource),"resized presentation source");
+    D3D11_TEXTURE2D_DESC desc{};target->GetDesc(&desc);
+    desc.BindFlags=desc.MiscFlags=0;desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+    check(device_->CreateTexture2D(&desc,nullptr,&staging),"resized readback");
+    Ptr<ID3D11Texture2D> calibrated,calibratedStaging;
+    Ptr<ID3D11ShaderResourceView> calibratedSource;
+    Ptr<ID3D11RenderTargetView> calibratedTarget;
+    if(displayGamma_) {
+        // Calibration allocations belong to the same resize transaction. An
+        // allocation failure must leave the previous F6 output usable.
+        target->GetDesc(&desc);desc.Format=DXGI_FORMAT_R10G10B10A2_UNORM;
+        check(device_->CreateTexture2D(&desc,nullptr,&calibrated),"resized calibrated image");
+        check(device_->CreateShaderResourceView(calibrated.Get(),nullptr,&calibratedSource),"resized calibrated source");
+        check(device_->CreateRenderTargetView(calibrated.Get(),nullptr,&calibratedTarget),"resized calibrated target");
+        desc.BindFlags=0;desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+        check(device_->CreateTexture2D(&desc,nullptr,&calibratedStaging),"resized calibrated readback");
+    }
+    world_->setRenderScale(scale);
+    world_->setSubtitleRenderHeight(height);
+    target_=std::move(target);rtv_=std::move(rtv);presentationSource_=std::move(presentationSource);
+    staging_=std::move(staging);width_=width;height_=height;
+    calibrated_=std::move(calibrated);calibratedStaging_=std::move(calibratedStaging);
+    calibratedSource_=std::move(calibratedSource);calibratedTarget_=std::move(calibratedTarget);calibrationDirty_=true;
+    return true;
+}
+
+bool EnginePreviewD3D11::preloadImage(const std::shared_ptr<const ColorImage>& image) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "EnginePreviewD3D11::preloadImage");
+    if(frameOpen_)return false;
+    return world_->preloadImage(image);
+}
 void EnginePreviewD3D11::uploadVideoFrame(const VideoFrame& video) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "EnginePreviewD3D11::uploadVideoFrame");
     if (videoTexY_ && videoTexUV_ && videoWidth_ == video.width && videoHeight_ == video.height) {
         context_->UpdateSubresource(videoTexY_.Get(), 0, nullptr, video.luma.data(), video.width, 0);
         context_->UpdateSubresource(videoTexUV_.Get(), 0, nullptr, video.chroma.data(), video.width, 0);
@@ -224,15 +318,54 @@ void EnginePreviewD3D11::uploadVideoFrame(const VideoFrame& video) {
     videoWidth_ = video.width; videoHeight_ = video.height;
 }
 
+EnginePreviewD3D11::CachedColor& EnginePreviewD3D11::colorImage(const std::shared_ptr<const ColorImage>& source) {
+    const auto& image=*source;
+    if(!image.valid() || image.faces!=1)throw std::invalid_argument("Invalid preview color image");
+    if(!colorTextures_.contains(source.get())) {
+        constexpr size_t budget=64*1024*1024;
+        const unsigned levels=image.authoredMips?unsigned(image.mips.size()+1):1;
+        size_t gpuBytes=0;
+        for(unsigned mip=0;mip<levels;++mip)gpuBytes+=size_t((std::max)(1u,image.width>>mip))*(std::max)(1u,image.height>>mip)*4;
+        auto makeRoom=[&] {
+            while((colorBytes_+gpuBytes>budget || colorTextures_.size()>=256) && !colorTextures_.empty()) {
+                auto oldest=std::min_element(colorTextures_.begin(),colorTextures_.end(),[](const auto& a,const auto& b){return a.second.used<b.second.used;});
+                colorBytes_-=oldest->second.bytes;colorTextures_.erase(oldest);
+            }
+        };
+        if(!image.generatedSubtitleFont)makeRoom();
+        D3D11_TEXTURE2D_DESC td{};td.Width=image.width;td.Height=image.height;
+        td.MipLevels=levels;td.ArraySize=td.SampleDesc.Count=1;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.Usage=D3D11_USAGE_DEFAULT;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        Ptr<ID3D11Texture2D> texture;CachedColor cached{source,{},0,gpuBytes,{}};
+        check(device_->CreateTexture2D(&td,nullptr,&texture),"upload original color texture");
+        for(unsigned mip=image.firstMip;mip<levels;++mip) {
+            const auto& pixels=mip?image.mips[mip-1]:image.pixels;
+            context_->UpdateSubresource(texture.Get(),mip,nullptr,pixels.data(),(std::max)(1u,image.width>>mip)*4,0);
+        }
+        check(device_->CreateShaderResourceView(texture.Get(),nullptr,&cached.view),"create color view");
+        if(image.firstMip) {
+            D3D11_SAMPLER_DESC desc{};sampler_->GetDesc(&desc);desc.MinLOD=float(image.firstMip);
+            check(device_->CreateSamplerState(&desc,&cached.sampler),"create resident color sampler");
+        }
+        if(image.generatedSubtitleFont)makeRoom();
+        colorTextures_.emplace(source.get(),std::move(cached));colorBytes_+=gpuBytes;
+    }
+    auto& cached=colorTextures_.at(source.get());cached.used=++colorUse_;return cached;
+}
 void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::PreviewFramePart part) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "EnginePreviewD3D11::render");
     if(part.first==frameOpen_)throw std::logic_error("Preview frame parts are out of order");
     if(part.first) {
+    const auto previousTextureBudget=world_->textureBudget();
     world_->beginFrame();
+    if(world_->textureBudget()!=previousTextureBudget)
+        Native::setPreviewTextureBudget(world_->textureBudget());
     if(inspectionPending_) {world_->inspectNextFrame();inspectionPending_=false;}
     worldPresented_=false;
+    calibrationDirty_=true;
     // Prompt source is read once per frame: no per-mesh input locks, and all
-    // prompt meshes in the frame agree. Labels are combined truthful icons, so
-    // no mouse-capture context is claimed; the same source feeds the world.
+    // prompt meshes in the frame agree. Each owned draw carries its original
+    // HUD/menu context; the same input source feeds the world renderer.
     framePromptSource_ = Native::nativeInput().promptSource() == Native::PromptInputSource::Controller ?
         Native::PromptRenderSource::Controller : Native::PromptRenderSource::KeyboardMouse;
     world_->setPromptSource(framePromptSource_ == Native::PromptRenderSource::KeyboardMouse);
@@ -249,7 +382,6 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
     }
     frameOpen_=!part.last;
     const auto promptSource=framePromptSource_;
-    const auto promptContext=Native::PromptRenderContext::Menu;
     auto restoreSimpleState=[&] {
     world_->invalidateBindings();
     ID3D11RenderTargetView* target = rtv_.Get(); context_->OMSetRenderTargets(1, &target, nullptr);
@@ -264,7 +396,15 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
     };
     bool simpleStateDirty = true;
     for (const auto& mesh : meshes) {
+        const auto promptContext = mesh.promptContext;
+        auto projection = mesh.projection;
         Native::setRenderSamplePhase(Native::RenderSamplePhase::other);
+        if(mesh.displayGamma) {
+            if(!displayGamma_ || *displayGamma_!=*mesh.displayGamma)
+                context_->UpdateSubresource(displayGammaBuffer_.Get(),0,nullptr,mesh.displayGamma->entries.data(),0,0);
+            displayGamma_=mesh.displayGamma;calibrationDirty_=true;
+            continue;
+        }
         if(mesh.worldQuery) {world_->histogram(mesh.worldQuery,mesh.worldQueryBegin);continue;}
         // Partial clears replace the pipeline; surface growth also unbinds targets.
         if (mesh.worldClear) {world_->clear(*mesh.worldClear);simpleStateDirty=true;continue;}
@@ -289,6 +429,23 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
             simpleStateDirty = true;
         }
         ID3D11SamplerState* defaultSampler=sampler_.Get();context_->PSSetSamplers(0,1,&defaultSampler);
+        std::shared_ptr<const ColorImage> subtitleImage;
+        if(mesh.subtitle && subtitleSampler_) {
+            const auto factor=Native::subtitleFontRasterScale(height_,Native::graphicsSettings().subtitleScalePercent);
+            const std::shared_ptr<const void> source=mesh.colorTexture?
+                std::shared_ptr<const void>(mesh.colorTexture):std::shared_ptr<const void>(mesh.texture);
+            const bool failed=std::any_of(failedSubtitles_.begin(),failedSubtitles_.end(),
+                [&](const auto& entry){return entry.factor==factor && entry.source.lock()==source;});
+            if(!failed) {
+                if(mesh.colorTexture)subtitleImage=Native::subtitleFontReplacementFor(mesh.textureId,mesh.colorTexture,factor);
+                else if(mesh.texture)subtitleImage=Native::subtitleFontReplacementFor(mesh.textureId,mesh.texture,factor);
+                if(subtitleImage)try {colorImage(subtitleImage);}
+                catch(const std::exception&) {
+                    failedSubtitles_[failedSubtitleNext_++%failedSubtitles_.size()]={source,factor};subtitleImage.reset();
+                    std::fprintf(stderr,"[SubtitleFont] GPU atlas unavailable id=%u factor=%u; retaining original\n",mesh.textureId,factor);
+                }
+            }
+        }
         if (mesh.video) {
             const auto& video = *mesh.video;
             if (!video.width || !video.height || video.width > 2048 || video.height > 2048 ||
@@ -303,7 +460,7 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
             context_->PSSetShaderResources(0,3,views); context_->PSSetShader(videoPs_.Get(),nullptr,0);
             // Original blend factors ONE,ZERO; video shader deliberately outputs alpha zero.
             context_->OMSetBlendState(nullptr,nullptr,~0u);
-        } else if (mesh.colorTexture) {
+        } else if (mesh.colorTexture || subtitleImage) {
             // Verified prompt textures resolve to cached native keycap/mouse
             // icons under keyboard/mouse source; anything else (including the
             // controller source) keeps the original artwork and cache entry.
@@ -311,7 +468,7 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
             // canvases and atlas tiles keep exact sample behavior instead of
             // stretching or cropping the replacement (look tutorial 64x32).
             std::shared_ptr<const ColorImage> promptIcon;
-            if (promptSource == Native::PromptRenderSource::KeyboardMouse && mesh.colorTexture &&
+            if (!subtitleImage && promptSource == Native::PromptRenderSource::KeyboardMouse && mesh.colorTexture &&
                 DarkRecomp::Prompts::buttonFromOriginByte(mesh.colorTexture->promptOrigin) !=
                 DarkRecomp::Prompts::Button::Unknown && !mesh.vertices.empty()) {
                 float u0 = mesh.vertices[0].uv[0], v0 = mesh.vertices[0].uv[1];
@@ -323,39 +480,27 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
                 }
                 promptIcon = Native::promptReplacementForUv(mesh.textureId, mesh.colorTexture,
                     promptSource, promptContext, u0, v0, u1, v1);
-            } else {
+            } else if(!subtitleImage) {
                 promptIcon = Native::promptReplacementFor(mesh.textureId, mesh.colorTexture, promptSource, promptContext);
             }
-            const auto& effective = promptIcon ? promptIcon : mesh.colorTexture;
-            const auto& image = *effective;
-            if (!image.valid() || image.faces!=1)throw std::invalid_argument("Invalid preview color image");
-            if (!colorTextures_.contains(effective.get())) {
-                constexpr size_t budget=64*1024*1024;
-                const unsigned levels=image.authoredMips?unsigned(image.mips.size()+1):1;
-                size_t gpuBytes=0;
-                for(unsigned mip=0;mip<levels;++mip)gpuBytes+=size_t((std::max)(1u,image.width>>mip))*(std::max)(1u,image.height>>mip)*4;
-                while ((colorBytes_+gpuBytes>budget || colorTextures_.size()>=256) && !colorTextures_.empty()) {
-                    auto oldest=std::min_element(colorTextures_.begin(),colorTextures_.end(),[](const auto& a,const auto& b){return a.second.used<b.second.used;});
-                    colorBytes_-=oldest->second.bytes;colorTextures_.erase(oldest);
+            const auto& effective = subtitleImage?subtitleImage:(promptIcon ? promptIcon : mesh.colorTexture);
+            if (promptIcon && mesh.vertices.size() == 4 && mesh.indices.size() == 6) {
+                std::array<std::array<float,4>,4> clip{};
+                for (unsigned vertex = 0; vertex < 4; ++vertex)
+                    for (unsigned column = 0; column < 4; ++column) {
+                        clip[vertex][column] = projection[12 + column];
+                        for (unsigned row = 0; row < 3; ++row)
+                            clip[vertex][column] += mesh.vertices[vertex].position[row] * projection[row * 4 + column];
+                    }
+                const auto transform = Prompts::promptQuadTransform(clip, mesh.indices);
+                if (transform[3]) for (unsigned row = 0; row < 4; ++row) {
+                    projection[row * 4] = transform[0] * projection[row * 4] + transform[1] * projection[row * 4 + 3];
+                    projection[row * 4 + 1] = transform[0] * projection[row * 4 + 1] + transform[2] * projection[row * 4 + 3];
                 }
-                D3D11_TEXTURE2D_DESC td{};td.Width=image.width;td.Height=image.height;
-                td.MipLevels=levels;td.ArraySize=td.SampleDesc.Count=1;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-                td.Usage=D3D11_USAGE_DEFAULT;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-                Ptr<ID3D11Texture2D> texture;CachedColor cached{effective,{},0,gpuBytes,{}};
-                check(device_->CreateTexture2D(&td,nullptr,&texture),"upload original color texture");
-                for(unsigned mip=image.firstMip;mip<levels;++mip) {
-                    const auto& pixels=mip?image.mips[mip-1]:image.pixels;
-                    context_->UpdateSubresource(texture.Get(),mip,nullptr,pixels.data(),(std::max)(1u,image.width>>mip)*4,0);
-                }
-                check(device_->CreateShaderResourceView(texture.Get(),nullptr,&cached.view),"create color view");
-                if(image.firstMip) {
-                    D3D11_SAMPLER_DESC desc{};sampler_->GetDesc(&desc);desc.MinLOD=float(image.firstMip);
-                    check(device_->CreateSamplerState(&desc,&cached.sampler),"create resident color sampler");
-                }
-                colorBytes_+=gpuBytes;colorTextures_.emplace(effective.get(),std::move(cached));
             }
-            auto& cached = colorTextures_.at(effective.get()); cached.used = ++colorUse_;
+            auto& cached=colorImage(effective);
             if(cached.sampler) {ID3D11SamplerState* sampler=cached.sampler.Get();context_->PSSetSamplers(0,1,&sampler);}
+            if(subtitleImage) {ID3D11SamplerState* sampler=subtitleSampler_.Get();context_->PSSetSamplers(0,1,&sampler);}
             ID3D11ShaderResourceView* views[]{nullptr,nullptr,cached.view.Get()};
             context_->PSSetShaderResources(0,3,views); context_->PSSetShader(colorPs_.Get(),nullptr,0);
             context_->OMSetBlendState(mesh.opaque ? nullptr : blend_.Get(),nullptr,~0u);
@@ -379,15 +524,17 @@ void EnginePreviewD3D11::render(const std::vector<SimpleMesh>& meshes,Native::Pr
           context_->OMSetBlendState(blend_.Get(),nullptr,~0u);
         }
         D3D11_MAPPED_SUBRESOURCE mappedVB{}, mappedIB{};
-        check(context_->Map(dynamicVB_.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mappedVB), "map dynamic VB");
+        check(stallProfileMap(context_.Get(),dynamicVB_.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mappedVB,
+                             "preview dynamic VB Map"), "map dynamic VB");
         std::memcpy(mappedVB.pData,mesh.vertices.data(),mesh.vertices.size()*sizeof(SimpleVertex));
         context_->Unmap(dynamicVB_.Get(),0);
-        check(context_->Map(dynamicIB_.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mappedIB), "map dynamic IB");
+        check(stallProfileMap(context_.Get(),dynamicIB_.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mappedIB,
+                             "preview dynamic IB Map"), "map dynamic IB");
         std::memcpy(mappedIB.pData,mesh.indices.data(),mesh.indices.size()*sizeof(uint16_t));
         context_->Unmap(dynamicIB_.Get(),0);
         ID3D11Buffer* vertexBuffer = dynamicVB_.Get(); UINT stride = sizeof(SimpleVertex), offset = 0;
         context_->IASetVertexBuffers(0,1,&vertexBuffer,&stride,&offset); context_->IASetIndexBuffer(dynamicIB_.Get(),DXGI_FORMAT_R16_UINT,0);
-        updateConstants(context_.Get(),constants_.Get(),mesh.projection.data(),sizeof(mesh.projection));
+        updateConstants(context_.Get(),constants_.Get(),projection.data(),sizeof(projection));
         context_->DrawIndexed(UINT(mesh.indices.size()),0,0);
     }
     if(part.last)world_->endFrame();
@@ -397,19 +544,60 @@ void EnginePreviewD3D11::releaseDisplayTarget() {
     presentationTarget_.Reset();
     world_->invalidateBindings();
 }
+void EnginePreviewD3D11::updateCalibratedImage() {
+    if(!displayGamma_ || !calibrationDirty_)return;
+    if(!calibrated_) {
+        D3D11_TEXTURE2D_DESC desc{};target_->GetDesc(&desc);
+        desc.Format=DXGI_FORMAT_R10G10B10A2_UNORM;
+        Ptr<ID3D11Texture2D> texture,staging;
+        Ptr<ID3D11RenderTargetView> target;
+        Ptr<ID3D11ShaderResourceView> source;
+        check(device_->CreateTexture2D(&desc,nullptr,&texture),"create calibrated image");
+        check(device_->CreateRenderTargetView(texture.Get(),nullptr,&target),"create calibrated target");
+        check(device_->CreateShaderResourceView(texture.Get(),nullptr,&source),"create calibrated source");
+        desc.BindFlags=0;desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+        check(device_->CreateTexture2D(&desc,nullptr,&staging),"create calibrated readback");
+        calibrated_=std::move(texture);calibratedTarget_=std::move(target);
+        calibratedSource_=std::move(source);calibratedStaging_=std::move(staging);
+    }
+    context_->ClearState();world_->invalidateBindings();
+    ID3D11RenderTargetView* target=calibratedTarget_.Get();context_->OMSetRenderTargets(1,&target,nullptr);
+    context_->OMSetDepthStencilState(depth_.Get(),0);context_->RSSetState(raster_.Get());
+    const D3D11_VIEWPORT viewport{0,0,float(width_),float(height_),0,1};context_->RSSetViewports(1,&viewport);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->VSSetShader(presentationVs_.Get(),nullptr,0);context_->PSSetShader(displayGammaPs_.Get(),nullptr,0);
+    const float tone[]{0,1,displayGamma_->piecewise?1.0f:0.0f,0};
+    updateConstants(context_.Get(),presentationConstants_.Get(),tone,sizeof(tone));
+    ID3D11Buffer* constants=presentationConstants_.Get();context_->PSSetConstantBuffers(1,1,&constants);
+    ID3D11ShaderResourceView* sources[]{presentationSource_.Get(),displayGammaView_.Get()};context_->PSSetShaderResources(3,2,sources);
+    context_->Draw(3,0);
+    ID3D11ShaderResourceView* empty[2]{};context_->PSSetShaderResources(3,2,empty);
+    context_->OMSetRenderTargets(0,nullptr,nullptr);
+    calibrationDirty_=false;
+}
 void EnginePreviewD3D11::copyToDisplay() {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "EnginePreviewD3D11::copyToDisplay");
     if(frameOpen_)throw std::logic_error("Cannot display an unfinished preview frame");
     Ptr<ID3D11Texture2D> back; check(swapChain_->GetBuffer(0, IID_PPV_ARGS(&back)), "get display target");
     D3D11_TEXTURE2D_DESC desc{}; back->GetDesc(&desc);
     const auto settings = Native::graphicsSettings();
-    const bool antialiasing = settings.antialiasing;
-    if (!antialiasing && settings.gammaPercent == 100 && settings.brightnessPercent == 100 &&
+    const bool fxaa = settings.antialiasing == Native::AntialiasingMode::FXAA;
+    const bool smaa = settings.antialiasing == Native::AntialiasingMode::SMAA;
+    if (!fxaa && !smaa && !displayGamma_ && !highPrecisionDisplay_ && settings.brightnessPercent == 100 &&
         desc.Width == width_ && desc.Height == height_) {
         context_->CopyResource(back.Get(), target_.Get());
         return;
     }
     if (!presentationTarget_)
         check(device_->CreateRenderTargetView(back.Get(), nullptr, &presentationTarget_), "create presentation target");
+    updateCalibratedImage();
+    ID3D11ShaderResourceView* source = displayGamma_?calibratedSource_.Get():presentationSource_.Get();
+    if(smaa) {
+        if(!smaa_)smaa_=std::make_unique<SmaaD3D11>(device_.Get(),context_.Get());
+        // Rebuild at the calibrated source's resolution after F6 changes. Each
+        // copy begins with the owned original, so repaints never compound AA.
+        source=smaa_->filter(source);
+    }
     context_->ClearState(); world_->invalidateBindings();
     const float black[]{0, 0, 0, 1};
     context_->ClearRenderTargetView(presentationTarget_.Get(), black);
@@ -422,12 +610,12 @@ void EnginePreviewD3D11::copyToDisplay() {
     context_->RSSetViewports(1, &viewport);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(presentationVs_.Get(), nullptr, 0);
-    context_->PSSetShader(antialiasing ? antialiasingPs_.Get() : presentationPs_.Get(), nullptr, 0);
-    const float tone[]{100.0f / settings.gammaPercent, settings.brightnessPercent / 100.0f, 0, 0};
+    context_->PSSetShader(fxaa ? antialiasingPs_.Get() : presentationPs_.Get(), nullptr, 0);
+    const float tone[]{0,settings.brightnessPercent/100.0f,0,0};
     updateConstants(context_.Get(),presentationConstants_.Get(),tone,sizeof(tone));
     ID3D11Buffer* constants = presentationConstants_.Get(); context_->PSSetConstantBuffers(1, 1, &constants);
     ID3D11SamplerState* sampler = sampler_.Get(); context_->PSSetSamplers(0, 1, &sampler);
-    ID3D11ShaderResourceView* source = presentationSource_.Get(); context_->PSSetShaderResources(3, 1, &source);
+    context_->PSSetShaderResources(3, 1, &source);
     context_->Draw(3, 0);
     source = nullptr; context_->PSSetShaderResources(3, 1, &source);
 }
@@ -435,9 +623,10 @@ uint32_t EnginePreviewD3D11::readPixel(uint32_t x, uint32_t y) {
     if(frameOpen_)throw std::logic_error("Cannot read an unfinished preview frame");
     if (x >= width_ || y >= height_) throw std::invalid_argument("Invalid preview pixel coordinate");
     context_->CopyResource(staging_.Get(), target_.Get());
-    D3D11_MAPPED_SUBRESOURCE mapped{}; check(context_->Map(staging_.Get(),0,D3D11_MAP_READ,0,&mapped), "read pixel");
+    D3D11_MAPPED_SUBRESOURCE mapped{}; check(stallProfileMap(context_.Get(),staging_.Get(),0,D3D11_MAP_READ,0,&mapped,
+                                                          "preview pixel readback Map"), "read pixel");
     uint32_t value; std::memcpy(&value, static_cast<const uint8_t*>(mapped.pData)+y*mapped.RowPitch+x*4,4);
-    context_->Unmap(staging_.Get(),0); return value;
+    context_->Unmap(staging_.Get(),0); return highPrecisionDisplay_?rgba8From10(value):value;
 }
 bool EnginePreviewD3D11::trySaveShadowCapture(const std::filesystem::path& path) noexcept {
     try {
@@ -452,18 +641,24 @@ bool EnginePreviewD3D11::trySaveShadowCapture(const std::filesystem::path& path)
     return false;
 }
 void EnginePreviewD3D11::saveBmp(const std::filesystem::path& path) {
+    Native::StallProfiler::Scope stallCapture(Native::StallProfiler::Section::FileIO, "EnginePreviewD3D11::saveBmp");
     if(frameOpen_)throw std::logic_error("Cannot capture an unfinished preview frame");
     std::vector<uint8_t> pixels(size_t(width_)*height_*4);
-    context_->CopyResource(staging_.Get(), target_.Get());
-    D3D11_MAPPED_SUBRESOURCE mapped{}; check(context_->Map(staging_.Get(),0,D3D11_MAP_READ,0,&mapped), "capture frame");
+    updateCalibratedImage();
+    auto* staging=displayGamma_?calibratedStaging_.Get():staging_.Get();
+    context_->CopyResource(staging,displayGamma_?calibrated_.Get():target_.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{}; check(stallProfileMap(context_.Get(),staging,0,D3D11_MAP_READ,0,&mapped,
+                                                          "preview screenshot readback Map"), "capture frame");
     for (uint32_t y=0;y<height_;++y) {
         const auto* row = static_cast<const uint8_t*>(mapped.pData)+y*mapped.RowPitch;
         for (uint32_t x=0;x<width_;++x) {
             auto* output = pixels.data()+(size_t(y)*width_+x)*4;
-            output[0]=row[x*4+2]; output[1]=row[x*4+1]; output[2]=row[x*4]; output[3]=255;
+            uint32_t value;std::memcpy(&value,row+x*4,4);
+            if(displayGamma_ || highPrecisionDisplay_)value=rgba8From10(value);
+            output[0]=uint8_t(value>>16);output[1]=uint8_t(value>>8);output[2]=uint8_t(value);output[3]=255;
         }
     }
-    context_->Unmap(staging_.Get(),0);
+    context_->Unmap(staging,0);
     BITMAPFILEHEADER file{}; file.bfType=0x4D42; file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER);
     file.bfSize=file.bfOffBits+DWORD(pixels.size());
     BITMAPINFOHEADER info{}; info.biSize=sizeof(info); info.biWidth=width_; info.biHeight=-LONG(height_);

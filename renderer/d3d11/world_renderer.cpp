@@ -1,7 +1,13 @@
 #include "world_renderer.h"
+#include "stall_profile_d3d11.h"
 #include "world_render_state.h"
+#include "world_darkness_bloom.h"
+#include "shader_bytecode_cache.h"
+#include "texture_budget_policy.h"
 #include "runtime/native/graphics_settings.h"
 #include "renderer/engine/prompt_icons.h"
+#include "renderer/engine/prompt_layout.h"
+#include "renderer/engine/subtitle_font.h"
 #include "renderer/engine/engine_performance.h"
 #include "renderer/engine/render_trace.h"
 #include <d3d11shader.h>
@@ -32,7 +38,8 @@ double millisBetween(std::chrono::steady_clock::time_point begin,std::chrono::st
 // before; only the upload mechanism changes to DISCARD mapping.
 void updateConstants(ID3D11DeviceContext* context,ID3D11Buffer* buffer,const void* data,size_t bytes) {
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    check(context->Map(buffer,0,D3D11_MAP_WRITE_DISCARD,0,&mapped),"world constant map");
+    check(stallProfileMap(context,buffer,0,D3D11_MAP_WRITE_DISCARD,0,&mapped,
+                         "world constants Map"),"world constant map");
     std::memcpy(mapped.pData,data,bytes);
     context->Unmap(buffer,0);
 }
@@ -53,13 +60,14 @@ template<class Cache> typename Cache::mapped_type& cacheEntry(Cache& cache,std::
     if(auto found=cache.find(key);found!=cache.end())return found->second;
     return cache.try_emplace(std::string(key)).first->second;
 }
-std::array<char,6+8*4> shaderKey(const Native::WorldVertexOptions& o) {
-    std::array<char,6+8*4> key{};
+std::array<char,6+8*4+1> shaderKey(const Native::WorldVertexOptions& o,unsigned userClip) {
+    std::array<char,6+8*4+1> key{};
     size_t next=0;
     for (auto x:{o.weights,uint32_t(o.positionConversion),uint32_t(o.normal),uint32_t(o.tangents),
                  uint32_t(o.normalizeNormal),uint32_t(o.vertexColor)}) key[next++]=char(x);
     for (unsigned i=0;i<8;++i) {key[next++]=char(o.modes[i]);key[next++]=char(o.coordinates[i]);
-        key[next++]=char(o.conversions[i]);key[next++]=char(o.matrices[i]);}return key;
+        key[next++]=char(o.conversions[i]);key[next++]=char(o.matrices[i]);}
+    key[next]=char(userClip);return key;
 }
 // FNV-1a over owned bytes for smoke-evidence sampling. Inspection-only;
 // never called on normal runs.
@@ -70,133 +78,88 @@ uint64_t smokeHashBytes(const void* data,size_t size,uint64_t seed=1469598103934
     return hash;
 }
 }
-namespace {
-std::filesystem::path worldVertexShaderCacheDir() {
-    wchar_t executable[MAX_PATH]{};
-    const DWORD length=GetModuleFileNameW(nullptr,executable,MAX_PATH);
-    try {
-        if(length && length<MAX_PATH) {
-            auto dir=std::filesystem::path(executable).parent_path()/"DarkRecompShaderCache";
-            std::error_code status;
-            std::filesystem::create_directories(dir,status);
-            if(!status) return dir;
-        }
-        auto fallback=std::filesystem::temp_directory_path()/"DarkRecompShaderCache";
-        std::error_code status;
-        std::filesystem::create_directories(fallback,status);
-        if(!status) return fallback;
-    } catch (...) {}
-    return {};
-}
-uint64_t worldVertexShaderCacheKey(const Native::WorldVertexOptions& o,bool rasterize) {
-    // FNV-1a over the compiled template source, rasterize variant and packed
-    // options. Any template or flag change yields a different filename, so a
-    // stale cache entry can never shadow a new permutation.
-    uint64_t hash=14695981039346656037ull;
-    auto mix=[&](const void* data,size_t size) {
-        const auto* bytes=static_cast<const uint8_t*>(data);
-        for(size_t i=0;i<size;++i) {hash^=bytes[i];hash*=1099511628211ull;}
-    };
-    constexpr uint64_t version=1;
-    mix(&version,sizeof(version));
-    mix(engineWorldTemplateSource,std::strlen(engineWorldTemplateSource));
-    mix(&rasterize,sizeof(rasterize));
-    mix(&o.weights,sizeof(o.weights));
-    mix(&o.positionConversion,sizeof(o.positionConversion));
-    mix(&o.normal,sizeof(o.normal));
-    mix(&o.tangents,sizeof(o.tangents));
-    mix(&o.normalizeNormal,sizeof(o.normalizeNormal));
-    mix(&o.vertexColor,sizeof(o.vertexColor));
-    mix(o.modes.data(),o.modes.size());
-    mix(o.coordinates.data(),o.coordinates.size());
-    mix(o.conversions.data(),o.conversions.size()*sizeof(bool));
-    mix(o.matrices.data(),o.matrices.size()*sizeof(bool));
-    return hash;
-}
-bool loadCachedWorldVertexShader(ID3D11Device* device,uint64_t key,Microsoft::WRL::ComPtr<ID3DBlob>& code) {
-    const auto dir=worldVertexShaderCacheDir();
-    if(dir.empty()) return false;
-    char name[64]{};
-    std::snprintf(name,sizeof(name),"worldvs_v1_%016llX.cso",key);
-    std::error_code status;
-    const auto size=std::filesystem::file_size(dir/name,status);
-    if(status || !size || size>1024*1024) return false;
-    std::ifstream file(dir/name,std::ios::binary);
-    if(!file) return false;
-    std::vector<uint8_t> bytes;
-    bytes.resize(static_cast<size_t>(size));
-    if(!file.read(reinterpret_cast<char*>(bytes.data()),bytes.size())) return false;
-    Microsoft::WRL::ComPtr<ID3DBlob> blob;
-    if(FAILED(D3DCreateBlob(bytes.size(),&blob))) return false;
-    std::memcpy(blob->GetBufferPointer(),bytes.data(),bytes.size());
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> probe;
-    if(FAILED(device->CreateVertexShader(blob->GetBufferPointer(),blob->GetBufferSize(),nullptr,&probe)))
-        return false;
-    code=std::move(blob);
-    return true;
-}
-void saveCachedWorldVertexShader(uint64_t key,ID3DBlob* code) {
-    if(!code || !code->GetBufferSize() || code->GetBufferSize()>1024*1024) return;
-    try {
-        const auto dir=worldVertexShaderCacheDir();
-        if(dir.empty()) return;
-        char name[64]{}, temporary[80]{};
-        std::snprintf(name,sizeof(name),"worldvs_v1_%016llX.cso",key);
-        std::snprintf(temporary,sizeof(temporary),"worldvs_v1_%016llX.%lu.tmp",key,GetCurrentProcessId());
-        const auto target=dir/name, staging=dir/temporary;
-        {
-            std::ofstream file(staging,std::ios::binary|std::ios::trunc);
-            if(!file) return;
-            file.write(static_cast<const char*>(code->GetBufferPointer()),code->GetBufferSize());
-            if(!file) {std::error_code ignored;std::filesystem::remove(staging,ignored);return;}
-        }
-        std::error_code renameStatus;
-        std::filesystem::rename(staging,target,renameStatus);
-        if(renameStatus) {std::error_code ignored;std::filesystem::remove(staging,ignored);}
-    } catch (...) {}
-}
-}
-WorldVertexShaderD3D11::WorldVertexShaderD3D11(ID3D11Device* device,const Native::WorldVertexOptions& o,bool rasterize):options_(o) {
-    if (!device || o.weights>8) throw std::invalid_argument("Invalid world vertex options");
-    const uint64_t cacheKey=worldVertexShaderCacheKey(o,rasterize);
-    if(loadCachedWorldVertexShader(device,cacheKey,code_)) {
-        check(device->CreateVertexShader(code_->GetBufferPointer(),code_->GetBufferSize(),nullptr,&shader_),"world VS (cached)");
-    } else {
-        std::vector<std::pair<std::string,std::string>> definitions{
-            {"MWCOMP",std::to_string(o.weights)},{"POSITION_TRANS",std::to_string(o.positionConversion)},
-            {"USE_NORMAL",std::to_string(o.normal)},{"USE_TANGENTS",std::to_string(o.tangents)},
-            {"NORMALIZE_NORMAL",std::to_string(o.normalizeNormal)},{"VERTEX_COLOR",std::to_string(o.vertexColor)}};
-        for (unsigned i=0;i<8;++i) {
-            const auto s=std::to_string(i);
-            definitions.insert(definitions.end(),{{"MODE_"+s,std::to_string(o.modes[i])},{"COORD_"+s,std::to_string(o.coordinates[i])},
-                {"CONVERT_"+s,std::to_string(o.conversions[i])},{"MATRIX_"+s,std::to_string(o.matrices[i])}});
-        }
-        std::vector<D3D_SHADER_MACRO> macros;
-        for (const auto& [k,v]:definitions) macros.push_back({k.c_str(),v.c_str()});macros.push_back({nullptr,nullptr});
-        Ptr<ID3DBlob> errors;
-        // Preserve the original shader output; apply the engine's viewport depth
-        // range afterward. 82246F20 initializes this range to (1,0).
-        std::string source=engineWorldTemplateSource;
-        if(rasterize)source+=R"(
-cbuffer NativeViewport : register(b2) {float4 nativeDepthRange;};
+WorldVertexShaderD3D11::WorldVertexShaderD3D11(ID3D11Device* device,const Native::WorldVertexOptions& o,bool rasterize,
+                                           unsigned userClip):options_(o) {
+    if (!device || o.weights>8 || userClip>2 || (!rasterize && userClip))
+        throw std::invalid_argument("Invalid world vertex options");
+    std::vector<std::pair<std::string,std::string>> definitions{
+        {"MWCOMP",std::to_string(o.weights)},{"POSITION_TRANS",std::to_string(o.positionConversion)},
+        {"USE_NORMAL",std::to_string(o.normal)},{"USE_TANGENTS",std::to_string(o.tangents)},
+        {"NORMALIZE_NORMAL",std::to_string(o.normalizeNormal)},{"VERTEX_COLOR",std::to_string(o.vertexColor)}};
+    for (unsigned i=0;i<8;++i) {
+        const auto s=std::to_string(i);
+        definitions.insert(definitions.end(),{{"MODE_"+s,std::to_string(o.modes[i])},{"COORD_"+s,std::to_string(o.coordinates[i])},
+            {"CONVERT_"+s,std::to_string(o.conversions[i])},{"MATRIX_"+s,std::to_string(o.matrices[i])}});
+    }
+    if(userClip)definitions.emplace_back("NATIVE_USER_CLIP_CULL",userClip==2?"1":"0");
+    std::vector<D3D_SHADER_MACRO> macros;
+    for (const auto& [k,v]:definitions) macros.push_back({k.c_str(),v.c_str()});macros.push_back({nullptr,nullptr});
+    // Hash the complete compiled source, including the viewport wrapper.
+    std::string source=engineWorldTemplateSource;
+    if(rasterize && userClip)source+=R"(
+cbuffer NativeViewport : register(b2) {float4 nativeDepthRange;float4 nativePromptTransform;};
+cbuffer NativeUserClip : register(b3) {float4 nativeClipPlanes[6];uint4 nativeClipControl;};
+struct NativeRasterOutput {
+    float4 position : SV_Position;
+    float4 tex[8] : TEXCOORD0;
+    float4 color : COLOR0;
+#if NATIVE_USER_CLIP_CULL
+    float4 distances0 : SV_CullDistance0;
+    float2 distances1 : SV_CullDistance1;
+#else
+    float4 distances0 : SV_ClipDistance0;
+    float2 distances1 : SV_ClipDistance1;
+#endif
+};
+NativeRasterOutput rasterMain(VertexInput input) {
+    VertexOutput result=vertexMain(input);
+    NativeRasterOutput output;
+    // The original PA_CL_UCP planes act on the guest shader's clip position,
+    // before the native viewport and depth-range conversion.
+    float distances[6];
+    [unroll] for(uint plane=0;plane<6;++plane)
+        distances[plane]=(nativeClipControl.x & (1u<<plane))?dot(result.position,nativeClipPlanes[plane]):1.0;
+    output.distances0=float4(distances[0],distances[1],distances[2],distances[3]);
+    output.distances1=float2(distances[4],distances[5]);
+    if(nativePromptTransform.w != 0)
+        result.position.xy=result.position.xy*nativePromptTransform.x+result.position.w*nativePromptTransform.yz;
+    result.position.z=nativeDepthRange.x*result.position.w+(nativeDepthRange.y-nativeDepthRange.x)*result.position.z;
+    output.position=result.position;
+    [unroll] for(uint stage=0;stage<8;++stage)output.tex[stage]=result.tex[stage];
+    output.color=result.color;
+    return output;
+})";
+    else if(rasterize)source+=R"(
+cbuffer NativeViewport : register(b2) {float4 nativeDepthRange;float4 nativePromptTransform;};
 VertexOutput rasterMain(VertexInput input) {
     VertexOutput result=vertexMain(input);
+    if(nativePromptTransform.w != 0)
+        result.position.xy=result.position.xy*nativePromptTransform.x+result.position.w*nativePromptTransform.yz;
     result.position.z=nativeDepthRange.x*result.position.w+(nativeDepthRange.y-nativeDepthRange.x)*result.position.z;
     return result;
 })";
+    constexpr UINT flags=D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_WARNINGS_ARE_ERRORS|D3DCOMPILE_IEEE_STRICTNESS;
+    const char* entry=rasterize?"rasterMain":"vertexMain";
+    const auto cacheKey=ShaderBytecodeCache::key(source,"original_world_VP",entry,"vs_5_0",flags,0,macros.data());
+    const auto& cache=ShaderBytecodeCache::defaultCache();
+    const bool cached=cacheKey && cache.load(*cacheKey,code_) &&
+        SUCCEEDED(device->CreateVertexShader(code_->GetBufferPointer(),code_->GetBufferSize(),nullptr,&shader_));
+    if(!cached) {
+        Native::StallProfiler::Scope stallCompile(Native::StallProfiler::Section::Rendering,
+                                                 "WorldVertexShaderD3D11 shader compile");
+        code_.Reset();shader_.Reset();Ptr<ID3DBlob> errors;
         const auto compileStart=std::chrono::steady_clock::now();
         const auto hr=D3DCompile(source.data(),source.size(),"original_world_VP",macros.data(),nullptr,
-            rasterize?"rasterMain":"vertexMain","vs_5_0",D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_WARNINGS_ARE_ERRORS|D3DCOMPILE_IEEE_STRICTNESS,0,&code_,&errors);
+            entry,"vs_5_0",flags,0,&code_,&errors);
         if (FAILED(hr)) throw std::runtime_error(errors?std::string(static_cast<const char*>(errors->GetBufferPointer()),errors->GetBufferSize()):"World vertex compilation failed");
+        compiled_=true;
         const double compileMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-compileStart).count();
-        // A synchronous compile blocks the render thread. Log only hitch-sized
-        // misses so steady 60 FPS runs stay quiet after the cache warms up.
         static std::atomic<unsigned> slowCompiles{};
         if(compileMs>8.0 && slowCompiles.fetch_add(1,std::memory_order_relaxed)<16)
             std::fprintf(stderr,"[RenderShaderCompile] worldVS miss key=%016llX ms=%.1f weights=%u\n",
-                cacheKey,compileMs,o.weights);
+                cacheKey.value_or(0),compileMs,o.weights);
         check(device->CreateVertexShader(code_->GetBufferPointer(),code_->GetBufferSize(),nullptr,&shader_),"world VS");
-        saveCachedWorldVertexShader(cacheKey,code_.Get());
+        if(cacheKey)cache.save(*cacheKey,code_.Get());
     }
     using V=Native::WorldVertex;
     std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
@@ -211,7 +174,7 @@ VertexOutput rasterMain(VertexInput input) {
     check(device->CreateBuffer(&desc,nullptr,&constants_),"world constants");desc.ByteWidth=144;
     check(device->CreateBuffer(&desc,nullptr,&references_),"world references");
 }
-bool WorldVertexShaderD3D11::bind(ID3D11DeviceContext* context,const Native::WorldVertexConstants& c,const std::vector<Native::WorldVertex>& vertices,
+bool WorldVertexShaderD3D11::bind(ID3D11DeviceContext* context,const Native::WorldVertexConstants& c,std::span<const Native::WorldVertex> vertices,
                                const std::array<std::array<float,2>,8>* indexBounds,bool alreadyBound) {
     if (!context) return false;
     auto valid=[&](float index) {
@@ -226,15 +189,34 @@ bool WorldVertexShaderD3D11::bind(ID3D11DeviceContext* context,const Native::Wor
             if(!valid((*indexBounds)[w][0]) || !valid((*indexBounds)[w][1]))return false;
     } else for(const auto& v:vertices)for(unsigned w=0;w<options_.weights;++w)
         if(!valid(w<4?v.indices[w]:v.indices2[w-4]))return false;
-    const bool initial=!uploadedConstants_;
-    if(initial)uploadedConstants_.emplace();
-    if(initial || std::memcmp(uploadedConstants_->vectors.data(),c.vectors.data(),sizeof(c.vectors))) {
+    if(!uploadedConstants_)uploadedConstants_.emplace();
+    const bool referencesChanged=!referencesUploaded_ ||
+        std::memcmp(uploadedConstants_->references.data(),c.references.data(),sizeof(c.references));
+    const bool countDiagnostics=Native::profileEngineCpu || Native::sampleRendererCpu;
+    if(referencesChanged) {
+        constantRanges_=worldConstantRanges(options_,c.references);
+        if(countDiagnostics)++constantPlansBuilt_;
+    }
+    const bool unprovenPalette=options_.weights && vertices.empty() && !indexBounds;
+    // Compare only a conservative union of shader reads. uploadedConstants_
+    // always describes the actual last successful full GPU upload, including
+    // unread rows; a later reference change therefore cannot reuse stale data.
+    // Raw byte equality retains signed zeros, subnormals and NaN payloads.
+    if(vectorsUploaded_ && countDiagnostics) {
+        ++constantCompareCalls_;constantCompareReadBytes_+=size_t(unprovenPalette?256:constantRanges_.rows)*sizeof(Native::EngineVector);
+    }
+    if(!vectorsUploaded_ || (unprovenPalette?
+        std::memcmp(uploadedConstants_->vectors.data(),c.vectors.data(),sizeof(c.vectors))!=0:
+        !constantRanges_.equal(uploadedConstants_->vectors,c.vectors))) {
         updateConstants(context,constants_.Get(),c.vectors.data(),sizeof(c.vectors));
         uploadedConstants_->vectors=c.vectors;
+        vectorsUploaded_=true;++constantUploadCount_;
     }
-    if(initial || std::memcmp(uploadedConstants_->references.data(),c.references.data(),sizeof(c.references))) {
+    if(referencesChanged) {
         updateConstants(context,references_.Get(),c.references.data(),sizeof(c.references));
         uploadedConstants_->references=c.references;
+        referencesUploaded_=true;
+        if(countDiagnostics)++referenceUploadCount_;
     }
     if(!alreadyBound) {
         ID3D11Buffer* buffers[]{constants_.Get(),references_.Get()};context->VSSetConstantBuffers(0,2,buffers);
@@ -243,18 +225,76 @@ bool WorldVertexShaderD3D11::bind(ID3D11DeviceContext* context,const Native::Wor
     return true;
 }
 WorldRendererD3D11::WorldRendererD3D11(ID3D11Device* d,ID3D11DeviceContext* c,uint32_t scale):device_(d),context_(c),scale_(scale),transientBuffers_(d,c) {
+    const char* reflectionProbe=std::getenv("DARK_REFLECTION_PROBE");
+    reflectionProbe_=reflectionProbe && std::strcmp(reflectionProbe,"1")==0;
+    if(reflectionProbe_)
+        std::fprintf(stderr,"[ReflectionProbe] enabled (diagnostic only; explicit inspections capture at most4 water draws and share a128MiB GPU budget)\n");
+    const char* otherWorldProbe=std::getenv("DARK_OW_PROBE");
+    const char* otherWorldBypass=std::getenv("DARK_OW_BYPASS");
+    otherWorldProbe_=otherWorldProbe && std::strcmp(otherWorldProbe,"1")==0;
+    otherWorldBypass_=otherWorldBypass && std::strcmp(otherWorldBypass,"1")==0;
+    if(otherWorldProbe_ || otherWorldBypass_)
+        std::fprintf(stderr,"[OtherWorldProbe] capture=%u bypass=%u (diagnostic only; explicit inspections capture at most128MiB)\n",
+            unsigned(otherWorldProbe_),unsigned(otherWorldBypass_));
     if(scale<1 || scale>3)throw std::invalid_argument("World render scale must be between one and three");
     Ptr<IDXGIDevice> dxgi;Ptr<IDXGIAdapter> adapter;DXGI_ADAPTER_DESC desc{};
-    if(SUCCEEDED(device_.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)) && desc.DedicatedVideoMemory)
-        imageBudget_=std::clamp(size_t(desc.DedicatedVideoMemory/4),size_t(256*1024*1024),size_t(2ull*1024*1024*1024));
+    const auto dxgiStatus=device_.As(&dxgi);
+    const auto adapterStatus=SUCCEEDED(dxgiStatus)?dxgi->GetAdapter(&adapter):dxgiStatus;
+    const auto descriptionStatus=SUCCEEDED(adapterStatus)?adapter->GetDesc(&desc):adapterStatus;
+    imageDedicatedBytes_=SUCCEEDED(descriptionStatus)?uint64_t(desc.DedicatedVideoMemory):0;
+    imageHardwareBudget_=TextureBudgetPolicy::hardwareCap(imageDedicatedBytes_);
     MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
-    if(GlobalMemoryStatusEx(&memory))imageBudget_=(std::min)(imageBudget_,(std::max)(size_t(256*1024*1024),size_t(memory.ullAvailPhys/4)));
+    const bool memorySuccess=GlobalMemoryStatusEx(&memory)!=0;
+    const auto memoryError=memorySuccess?0ul:GetLastError();
+    imageBudget_=TextureBudgetPolicy::initialBudget(imageHardwareBudget_,memorySuccess,memory.ullAvailPhys);
+    nextImageBudgetSample_=GetTickCount64()+TextureBudgetPolicy::refreshIntervalMs;
+    std::fprintf(stderr,"[TextureBudget] phase=initial adapterAs=%08X adapterGet=%08X adapterDesc=%08X adapter=%ls dedicatedBytes=%llu memorySuccess=%u memoryError=%lu totalPhys=%llu availPhys=%llu memoryLoad=%lu hardwareCapMiB=%zu hostCapMiB=%zu selectedMiB=%zu\n",
+        unsigned(dxgiStatus),unsigned(adapterStatus),unsigned(descriptionStatus),desc.Description,
+        static_cast<unsigned long long>(imageDedicatedBytes_),unsigned(memorySuccess),memoryError,
+        memory.ullTotalPhys,memory.ullAvailPhys,memory.dwMemoryLoad,imageHardwareBudget_/TextureBudgetPolicy::MiB,
+        memorySuccess?TextureBudgetPolicy::hostCap(memory.ullAvailPhys)/TextureBudgetPolicy::MiB:0,
+        imageBudget_/TextureBudgetPolicy::MiB);
+    // The original cache enumerates actual engine programs, rather than the
+    // template's combinatorial option space. Prepare their native raster
+    // forms before the guest starts, just like the fragment programs below.
+    // Keep the same shader objects for the first draw: no compile, cache I/O
+    // or device shader/layout/buffer creation is needed on that display frame.
+    const auto verticesStart=std::chrono::steady_clock::now();
+    shaders_.reserve(engineWorldVertexDescriptorKeys.size()*3);
+    for(const auto& descriptorKey:engineWorldVertexDescriptorKeys) {
+        std::array<uint8_t,80> descriptorBytes{};
+        std::copy(descriptorKey.begin(),descriptorKey.end(),descriptorBytes.begin());
+        const auto options=Native::worldVertexOptions(Native::decodeEngineVertexDescriptor(descriptorBytes));
+        for(unsigned userClip=0;userClip<=2;++userClip) {
+            const auto key=shaderKey(options,userClip);
+            auto& shader=cacheEntry(shaders_,std::string_view(key.data(),key.size()));
+            if(shader)continue;
+            shader=std::make_unique<WorldVertexShaderD3D11>(device_.Get(),options,true,userClip);
+            vertexShaderCompileCount_+=shader->compiled();
+        }
+    }
+    std::fprintf(stderr,"[RenderShaderCache] worldVS=%zu hits=%llu misses=%llu initMs=%.2f compiler=%016llX\n",
+        shaders_.size(),uint64_t(shaders_.size())-vertexShaderCompileCount_,vertexShaderCompileCount_,
+        millisBetween(verticesStart,std::chrono::steady_clock::now()),ShaderBytecodeCache::compilerIdentity().value_or(0));
+    unsigned fragmentCacheHits=0,fragmentCacheMisses=0;
+    const auto fragmentsStart=std::chrono::steady_clock::now();
     auto compile=[&](const char* source,const char* name,Ptr<ID3D11PixelShader>& shader) {
+        Native::StallProfiler::Scope stallCompile(Native::StallProfiler::Section::Rendering,
+                                                 "WorldRendererD3D11 fragment compile");
         Ptr<ID3DBlob> code,errors;
-        const auto hr=D3DCompile(source,std::strlen(source),name,nullptr,nullptr,"pixelMain","ps_5_0",
-            D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_WARNINGS_ARE_ERRORS|D3DCOMPILE_IEEE_STRICTNESS,0,&code,&errors);
+        constexpr UINT flags=D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_WARNINGS_ARE_ERRORS|D3DCOMPILE_IEEE_STRICTNESS;
+        const std::string_view sourceView(source);
+        const auto cacheKey=ShaderBytecodeCache::key(sourceView,name,"pixelMain","ps_5_0",flags,0);
+        const auto& cache=ShaderBytecodeCache::defaultCache();
+        if(cacheKey && cache.load(*cacheKey,code) &&
+           SUCCEEDED(d->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shader))) {
+            ++fragmentCacheHits;return code;
+        }
+        code.Reset();shader.Reset();++fragmentCacheMisses;
+        const auto hr=D3DCompile(source,sourceView.size(),name,nullptr,nullptr,"pixelMain","ps_5_0",flags,0,&code,&errors);
         if (FAILED(hr)) throw std::runtime_error(errors?std::string(static_cast<const char*>(errors->GetBufferPointer()),errors->GetBufferSize()):"Fragment compile failed");
         check(d->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shader),name);
+        if(cacheKey)cache.save(*cacheKey,code.Get());
         return code;
     };
     for(const auto& source:worldFragmentSources) {
@@ -264,6 +304,22 @@ WorldRendererD3D11::WorldRendererD3D11(ID3D11Device* d,ID3D11DeviceContext* c,ui
         // then perform the fixed-function alpha comparison before blending.
         std::string nativeSource="#define pixelMain originalPixelMain\n";
         nativeSource+=source.source;
+        const bool logicalBloom=std::string_view(source.name)=="XRUtil_ShrinkTexture8" ||
+            std::string_view(source.name)=="XREngine_GaussClamped";
+        if(logicalBloom)nativeSource+=R"(
+cbuffer NativeBloom : register(b4) {float bloomRenderScale;uint bloomSnap;uint2 bloomPadding;};
+float4 bloomPixelMain(Fragment input) {
+    // Evaluate the original filter once per guest output texel. Its taps and
+    // atlas clamps retain their original pitch even at 1440p and 4K.
+    float4 dx=ddx(input.tex[0]),dy=ddy(input.tex[0]);
+    if(bloomSnap) {
+        float2 offset=(floor(input.position.xy/bloomRenderScale)+0.5)*bloomRenderScale-input.position.xy;
+        input.tex[0]+=dx*offset.x+dy*offset.y;
+    }
+    return originalPixelMain(input);
+}
+#define originalPixelMain bloomPixelMain
+)";
         nativeSource+=R"(
 #undef pixelMain
 cbuffer NativeAlphaTest : register(b2) {uint alphaFunction;float alphaReference;uint2 alphaPadding;};
@@ -303,6 +359,9 @@ float4 pixelMain(Fragment input) : SV_Target {
             throw std::runtime_error("Native capture omits a compiled original texture binding");
         fragments_.emplace(std::string(source.name)+":"+std::to_string(source.flags),std::move(program));
     }
+    std::fprintf(stderr,"[RenderShaderCache] fragments=%zu hits=%u misses=%u initMs=%.2f compiler=%016llX\n",
+        std::size(worldFragmentSources),fragmentCacheHits,fragmentCacheMisses,
+        millisBetween(fragmentsStart,std::chrono::steady_clock::now()),ShaderBytecodeCache::compilerIdentity().value_or(0));
     constexpr char transferSource[]=R"(
 cbuffer Transfer : register(b0) {float4 area;float4 originScale;};
 float4 vertexMain(uint id:SV_VertexID):SV_Position {
@@ -317,6 +376,19 @@ float4 pixelMain(float4 p:SV_Position):SV_Target {
         D3DCOMPILE_ENABLE_STRICTNESS,0,&code,&errors),"resolve VS compilation");
     check(d->CreateVertexShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&transferVertex_),"resolve VS");
     compile(transferSource,"engine_resolve_copy",transferPixel_);
+    constexpr char logicalSource[]=R"(
+cbuffer Transfer : register(b0) {float4 area;float4 originScale;};
+Texture2D<float4> sourceImage:register(t0);
+float4 pixelMain(float4 p:SV_Position):SV_Target {
+    uint scale=(uint)originScale.w;
+    int2 base=int2(p.xy)*scale;
+    float4 total=0;
+    [loop] for(uint y=0;y<scale;++y)
+        [loop] for(uint x=0;x<scale;++x)
+            total+=sourceImage.Load(int3(base+int2(x,y),0));
+    return total/(scale*scale);
+})";
+    compile(logicalSource,"engine_bloom_logical",logicalPixel_);
     D3D11_DEPTH_STENCIL_DESC depth{};depth.DepthFunc=D3D11_COMPARISON_ALWAYS;
     check(d->CreateDepthStencilState(&depth,&transferDepth_),"resolve depth state");
     D3D11_RASTERIZER_DESC raster{};raster.FillMode=D3D11_FILL_SOLID;raster.CullMode=D3D11_CULL_NONE;raster.DepthClipEnable=TRUE;
@@ -325,8 +397,12 @@ float4 pixelMain(float4 p:SV_Position):SV_Target {
     buffer.Usage=D3D11_USAGE_DYNAMIC;buffer.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
     check(d->CreateBuffer(&buffer,nullptr,&fragmentConstants_),"fragment constants");
     buffer.ByteWidth=256;check(d->CreateBuffer(&buffer,nullptr,&textureScales_),"texture scales");
-    buffer.ByteWidth=16;check(d->CreateBuffer(&buffer,nullptr,&viewportConstants_),"viewport constants");
+    buffer.ByteWidth=32;check(d->CreateBuffer(&buffer,nullptr,&viewportConstants_),"viewport constants");
+    buffer.ByteWidth=16;
     check(d->CreateBuffer(&buffer,nullptr,&alphaTestConstants_),"alpha test constants");
+    check(d->CreateBuffer(&buffer,nullptr,&colorLookupConstants_),"color lookup constants");
+    check(d->CreateBuffer(&buffer,nullptr,&bloomConstants_),"bloom constants");
+    check(d->CreateBuffer(&buffer,nullptr,&shadowConstants_),"shadow constants");
     buffer.ByteWidth=32;check(d->CreateBuffer(&buffer,nullptr,&transferConstants_),"resolve constants");
     D3D11_SAMPLER_DESC sampler{};sampler.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D11_TEXTURE_ADDRESS_WRAP;sampler.MaxLOD=D3D11_FLOAT32_MAX;
@@ -334,41 +410,259 @@ float4 pixelMain(float4 p:SV_Position):SV_Target {
     sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
     check(d->CreateSamplerState(&sampler,&cubeSampler_),"world cube sampler");
 }
-ID3D11ShaderResourceView* WorldRendererD3D11::image(const std::shared_ptr<const ColorImage>& source) {
+void WorldRendererD3D11::requireResizeBoundary() const {
+    if(activeHistogram_.source || inspectFrame_ || captureFrame_)
+        throw std::logic_error("Cannot change render scale during a world query or frame inspection");
+}
+WorldRendererD3D11::Ptr<ID3D11Texture2D> WorldRendererD3D11::resizedTexture(
+        ID3D11Texture2D* source,uint32_t width,uint32_t height) {
+    if(!source || !width || !height || width>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+       height>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        throw std::invalid_argument("Invalid resized texture extent");
+    D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);
+    if(desc.MipLevels!=1 || (desc.ArraySize!=1 && desc.ArraySize!=6) || desc.SampleDesc.Count!=1)
+        throw std::invalid_argument("Unsupported retained texture layout during resize");
+    unsigned pixelBytes=0;
+    switch(desc.Format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R32_FLOAT:case DXGI_FORMAT_R24G8_TYPELESS:pixelBytes=4;break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R16G16B16A16_UNORM:pixelBytes=8;break;
+        default:throw std::invalid_argument("Unsupported retained texture format during resize");
+    }
+    const size_t rowBytes=size_t(width)*pixelBytes,faceBytes=rowBytes*height;
+    if(faceBytes>SIZE_MAX/desc.ArraySize || rowBytes>UINT_MAX || faceBytes>UINT_MAX)
+        throw std::overflow_error("Resized texture exceeds upload dimensions");
+    // A rare explicit resolution change may wait for readback. Copy packed
+    // texels instead of filtering float values so every depth/stencil bit,
+    // FP16 value and repeated color-table block survives the migration.
+    std::vector<uint8_t> pixels(faceBytes*desc.ArraySize);
+    auto stagingDesc=desc;stagingDesc.Usage=D3D11_USAGE_STAGING;stagingDesc.BindFlags=0;
+    stagingDesc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;stagingDesc.MiscFlags=0;
+    Ptr<ID3D11Texture2D> staging;
+    check(device_->CreateTexture2D(&stagingDesc,nullptr,&staging),"resize texture readback");
+    context_->CopyResource(staging.Get(),source);
+    std::array<D3D11_SUBRESOURCE_DATA,6> initial{};
+    for(unsigned face=0;face<desc.ArraySize;++face) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        check(stallProfileMap(context_.Get(),staging.Get(),face,D3D11_MAP_READ,0,&mapped,
+                             "world resized texture Map"),"resize texture map");
+        auto* output=pixels.data()+faceBytes*face;
+        for(uint32_t y=0;y<height;++y) {
+            const auto sourceY=uint32_t(((uint64_t(y)*2+1)*desc.Height)/(uint64_t(height)*2));
+            const auto* input=static_cast<const uint8_t*>(mapped.pData)+size_t(sourceY)*mapped.RowPitch;
+            for(uint32_t x=0;x<width;++x) {
+                const auto sourceX=uint32_t(((uint64_t(x)*2+1)*desc.Width)/(uint64_t(width)*2));
+                std::memcpy(output+size_t(y)*rowBytes+size_t(x)*pixelBytes,input+size_t(sourceX)*pixelBytes,pixelBytes);
+            }
+        }
+        context_->Unmap(staging.Get(),face);
+        initial[face]={output,UINT(rowBytes),UINT(faceBytes)};
+    }
+    desc.Width=width;desc.Height=height;
+    Ptr<ID3D11Texture2D> result;
+    check(device_->CreateTexture2D(&desc,initial.data(),&result),"resized retained texture");
+    return result;
+}
+WorldRendererD3D11::Surface WorldRendererD3D11::resizedSurface(Surface& source,uint32_t scale) {
+    if(!source.texture)return source;
+    synchronizeSurface(source,true);
+    if(source.width>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION/scale ||
+       source.height>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION/scale)
+        throw std::invalid_argument("Scaled retained surface exceeds GPU dimensions");
+    Surface result;result.width=source.width;result.height=source.height;
+    result.texture=resizedTexture(source.texture.Get(),source.width*scale,source.height*scale);
+    if(source.view) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc{};source.view->GetDesc(&desc);
+        check(device_->CreateShaderResourceView(result.texture.Get(),&desc,&result.view),"resized surface read view");
+    }
+    if(source.color) {
+        check(device_->CreateRenderTargetView(result.texture.Get(),nullptr,&result.color),"resized surface color view");
+    }
+    if(source.depth) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC desc{};source.depth->GetDesc(&desc);
+        desc.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D;
+        check(device_->CreateDepthStencilView(result.texture.Get(),&desc,&result.depth),"resized surface depth view");
+        result.singleDepth=result.depth;
+        D3D11_SHADER_RESOURCE_VIEW_DESC stencil{};stencil.Format=DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        stencil.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D;stencil.Texture2D.MipLevels=1;
+        check(device_->CreateShaderResourceView(result.texture.Get(),&stencil,&result.stencilView),"resized stencil view");
+    }
+    for(unsigned face=0;face<source.faces.size();++face)if(source.faces[face]) {
+        D3D11_RENDER_TARGET_VIEW_DESC desc{};source.faces[face]->GetDesc(&desc);
+        check(device_->CreateRenderTargetView(result.texture.Get(),&desc,&result.faces[face]),"resized surface cube face");
+    }
+    if(source.multisample)attachMultisample(result,sampleCount_,true);
+    return result;
+}
+void WorldRendererD3D11::synchronizeSurface(Surface& source,bool stencil) {
+    if(!source.multisample || (!source.resolveDirty && (!stencil || !source.stencilDirty)))return;
+    if(source.depth) {
+        if(!msaaDepthTransfer_)msaaDepthTransfer_=std::make_unique<MsaaDepthTransferD3D11>(device_.Get(),context_.Get());
+        const bool paused=pauseHistogram();
+        try {
+            msaaDepthTransfer_->copy(source.multisampleDepthView.Get(),source.multisampleStencilView.Get(),true,
+                source.singleDepth.Get(),source.width*scale_,source.height*scale_,stencil);
+        } catch(...) {if(paused)resumeHistogram();throw;}
+        if(paused)resumeHistogram();
+        if(stencil)source.stencilDirty=false;
+    } else {
+        context_->ResolveSubresource(source.texture.Get(),0,source.multisample.Get(),0,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    }
+    source.resolveDirty=false;
+}
+void WorldRendererD3D11::attachMultisample(Surface& surface,unsigned samples,bool retained) {
+    if(samples==1)return;
+    const bool depth=bool(surface.depth);
+    D3D11_TEXTURE2D_DESC desc{};surface.texture->GetDesc(&desc);
+    desc.SampleDesc.Count=samples;desc.SampleDesc.Quality=D3D11_STANDARD_MULTISAMPLE_PATTERN;
+    check(device_->CreateTexture2D(&desc,nullptr,&surface.multisample),"multisample world surface");
+    if(depth) {
+        surface.singleDepth=surface.depth;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};dsv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2DMS;
+        check(device_->CreateDepthStencilView(surface.multisample.Get(),&dsv,&surface.depth),"multisample depth view");
+        D3D11_SHADER_RESOURCE_VIEW_DESC view{};view.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2DMS;
+        view.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        check(device_->CreateShaderResourceView(surface.multisample.Get(),&view,&surface.multisampleDepthView),"multisample depth read view");
+        view.Format=DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        check(device_->CreateShaderResourceView(surface.multisample.Get(),&view,&surface.multisampleStencilView),"multisample stencil read view");
+        if(retained) {
+            if(!msaaDepthTransfer_)msaaDepthTransfer_=std::make_unique<MsaaDepthTransferD3D11>(device_.Get(),context_.Get());
+            const bool paused=pauseHistogram();
+            try {msaaDepthTransfer_->copy(surface.view.Get(),surface.stencilView.Get(),false,surface.depth.Get(),desc.Width,desc.Height,true);}
+            catch(...) {if(paused)resumeHistogram();throw;}
+            if(paused)resumeHistogram();
+        } else context_->ClearDepthStencilView(surface.depth.Get(),D3D11_CLEAR_DEPTH|D3D11_CLEAR_STENCIL,0,0);
+    } else {
+        check(device_->CreateRenderTargetView(surface.multisample.Get(),nullptr,&surface.color),"multisample color view");
+        if(retained) {
+            if(!msaaDepthTransfer_)msaaDepthTransfer_=std::make_unique<MsaaDepthTransferD3D11>(device_.Get(),context_.Get());
+            const bool paused=pauseHistogram();
+            try {msaaDepthTransfer_->copyColor(surface.view.Get(),surface.color.Get(),desc.Width,desc.Height);}
+            catch(...) {if(paused)resumeHistogram();throw;}
+            if(paused)resumeHistogram();
+        } else {const float zero[4]{};context_->ClearRenderTargetView(surface.color.Get(),zero);}
+    }
+    surface.resolveDirty=surface.stencilDirty=false;
+}
+bool WorldRendererD3D11::setSampleCount(unsigned requested) {
+    if(requested!=1 && requested!=2 && requested!=4 && requested!=8)throw std::invalid_argument("Invalid MSAA sample count");
+    if(requested==requestedSampleCount_)return false;
+    unsigned supported=requested;
+    while(supported>1) {
+        UINT color=0,depth=0;
+        if(SUCCEEDED(device_->CheckMultisampleQualityLevels(DXGI_FORMAT_R16G16B16A16_FLOAT,supported,&color)) &&
+           SUCCEEDED(device_->CheckMultisampleQualityLevels(DXGI_FORMAT_D24_UNORM_S8_UINT,supported,&depth)) && color && depth)break;
+        supported/=2;
+    }
+    if(supported==sampleCount_) {requestedSampleCount_=requested;return false;}
+    requireResizeBoundary();
+    context_->ClearState();invalidateBindings();pixelBuffersBound_=false;
+    decltype(surfaces_) replacement;replacement.reserve(surfaces_.size());
+    for(auto& [key,old]:surfaces_) {
+        synchronizeSurface(old,true);
+        Surface next=old;next.multisample.Reset();next.multisampleDepthView.Reset();next.multisampleStencilView.Reset();
+        if(next.depth)next.depth=next.singleDepth;
+        else check(device_->CreateRenderTargetView(next.texture.Get(),nullptr,&next.color),"single-sample world color view");
+        if(supported>1)attachMultisample(next,supported,true);
+        replacement.emplace(key,std::move(next));
+    }
+    surfaces_.swap(replacement);sampleCount_=supported;requestedSampleCount_=requested;
+    context_->ClearState();invalidateBindings();pixelBuffersBound_=false;
+    std::fprintf(stderr,"[Antialiasing] requestedSamples=%u activeSamples=%u retainedSurfaces=%zu\n",requested,supported,surfaces_.size());
+    return true;
+}
+bool WorldRendererD3D11::setRenderScale(uint32_t scale) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "WorldRendererD3D11::setRenderScale");
+    if(scale<1 || scale>3)throw std::invalid_argument("World render scale must be between one and three");
+    requireResizeBoundary();
+    if(scale==scale_)return false;
+    context_->ClearState();invalidateBindings();pixelBuffersBound_=false;
+    // Build both replacement maps before committing any owner or scale. The
+    // old maps retain every texture/view if allocation, readback or upload fails.
+    decltype(surfaces_) surfaces;decltype(resolved_) resolved;
+    surfaces.reserve(surfaces_.size());resolved.reserve(resolved_.size());
+    for(auto& [key,surface]:surfaces_)surfaces.emplace(key,resizedSurface(surface,scale));
+    for(auto& [key,surface]:resolved_)resolved.emplace(key,resizedSurface(surface,scale));
+    surfaces_.swap(surfaces);resolved_.swap(resolved);scale_=scale;
+    boundColor_=nullptr;boundDepth_=nullptr;boundViews_.fill(nullptr);
+    return true;
+}
+bool WorldRendererD3D11::preloadImage(const std::shared_ptr<const ColorImage>& source) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "WorldRendererD3D11::preloadImage");
+    if(!source || !source->authoredMips || source->firstMip || !source->valid())return false;
+    return image(source,true)!=nullptr;
+}
+ID3D11ShaderResourceView* WorldRendererD3D11::image(const std::shared_ptr<const ColorImage>& source,bool speculative) {
     if (!source || !source->valid())return nullptr;
     const unsigned levels=std::bit_width((std::max)(source->width,source->height));
-    if (auto it=images_.find(source.get());it!=images_.end()) {it->second.used=++resourceUse_;return it->second.view.Get();}
+    if (auto it=images_.find(source.get());it!=images_.end()) {
+        if(!speculative)it->second.used=++resourceUse_;
+        return it->second.view.Get();
+    }
     const auto imageStart=std::chrono::steady_clock::now();
+    Native::StallProfiler::Scope stallUpload(Native::StallProfiler::Section::Rendering,
+                                            "WorldRendererD3D11 image upload");
     D3D11_TEXTURE2D_DESC desc{};desc.Width=source->width;desc.Height=source->height;
     desc.MipLevels=source->authoredMips?unsigned(source->mips.size()+1):levels;desc.ArraySize=source->faces;
     desc.SampleDesc.Count=1;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.Usage=D3D11_USAGE_DEFAULT;
     desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
     if(!source->authoredMips) {desc.BindFlags|=D3D11_BIND_RENDER_TARGET;desc.MiscFlags=D3D11_RESOURCE_MISC_GENERATE_MIPS;}
     if (source->faces==6) desc.MiscFlags|=D3D11_RESOURCE_MISC_TEXTURECUBE;
-    Image result;result.source=source;result.used=++resourceUse_;
+    // Preloading uses only spare cache capacity. Keep speculative entries cold
+    // until a draw uses them, so ordinary LRU eviction prefers unused images.
+    Image result;result.source=source;result.used=speculative?0:++resourceUse_;
     for(unsigned mip=0;mip<desc.MipLevels;++mip)
         result.bytes+=size_t((std::max)(1u,source->width>>mip))*(std::max)(1u,source->height>>mip)*source->faces*4;
-    while(!images_.empty() && imageBytes_+result.bytes>imageBudget_) {
-        auto oldest=std::min_element(images_.begin(),images_.end(),[](const auto& l,const auto& r){return l.second.used<r.second.used;});
-        imageBytes_-=oldest->second.bytes;images_.erase(oldest);
-    }
-    Ptr<ID3D11Texture2D> texture;check(device_->CreateTexture2D(&desc,nullptr,&texture),"world image");
-    for(unsigned mip=source->firstMip;mip<=source->mips.size();++mip) {
-        const auto& pixels=mip?source->mips[mip-1]:source->pixels;
-        const unsigned width=(std::max)(1u,source->width>>mip),height=(std::max)(1u,source->height>>mip);
-        for(unsigned f=0;f<source->faces;++f)context_->UpdateSubresource(texture.Get(),D3D11CalcSubresource(mip,f,desc.MipLevels),nullptr,
-            pixels.data()+size_t(f)*width*height*4,width*4,0);
+    if(source->generatedSubtitleFont && result.bytes>imageBudget_)return nullptr;
+    if(speculative && (imageBytes_>imageBudget_ || result.bytes>imageBudget_-imageBytes_))return nullptr;
+    auto makeRoom=[&] {
+        while(!images_.empty() && imageBytes_+result.bytes>imageBudget_) {
+            auto oldest=std::min_element(images_.begin(),images_.end(),[](const auto& l,const auto& r){return l.second.used<r.second.used;});
+            imageBytes_-=oldest->second.bytes;images_.erase(oldest);
+        }
+    };
+    if(!source->generatedSubtitleFont)makeRoom();
+    Ptr<ID3D11Texture2D> texture;
+    if(source->authoredMips && source->firstMip==0) {
+        // Owned authored levels are complete and never written after upload.
+        // Initialize every face/mip at creation to avoid separate immediate-
+        // context transfers (and their driver synchronization) per level.
+        desc.Usage=D3D11_USAGE_IMMUTABLE;
+        std::vector<D3D11_SUBRESOURCE_DATA> initial(size_t(desc.MipLevels)*desc.ArraySize);
+        for(unsigned mip=0;mip<desc.MipLevels;++mip) {
+            const auto& pixels=mip?source->mips[mip-1]:source->pixels;
+            const unsigned width=(std::max)(1u,source->width>>mip),height=(std::max)(1u,source->height>>mip);
+            const unsigned faceBytes=width*height*4;
+            for(unsigned f=0;f<source->faces;++f)
+                initial[D3D11CalcSubresource(mip,f,desc.MipLevels)]={
+                    pixels.data()+size_t(f)*faceBytes,width*4,faceBytes};
+        }
+        check(device_->CreateTexture2D(&desc,initial.data(),&texture),"world authored image");
+    } else {
+        check(device_->CreateTexture2D(&desc,nullptr,&texture),"world image");
+        for(unsigned mip=source->firstMip;mip<=source->mips.size();++mip) {
+            const auto& pixels=mip?source->mips[mip-1]:source->pixels;
+            const unsigned width=(std::max)(1u,source->width>>mip),height=(std::max)(1u,source->height>>mip);
+            for(unsigned f=0;f<source->faces;++f)context_->UpdateSubresource(texture.Get(),D3D11CalcSubresource(mip,f,desc.MipLevels),nullptr,
+                pixels.data()+size_t(f)*width*height*4,width*4,0);
+        }
     }
     check(device_->CreateShaderResourceView(texture.Get(),nullptr,&result.view),"world image view");
     if(!source->authoredMips)context_->GenerateMips(result.view.Get());
-    imageBytes_+=result.bytes;++imageUploads_;
-    noteWorstUpload(millisBetween(imageStart,std::chrono::steady_clock::now()),result.bytes,"image");
-    return images_.emplace(source.get(),std::move(result)).first->second.view.Get();
+    if(source->generatedSubtitleFont)makeRoom();
+    const auto cached=images_.emplace(source.get(),std::move(result)).first;
+    imageBytes_+=cached->second.bytes;++imageUploads_;
+    noteWorstUpload(millisBetween(imageStart,std::chrono::steady_clock::now()),cached->second.bytes,"image");
+    return cached->second.view.Get();
 }
 WorldRendererD3D11::Surface& WorldRendererD3D11::surface(uint64_t key,uint32_t width,uint32_t height,bool depth) {
     auto& s=surfaces_[key];
     if (s.texture && s.width>=width && s.height>=height) return s;
     const auto surfaceStart=std::chrono::steady_clock::now();
+    Native::StallProfiler::Scope stallSurface(Native::StallProfiler::Section::Rendering,
+                                             "WorldRendererD3D11 surface allocation");
+    synchronizeSurface(s,true);
     const auto old=s;
     width=(std::max)(old.width,width);height=(std::max)(old.height,height);
     if(!width || !height || width>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION/scale_ || height>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION/scale_)
@@ -384,6 +678,9 @@ WorldRendererD3D11::Surface& WorldRendererD3D11::surface(uint64_t key,uint32_t w
     if (depth) {
         D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};dsv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D;dsv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT;
         check(device_->CreateDepthStencilView(s.texture.Get(),&dsv,&s.depth),"world depth view");
+        s.singleDepth=s.depth;
+        srv.Format=DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        check(device_->CreateShaderResourceView(s.texture.Get(),&srv,&s.stencilView),"world stencil view");
         context_->ClearDepthStencilView(s.depth.Get(),D3D11_CLEAR_DEPTH|D3D11_CLEAR_STENCIL,0,0);
     } else {
         check(device_->CreateRenderTargetView(s.texture.Get(),nullptr,&s.color),"world color view");
@@ -409,8 +706,9 @@ WorldRendererD3D11::Surface& WorldRendererD3D11::surface(uint64_t key,uint32_t w
             context_->CopyResource(s.texture.Get(),expanded.Get());
         } else context_->CopySubresourceRegion(s.texture.Get(),0,0,0,0,old.texture.Get(),0,&box);
     }
+    attachMultisample(s,sampleCount_,bool(old.texture));
     noteWorstUpload(millisBetween(surfaceStart,std::chrono::steady_clock::now()),
-        size_t(desc.Width)*desc.Height*(depth?4:8),depth?"surface-depth":"surface-color");
+        size_t(desc.Width)*desc.Height*(depth?4:8)*sampleCount_,depth?"surface-depth":"surface-color");
     return s;
 }
 void WorldRendererD3D11::transfer(ID3D11ShaderResourceView* source,ID3D11RenderTargetView* target,
@@ -436,7 +734,48 @@ void WorldRendererD3D11::transfer(ID3D11ShaderResourceView* source,ID3D11RenderT
     if(histogramPaused)resumeHistogram();
     context_->PSSetShaderResources(0,16,empty.data());context_->OMSetRenderTargets(0,nullptr,nullptr);
 }
+ID3D11ShaderResourceView* WorldRendererD3D11::logicalBloomView(Surface& source) {
+    if(source.logicalValid)return source.logicalView.Get();
+    if(!source.logicalTexture) {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width=source.width;desc.Height=source.height;
+        desc.MipLevels=desc.ArraySize=desc.SampleDesc.Count=1;
+        // Keep dim subpixel lights: averaging into UNORM can round their
+        // energy to zero before the original fetch exponent is applied.
+        desc.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;
+        desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
+        Ptr<ID3D11Texture2D> texture;
+        Ptr<ID3D11ShaderResourceView> view;
+        Ptr<ID3D11RenderTargetView> target;
+        check(device_->CreateTexture2D(&desc,nullptr,&texture),"logical bloom texture");
+        check(device_->CreateShaderResourceView(texture.Get(),nullptr,&view),"logical bloom view");
+        check(device_->CreateRenderTargetView(texture.Get(),nullptr,&target),"logical bloom target");
+        source.logicalTexture=std::move(texture);source.logicalView=std::move(view);source.logicalTarget=std::move(target);
+    }
+    invalidateBindings();
+    std::array<ID3D11ShaderResourceView*,16> empty{};
+    context_->PSSetShaderResources(0,16,empty.data());
+    auto* target=source.logicalTarget.Get();
+    context_->OMSetRenderTargets(1,&target,nullptr);
+    context_->OMSetDepthStencilState(transferDepth_.Get(),0);
+    context_->OMSetBlendState(nullptr,nullptr,~0u);context_->RSSetState(transferRaster_.Get());
+    const D3D11_VIEWPORT viewport{0,0,float(source.width),float(source.height),0,1};
+    context_->RSSetViewports(1,&viewport);
+    const float constants[]{0,0,0,0,0,0,1,float(scale_)};
+    updateConstants(context_.Get(),transferConstants_.Get(),constants,sizeof(constants));
+    auto* buffer=transferConstants_.Get();context_->PSSetConstantBuffers(0,1,&buffer);
+    context_->IASetInputLayout(nullptr);context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->VSSetShader(transferVertex_.Get(),nullptr,0);context_->PSSetShader(logicalPixel_.Get(),nullptr,0);
+    context_->GSSetShader(nullptr,nullptr,0);context_->HSSetShader(nullptr,nullptr,0);context_->DSSetShader(nullptr,nullptr,0);
+    auto* view=source.view.Get();context_->PSSetShaderResources(0,1,&view);
+    const bool histogramPaused=pauseHistogram();context_->Draw(3,0);
+    if(histogramPaused)resumeHistogram();
+    context_->PSSetShaderResources(0,16,empty.data());context_->OMSetRenderTargets(0,nullptr,nullptr);
+    source.logicalValid=true;
+    return source.logicalView.Get();
+}
 bool WorldRendererD3D11::resolve(const Native::WorldResolve& r) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "WorldRendererD3D11::resolve");
     Native::setRenderSamplePhase(Native::RenderSamplePhase::resolve);
     const unsigned command=captureFrame_?captureCommand_++:0;
     const unsigned attachment=r.flags&7;const bool depth=attachment==4;
@@ -486,7 +825,11 @@ bool WorldRendererD3D11::resolve(const Native::WorldResolve& r) {
         return reject(7,src->second.width,src->second.height);
     DXGI_FORMAT format;
     switch(r.destination.format) {
-        case 6:case 54:format=DXGI_FORMAT_R8G8B8A8_UNORM;break;
+        case 6:format=DXGI_FORMAT_R8G8B8A8_UNORM;break;
+        // The original display PWL ramp consumes all ten frontbuffer bits.
+        // Quantizing its shadow inputs to eight bits before calibration loses
+        // values that the console retains, even when the host display is 8bpc.
+        case 54:format=DXGI_FORMAT_R10G10B10A2_UNORM;break;
         case 26:format=DXGI_FORMAT_R16G16B16A16_UNORM;break;
         case 23:if(!depth)return reject(3);format=DXGI_FORMAT_R32_FLOAT;break;
         default:return reject(4);
@@ -519,10 +862,23 @@ bool WorldRendererD3D11::resolve(const Native::WorldResolve& r) {
         uint64_t(r.rectangle[0])+r.destination.width-r.offset[0]}));
     copied[3]=uint32_t((std::min)({uint64_t(resolveRegion[3]),uint64_t(src->second.height),
         uint64_t(r.rectangle[1])+r.destination.height-r.offset[1]}));
+    synchronizeSurface(src->second);
     transfer(src->second.view.Get(),r.destination.faces==6?dest.faces[r.face].Get():dest.color.Get(),copied,r.offset,std::exp2(float(r.exponent)));
+    dest.logicalValid=false;
     // Record the completed transfer before any separately recorded resolve
     // clears; the command order is the render consumer's actual execution.
     if(captureFrame_)Native::traceWorldResolve(r,inspection_,command,0,&copied);
+    if(captureFrame_ && otherWorldProbe_ && !depth) {
+        if(otherWorldPhase_==1 && r.surfaceKey(attachment)==otherWorldSurface_) {
+            otherWorldMask_=r.destination.key();otherWorldPhase_=2;
+            captureTextureReadback(dest.texture.Get(),command,otherWorldGrainDraw_,1,
+                "ow1-full-resolve","ow-resolved-mask",otherWorldMask_,0);
+        } else if(otherWorldPhase_==3 && r.destination.key()==otherWorldMask_) {
+            otherWorldPhase_=4;
+            captureTextureReadback(dest.texture.Get(),command,otherWorldCopyDraw_,2,
+                "mask-copy-half-resolve","ow-resolved-mask",otherWorldMask_,0);
+        }
+    }
     auto clearSource=[&](unsigned slot,const Surface& target,bool depth) {
         Native::WorldClear reset;reset.flags=depth?48:1;reset.targets[depth?4:0]=r.targets[slot];
         reset.surfaceBindings[depth?4:0]=r.surfaceBindings[slot];
@@ -542,6 +898,7 @@ bool WorldRendererD3D11::resolve(const Native::WorldResolve& r) {
     return true;
 }
 bool WorldRendererD3D11::present(const Native::WorldTexture& texture,ID3D11Texture2D* target) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "WorldRendererD3D11::present frontbuffer");
     Native::setRenderSamplePhase(Native::RenderSamplePhase::copy);
     const unsigned command=captureFrame_?captureCommand_++:0;
     auto result=[&](unsigned reason) {
@@ -550,8 +907,20 @@ bool WorldRendererD3D11::present(const Native::WorldTexture& texture,ID3D11Textu
     };
     const auto it=resolved_.find(texture.key());if(it==resolved_.end() || !target)return result(1);
     D3D11_TEXTURE2D_DESC src{},dest{};it->second.texture->GetDesc(&src);target->GetDesc(&dest);
-    if(src.Width!=dest.Width || src.Height!=dest.Height || src.Format!=dest.Format)return result(2);
-    context_->OMSetRenderTargets(0,nullptr,nullptr);invalidateBindings();context_->CopyResource(target,it->second.texture.Get());
+    if(src.Width!=dest.Width || src.Height!=dest.Height)return result(2);
+    if(src.Format==dest.Format) {
+        context_->OMSetRenderTargets(0,nullptr,nullptr);invalidateBindings();context_->CopyResource(target,it->second.texture.Get());
+    } else {
+        // Explicit compatibility conversion for callers with an 8-bit render
+        // target. The live preview uses matching R10 storage, so its original
+        // gamma stage still receives the unmodified ten-bit frontbuffer.
+        if(src.Format!=DXGI_FORMAT_R10G10B10A2_UNORM || dest.Format!=DXGI_FORMAT_R8G8B8A8_UNORM ||
+           src.ArraySize!=1 || dest.ArraySize!=1 || dest.MipLevels!=1 || dest.SampleDesc.Count!=1 ||
+           !(dest.BindFlags&D3D11_BIND_RENDER_TARGET))return result(2);
+        Ptr<ID3D11RenderTargetView> view;
+        check(device_->CreateRenderTargetView(target,nullptr,&view),"present compatibility target");
+        transfer(it->second.view.Get(),view.Get(),{0,0,it->second.width,it->second.height},{0,0},1);
+    }
     ++presentCount_;return result(0);
 }
 void WorldRendererD3D11::histogram(const std::shared_ptr<Native::WorldQuery>& query,bool begin) {
@@ -560,6 +929,8 @@ void WorldRendererD3D11::histogram(const std::shared_ptr<Native::WorldQuery>& qu
     if(begin) {
         if(activeHistogram_.source)throw std::invalid_argument("Nested histogram query");
         activeHistogram_.source=query;
+        activeHistogram_.scale=scale_;
+        activeHistogram_.samples=sampleCount_;
         D3D11_QUERY_DESC desc{D3D11_QUERY_OCCLUSION,0};
         check(device_->CreateQuery(&desc,&activeHistogram_.query),"histogram query");
         context_->Begin(activeHistogram_.query.Get());
@@ -570,7 +941,9 @@ void WorldRendererD3D11::histogram(const std::shared_ptr<Native::WorldQuery>& qu
     }
 }
 bool WorldRendererD3D11::pauseHistogram() {
-    if(!activeHistogram_.source)return false;
+    // An outer clear can already own the pause while another attachment grows.
+    // Only the scope that ends a live segment should resume the measurement.
+    if(!activeHistogram_.source || !activeHistogram_.query)return false;
     context_->End(activeHistogram_.query.Get());
     activeHistogram_.segments.push_back(std::move(activeHistogram_.query));return true;
 }
@@ -580,6 +953,7 @@ void WorldRendererD3D11::resumeHistogram() {
     context_->Begin(activeHistogram_.query.Get());
 }
 void WorldRendererD3D11::pollHistograms() {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "WorldRendererD3D11::pollHistograms");
     Native::setRenderSamplePhase(Native::RenderSamplePhase::queries);
     // Keep completion ordered: an older pending measurement must never replace
     // a newer result. No CPU estimate or synthetic completion is published.
@@ -587,6 +961,8 @@ void WorldRendererD3D11::pollHistograms() {
     for(auto& query:pendingHistograms_) {
         uint64_t samples=0;
         auto collect=[&](ID3D11Query* part) {
+            Native::StallProfiler::Scope stallQuery(Native::StallProfiler::Section::Rendering,
+                "ID3D11DeviceContext::GetData histogram", 0, 0, reinterpret_cast<uint64_t>(part), "D3D11 query");
             uint64_t value=0;
             const auto hr=context_->GetData(part,&value,sizeof(value),D3D11_ASYNC_GETDATA_DONOTFLUSH);
             if(hr==S_FALSE)return false;
@@ -599,7 +975,7 @@ void WorldRendererD3D11::pollHistograms() {
         if(!ready || !collect(query.query.Get()))break;
         // Guest exposure consumes logical pixel counts. Normalize after summing
         // all segments so helper-induced query splits cannot lose extra samples.
-        query.source->result->samples.store(samples/(scale_*scale_),std::memory_order_release);++completed;
+        query.source->result->samples.store(samples/(query.scale*query.scale*query.samples),std::memory_order_release);++completed;
     }
     pendingHistograms_.erase(pendingHistograms_.begin(),pendingHistograms_.begin()+completed);
 }
@@ -614,6 +990,8 @@ float4 clearVS(uint id : SV_VertexID) : SV_Position {
 float4 clearPS() : SV_Target {return clearColor;}
 )";
     auto compile=[&](const char* entry,const char* profile) {
+        Native::StallProfiler::Scope stallCompile(Native::StallProfiler::Section::Rendering,
+                                                 "WorldRendererD3D11 clear shader compile");
         Ptr<ID3DBlob> code,error;
         const auto hr=D3DCompile(source,sizeof(source)-1,"native_rectangular_clear",nullptr,nullptr,entry,profile,
             D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_IEEE_STRICTNESS,0,&code,&error);
@@ -627,7 +1005,7 @@ float4 clearPS() : SV_Target {return clearColor;}
     cb.Usage=D3D11_USAGE_DYNAMIC;cb.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
     check(device_->CreateBuffer(&cb,nullptr,&clearConstants_),"clear constants");
     D3D11_RASTERIZER_DESC raster{};raster.FillMode=D3D11_FILL_SOLID;raster.CullMode=D3D11_CULL_NONE;
-    raster.DepthClipEnable=TRUE;raster.ScissorEnable=TRUE;
+    raster.DepthClipEnable=TRUE;raster.ScissorEnable=TRUE;raster.MultisampleEnable=TRUE;
     check(device_->CreateRasterizerState(&raster,&clearRaster_),"clear rasterizer");
     for(unsigned mask=0;mask<4;++mask) {
         D3D11_DEPTH_STENCIL_DESC depth{};depth.DepthEnable=(mask&1)!=0;depth.DepthFunc=D3D11_COMPARISON_ALWAYS;
@@ -640,6 +1018,7 @@ float4 clearPS() : SV_Target {return clearColor;}
     clearReady_=true;
 }
 void WorldRendererD3D11::clear(const Native::WorldClear& c) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "WorldRendererD3D11::clear");
     Native::setRenderSamplePhase(Native::RenderSamplePhase::clear);
     const unsigned command=captureFrame_?captureCommand_++:0;
     unsigned cleared=0;
@@ -654,6 +1033,7 @@ void WorldRendererD3D11::clear(const Native::WorldClear& c) {
         }
         if(rect.right<=rect.left || rect.bottom<=rect.top) {++emptyClearRegions_;return;}
         ++cleared;
+        target.resolveDirty=target.stencilDirty=bool(target.multisample);
         if(rect.left==0 && rect.top==0 && rect.right==LONG(target.width) && rect.bottom==LONG(target.height)) {
             if(depth)context_->ClearDepthStencilView(target.depth.Get(),((c.flags&16)?D3D11_CLEAR_DEPTH:0)|((c.flags&32)?D3D11_CLEAR_STENCIL:0),std::clamp(c.depth,0.0f,1.0f),UINT8(c.stencil));
             else context_->ClearRenderTargetView(target.color.Get(),c.color.data());
@@ -698,11 +1078,13 @@ std::vector<uint8_t> WorldRendererD3D11::readSurface(const Native::WorldSurfaceT
 std::vector<uint8_t> WorldRendererD3D11::readSurfaceKey(uint64_t key,bool depth) {
     const auto it=surfaces_.find(key);
     if (it==surfaces_.end()) return {};
+    synchronizeSurface(it->second,true);
     const auto& s=it->second;D3D11_TEXTURE2D_DESC desc{};s.texture->GetDesc(&desc);
     desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
     Ptr<ID3D11Texture2D> staging;check(device_->CreateTexture2D(&desc,nullptr,&staging),"world readback texture");
     context_->CopyResource(staging.Get(),s.texture.Get());D3D11_MAPPED_SUBRESOURCE mapped{};
-    const auto mapResult=context_->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped);
+    const auto mapResult=stallProfileMap(context_.Get(),staging.Get(),0,D3D11_MAP_READ,0,&mapped,
+                                        "world surface readback Map");
     if(FAILED(mapResult))check(device_->GetDeviceRemovedReason(),"world readback device removal");
     check(mapResult,"world readback map");
     const size_t row=size_t(desc.Width)*(depth?4:8);std::vector<uint8_t> result(row*desc.Height);
@@ -713,12 +1095,200 @@ void WorldRendererD3D11::inspectNextFrame() {
     inspectFrame_=true;++inspection_;inspectedPrograms_.clear();
     smokeRecords_=0;smokeTruncated_=false;smokeDrawOrdinal_=0;
     captureFrame_=inspection_<=2 && Native::worldCaptureEnabled();
-    captureCommand_=captureShadowPasses_=0;captureGpuBytes_=0;
+    captureCommand_=captureShadowPasses_=captureReflectionPasses_=0;captureGpuBytes_=0;
+    otherWorldPhase_=otherWorldGrainDraw_=otherWorldCopyDraw_=0;
+    otherWorldSurface_=otherWorldMask_=0;
     if(captureFrame_)Native::traceWorldFrame(inspection_,true,presentCount_,scale_);
 }
 void WorldRendererD3D11::endFrame() {
     if(captureFrame_)Native::traceWorldFrame(inspection_,false,presentCount_,scale_,captureCommand_,smokeDrawOrdinal_);
     captureFrame_=inspectFrame_=false;
+    otherWorldPhase_=0;otherWorldSurface_=otherWorldMask_=0;
+}
+void WorldRendererD3D11::captureTextureReadback(ID3D11Texture2D* texture,unsigned command,unsigned ordinal,unsigned pass,
+        std::string_view stage,std::string_view role,uint64_t key,unsigned slot) noexcept {
+    // Captures address the completed single-sample representation, even when
+    // the active OM attachment stores multisample geometry coverage.
+    if(texture)for(auto& [surfaceKey,surface]:surfaces_)if(surface.multisample.Get()==texture || surface.texture.Get()==texture) {
+        try {synchronizeSurface(surface,true);texture=surface.texture.Get();}
+        catch(...) {texture=nullptr;}
+        break;
+    }
+    D3D11_TEXTURE2D_DESC desc{};if(texture)texture->GetDesc(&desc);
+    unsigned pixelBytes=0;std::string_view encoding="raw";
+    switch(desc.Format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:pixelBytes=4;encoding="RGBA8_UNORM";break;
+        case DXGI_FORMAT_R16G16B16A16_UNORM:pixelBytes=8;encoding="RGBA16_UNORM-LE";break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:pixelBytes=8;encoding="RGBA16_FLOAT-LE";break;
+        case DXGI_FORMAT_R32_FLOAT:pixelBytes=4;encoding="R32_FLOAT-LE";break;
+        default:break;
+    }
+    auto omitted=[&](std::string_view reason,unsigned sub=0,unsigned width=0,unsigned height=0,unsigned row=0) {
+        Native::traceWorldGpu(inspection_,command,ordinal,pass,stage,role,key,slot,width,height,
+            unsigned(desc.Format),sub,row,encoding,nullptr,0,reason);
+    };
+    if(!texture){omitted("missing-resource");return;}
+    if(!pixelBytes || desc.SampleDesc.Count!=1){omitted("unsupported-layout");return;}
+    // Keep the original source representation. In particular, sampled UNORM16
+    // plus fetch exponent is different from the FP16 render target before it
+    // was resolved. Never apply screenshot gamma, exposure or RGB-only packing.
+    for(unsigned slice=0;slice<desc.ArraySize;++slice)for(unsigned mip=0;mip<desc.MipLevels;++mip) {
+        const unsigned sub=D3D11CalcSubresource(mip,slice,desc.MipLevels);
+        const unsigned width=(std::max)(1u,desc.Width>>mip),height=(std::max)(1u,desc.Height>>mip);
+        const unsigned row=width*pixelBytes;const size_t size=size_t(row)*height;
+        constexpr size_t limit=128*1024*1024;
+        if(size>limit-captureGpuBytes_){omitted("gpu-byte-budget",sub,width,height,row);continue;}
+        try {
+            D3D11_TEXTURE2D_DESC stagingDesc{};stagingDesc.Width=width;stagingDesc.Height=height;
+            stagingDesc.MipLevels=stagingDesc.ArraySize=stagingDesc.SampleDesc.Count=1;
+            stagingDesc.Format=desc.Format;stagingDesc.Usage=D3D11_USAGE_STAGING;
+            stagingDesc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+            Ptr<ID3D11Texture2D> staging;
+            if(FAILED(device_->CreateTexture2D(&stagingDesc,nullptr,&staging))) {
+                omitted("staging-create-failed",sub,width,height,row);continue;
+            }
+            std::vector<uint8_t> pixels(size);
+            context_->CopySubresourceRegion(staging.Get(),0,0,0,0,texture,sub,nullptr);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if(FAILED(stallProfileMap(context_.Get(),staging.Get(),0,D3D11_MAP_READ,0,&mapped,
+                                      "world capture texture Map"))) {
+                omitted("map-failed",sub,width,height,row);continue;
+            }
+            for(unsigned y=0;y<height;++y)
+                std::memcpy(pixels.data()+size_t(row)*y,
+                    static_cast<const uint8_t*>(mapped.pData)+size_t(mapped.RowPitch)*y,row);
+            context_->Unmap(staging.Get(),0);captureGpuBytes_+=size;
+            Native::traceWorldGpu(inspection_,command,ordinal,pass,stage,role,key,slot,width,height,
+                unsigned(desc.Format),sub,row,encoding,pixels.data(),pixels.size());
+        } catch(...) {omitted("readback-exception",sub,width,height,row);}
+    }
+}
+void WorldRendererD3D11::captureReflectionDraw(const Native::WorldDraw& draw,unsigned command,unsigned ordinal,unsigned pass,
+    bool after) noexcept {
+    if(!captureFrame_ || !reflectionProbe_ || pass>=4)return;
+    const std::string_view stage=after?"water-after":"water-before";
+    std::fprintf(stderr,"[ReflectionProbe] inspection=%u present=%llu command=%u draw=%u pass=%u stage=%.*s program=%s flags=%u viewport=%u,%u,%u,%u surface=%016llX\n",
+        inspection_,static_cast<unsigned long long>(presentCount_),command,ordinal,pass,int(stage.size()),stage.data(),
+        draw.fragmentName.c_str(),draw.fragmentFlags,draw.viewport[0],draw.viewport[1],draw.viewport[2],draw.viewport[3],
+        static_cast<unsigned long long>(draw.surfaceKey(0)));
+    if(!after)for(unsigned slot:{0u,4u}) {
+        ID3D11ShaderResourceView* rawView=nullptr;context_->PSGetShaderResources(slot,1,&rawView);
+        Ptr<ID3D11ShaderResourceView> view;view.Attach(rawView);
+        Ptr<ID3D11Texture2D> texture;
+        if(view) {
+            Ptr<ID3D11Resource> resource;view->GetResource(&resource);resource.As(&texture);
+            D3D11_SHADER_RESOURCE_VIEW_DESC desc{};view->GetDesc(&desc);
+            const auto& requested=draw.textureObjects[slot];
+            std::fprintf(stderr,"[ReflectionProbeView] inspection=%u command=%u slot=%u key=%016llX guestFormat=%u exponent=%d srvFormat=%u dimension=%u firstMip=%u mipLevels=%u\n",
+                inspection_,command,slot,static_cast<unsigned long long>(requested.key()),requested.format,
+                requested.exponent,unsigned(desc.Format),unsigned(desc.ViewDimension),
+                desc.ViewDimension==D3D11_SRV_DIMENSION_TEXTURE2D?desc.Texture2D.MostDetailedMip:0,
+                desc.ViewDimension==D3D11_SRV_DIMENSION_TEXTURE2D?desc.Texture2D.MipLevels:0);
+        }
+        captureTextureReadback(texture.Get(),command,ordinal,pass,stage,
+            slot==0?"reflection-sampled-texture":"refraction-sampled-texture",draw.textureObjects[slot].key(),slot);
+    }
+    ID3D11RenderTargetView* rawTarget=nullptr;context_->OMGetRenderTargets(1,&rawTarget,nullptr);
+    Ptr<ID3D11RenderTargetView> view;view.Attach(rawTarget);
+    Ptr<ID3D11Texture2D> target;
+    if(view){Ptr<ID3D11Resource> resource;view->GetResource(&resource);resource.As(&target);}
+    captureTextureReadback(target.Get(),command,ordinal,pass,stage,"water-target",draw.surfaceKey(0),0);
+}
+void WorldRendererD3D11::captureOtherWorldDraw(const Native::WorldDraw& draw,unsigned command,unsigned ordinal,unsigned pass,
+    bool after,bool bypassed) noexcept {
+    if(!captureFrame_ || !otherWorldProbe_ || pass<1 || pass>4)return;
+    constexpr std::string_view stages[4][2]{{"ow1-before","ow1-after"},{"mask-copy-before","mask-copy-after"},
+        {"ow2-before","ow2-after"},{"final5-before","final5-after"}};
+    const auto stage=stages[pass-1][after?1:0];
+    std::fprintf(stderr,"[OtherWorldProbe] inspection=%u present=%llu command=%u draw=%u stage=%.*s bypass=%u flags=%u viewport=%u,%u,%u,%u surface=%016llX timeLevelsW=%g exposure=%g,%g,%g,%g\n",
+        inspection_,static_cast<unsigned long long>(presentCount_),command,ordinal,int(stage.size()),stage.data(),
+        unsigned(bypassed),draw.fragmentFlags,draw.viewport[0],draw.viewport[1],draw.viewport[2],draw.viewport[3],
+        static_cast<unsigned long long>(draw.surfaceKey(0)),double(draw.fragmentConstants[1][3]),
+        double(draw.fragmentConstants[0][0]),double(draw.fragmentConstants[0][1]),
+        double(draw.fragmentConstants[0][2]),double(draw.fragmentConstants[0][3]));
+    if(!after) {
+        const unsigned slots=pass==2?1:pass==3?2:3;
+        for(unsigned slot=0;slot<slots;++slot) {
+            Ptr<ID3D11Texture2D> texture;
+            if(bypassed) {
+                // An early diagnostic skip never binds its requested resources.
+                // Read retained GPU inputs by owned key, not the previous draw's
+                // context slots. CPU noise is already in the owned draw capture.
+                const auto found=resolved_.find(draw.textureObjects[slot].key());
+                if(found!=resolved_.end())texture=found->second.texture;
+            } else {
+                ID3D11ShaderResourceView* rawView=nullptr;
+                context_->PSGetShaderResources(slot,1,&rawView);
+                Ptr<ID3D11ShaderResourceView> view;view.Attach(rawView);
+                if(view) {
+                    Ptr<ID3D11Resource> resource;view->GetResource(&resource);resource.As(&texture);
+                    D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};view->GetDesc(&viewDesc);
+                    const auto& requested=draw.textureObjects[slot];
+                    std::fprintf(stderr,"[OtherWorldProbeView] inspection=%u command=%u slot=%u key=%016llX guestFormat=%u exponent=%d srvFormat=%u dimension=%u firstMip=%u mipLevels=%u\n",
+                        inspection_,command,slot,static_cast<unsigned long long>(requested.key()),requested.format,
+                        requested.exponent,unsigned(viewDesc.Format),unsigned(viewDesc.ViewDimension),
+                        viewDesc.ViewDimension==D3D11_SRV_DIMENSION_TEXTURE2D?viewDesc.Texture2D.MostDetailedMip:0,
+                        viewDesc.ViewDimension==D3D11_SRV_DIMENSION_TEXTURE2D?viewDesc.Texture2D.MipLevels:0);
+                }
+                ID3D11SamplerState* rawSampler=nullptr;context_->PSGetSamplers(slot,1,&rawSampler);
+                Ptr<ID3D11SamplerState> sampled;sampled.Attach(rawSampler);
+                if(sampled) {
+                    D3D11_SAMPLER_DESC samplerDesc{};sampled->GetDesc(&samplerDesc);
+                    std::fprintf(stderr,"[OtherWorldProbeSampler] inspection=%u command=%u slot=%u filter=%u address=%u,%u,%u anisotropy=%u lod=%g,%g bias=%g border=%g,%g,%g,%g\n",
+                        inspection_,command,slot,unsigned(samplerDesc.Filter),unsigned(samplerDesc.AddressU),
+                        unsigned(samplerDesc.AddressV),unsigned(samplerDesc.AddressW),samplerDesc.MaxAnisotropy,
+                        double(samplerDesc.MinLOD),double(samplerDesc.MaxLOD),double(samplerDesc.MipLODBias),
+                        double(samplerDesc.BorderColor[0]),double(samplerDesc.BorderColor[1]),
+                        double(samplerDesc.BorderColor[2]),double(samplerDesc.BorderColor[3]));
+                }
+            }
+            captureTextureReadback(texture.Get(),command,ordinal,pass,stage,
+                bypassed?"ow-requested-texture":"ow-sampled-texture",draw.textureObjects[slot].key(),slot);
+        }
+        // Record the actual uploaded fragment bank and fetch scales as well as
+        // the owned draw metadata. This exposes stale bindings without changing
+        // any constant, sampler, render target or exposure query.
+        if(!bypassed)for(unsigned slot=0;slot<2;++slot) {
+            const auto role=slot?"ow-sample-scales-b1":"ow-constants-b0";
+            ID3D11Buffer* rawBuffer=nullptr;context_->PSGetConstantBuffers(slot,1,&rawBuffer);
+            Ptr<ID3D11Buffer> source;source.Attach(rawBuffer);
+            if(!source) {
+                Native::traceWorldGpu(inspection_,command,ordinal,pass,stage,role,0,slot,0,0,0,0,0,
+                    "float4-LE",nullptr,0,"missing-buffer");continue;
+            }
+            D3D11_BUFFER_DESC desc{};source->GetDesc(&desc);
+            constexpr size_t limit=128*1024*1024;
+            auto omitted=[&](std::string_view reason) {
+                Native::traceWorldGpu(inspection_,command,ordinal,pass,stage,role,0,slot,desc.ByteWidth/16,1,0,0,
+                    desc.ByteWidth,"float4-LE",nullptr,0,reason);
+            };
+            if(desc.ByteWidth>limit-captureGpuBytes_){omitted("gpu-byte-budget");continue;}
+            try {
+                std::vector<uint8_t> bytes(desc.ByteWidth);
+                desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=desc.MiscFlags=desc.StructureByteStride=0;
+                desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;Ptr<ID3D11Buffer> staging;
+                if(FAILED(device_->CreateBuffer(&desc,nullptr,&staging))){omitted("staging-create-failed");continue;}
+                context_->CopyResource(staging.Get(),source.Get());D3D11_MAPPED_SUBRESOURCE mapped{};
+                if(FAILED(stallProfileMap(context_.Get(),staging.Get(),0,D3D11_MAP_READ,0,&mapped,
+                                         "world capture draw Map"))){omitted("map-failed");continue;}
+                std::memcpy(bytes.data(),mapped.pData,bytes.size());context_->Unmap(staging.Get(),0);
+                captureGpuBytes_+=bytes.size();
+                Native::traceWorldGpu(inspection_,command,ordinal,pass,stage,role,0,slot,desc.ByteWidth/16,1,0,0,
+                    desc.ByteWidth,"float4-LE",bytes.data(),bytes.size());
+            } catch(...) {omitted("readback-exception");}
+        }
+    }
+    Ptr<ID3D11Texture2D> target;
+    if(bypassed) {
+        const auto found=surfaces_.find(draw.surfaceKey(0));
+        if(found!=surfaces_.end())target=found->second.texture;
+    } else {
+        ID3D11RenderTargetView* rawTarget=nullptr;context_->OMGetRenderTargets(1,&rawTarget,nullptr);
+        Ptr<ID3D11RenderTargetView> view;view.Attach(rawTarget);
+        if(view){Ptr<ID3D11Resource> resource;view->GetResource(&resource);resource.As(&target);}
+    }
+    captureTextureReadback(target.Get(),command,ordinal,pass,stage,
+        bypassed?"ow-requested-target":"ow-target",draw.surfaceKey(0),0);
 }
 void WorldRendererD3D11::captureShadow(const Native::WorldDraw& draw,unsigned command,unsigned ordinal,unsigned pass,bool after,
     const std::array<ID3D11ShaderResourceView*,16>& requested) noexcept {
@@ -763,7 +1333,8 @@ void WorldRendererD3D11::captureShadow(const Native::WorldDraw& draw,unsigned co
                 std::vector<uint8_t> pixels(size);
                 context_->CopySubresourceRegion(staging.Get(),0,0,0,0,texture,sub,nullptr);
                 D3D11_MAPPED_SUBRESOURCE mapped{};
-                if(FAILED(context_->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped))) {omitted("map-failed",sub,width,height,row);continue;}
+                if(FAILED(stallProfileMap(context_.Get(),staging.Get(),0,D3D11_MAP_READ,0,&mapped,
+                                         "world capture shadow Map"))) {omitted("map-failed",sub,width,height,row);continue;}
                 for(unsigned y=0;y<height;++y) {
                     const auto* source=static_cast<const uint8_t*>(mapped.pData)+size_t(mapped.RowPitch)*y;
                     auto* target=pixels.data()+size_t(row)*y;
@@ -789,14 +1360,19 @@ void WorldRendererD3D11::captureShadow(const Native::WorldDraw& draw,unsigned co
         }
     }
     auto color=surfaces_.find(draw.surfaceKey(0));
-    if(draw.targets[0])snapshot(color==surfaces_.end()?nullptr:color->second.texture.Get(),draw.surfaceKey(0),0,"target-alpha",true);
+    ID3D11Texture2D* colorTexture=color==surfaces_.end()?nullptr:color->second.texture.Get();
+    if(colorTexture)try {synchronizeSurface(color->second);} catch(...) {colorTexture=nullptr;}
+    if(draw.targets[0])snapshot(colorTexture,draw.surfaceKey(0),0,"target-alpha",true);
     auto depth=surfaces_.find(draw.surfaceKey(4));
-    if(draw.targets[4])snapshot(depth==surfaces_.end()?nullptr:depth->second.texture.Get(),draw.surfaceKey(4),4,"depth-stencil",false);
+    ID3D11Texture2D* depthTexture=depth==surfaces_.end()?nullptr:depth->second.texture.Get();
+    if(depthTexture)try {synchronizeSurface(depth->second,true);} catch(...) {depthTexture=nullptr;}
+    if(draw.targets[4])snapshot(depthTexture,draw.surfaceKey(4),4,"depth-stencil",false);
 }
 void WorldRendererD3D11::noteWorstUpload(double ms, size_t bytes, const char* kind) {
     if (ms > worstUploadMs_) { worstUploadMs_ = ms; worstUploadBytes_ = bytes; worstUploadKind_ = kind; }
 }
 bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
+    Native::StallProfiler::Scope stallRender(Native::StallProfiler::Section::Rendering, "WorldRendererD3D11::draw");
     Native::setRenderSamplePhase(Native::RenderSamplePhase::textures);
     const unsigned command=captureFrame_?captureCommand_++:0;
     unsigned captureFlags=draw.fragmentFlags,captureTextureMask=0,captureResolvedMask=0;
@@ -821,6 +1397,44 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         smokeOrdinal=smokeDrawOrdinal_++;
         if(inspection_<=2)
             Native::traceOwnedWorldDraw(draw,inspection_,smokeOrdinal);
+    }
+    unsigned otherWorldPass=0;
+    if(captureFrame_ && otherWorldProbe_) {
+        if(draw.fragmentName=="WClientMod_OW1_1" && !otherWorldPhase_) {
+            otherWorldPass=1;otherWorldPhase_=1;
+            otherWorldSurface_=draw.surfaceKey(0);otherWorldGrainDraw_=smokeOrdinal;
+        } else if(otherWorldPhase_==2 && draw.material==Native::WorldMaterial::fixed &&
+                  draw.fragmentName=="MRenderXenon_Attrib_TexEnvMode01" &&
+                  draw.textureObjects[0].key()==otherWorldMask_) {
+            // Track only the copy consuming this inspection's grain resolve,
+            // not every fixed-function textured draw in the game.
+            otherWorldPass=2;otherWorldPhase_=3;otherWorldCopyDraw_=smokeOrdinal;
+        } else if(draw.fragmentName=="WClientMod_OW1_2" && otherWorldPhase_ && otherWorldPhase_<5) {
+            otherWorldPass=3;otherWorldPhase_=5;
+        } else if(draw.fragmentName=="XREngine_Final5" && otherWorldPhase_ && otherWorldPhase_<6) {
+            otherWorldPass=4;otherWorldPhase_=6;
+        }
+    }
+    if(otherWorldBypass_ && (draw.fragmentName=="WClientMod_OW1_1" || draw.fragmentName=="WClientMod_OW1_2")) {
+        // Diagnostic reproduction of the previous release's missing two passes.
+        // Leave the original resolves and half-size fixed copy in place. That
+        // copy can still alter the upper-left quarter; this is not a clean
+        // pass-through or a proposed brightness correction. No retained resource,
+        // render binding, shader, constant, draw, or guest exposure value changes.
+        if(otherWorldPass)captureOtherWorldDraw(draw,command,smokeOrdinal,otherWorldPass,false,true);
+        if(captureFrame_) {
+            // Reason13 is an intentional diagnostic skip, distinct from a
+            // rendered success (0) and ordinary rejected draws (1..12).
+            Native::traceWorldDrawResult(inspection_,command,smokeOrdinal,13,draw.fragmentFlags,draw.textureMask,0);
+            Native::traceWorldGpu(inspection_,command,smokeOrdinal,otherWorldPass,"bypass","ow-bypass",
+                draw.surfaceKey(0),0,0,0,0,0,0,"",nullptr,0,"diagnostic-bypass");
+        }
+        if(otherWorldBypassLogs_<8) {
+            ++otherWorldBypassLogs_;
+            std::fprintf(stderr,"[OtherWorldProbeBypass] present=%llu command=%u draw=%u program=%s reason=13\n",
+                static_cast<unsigned long long>(presentCount_),command,smokeOrdinal,draw.fragmentName.c_str());
+        }
+        return true;
     }
     auto timing=[&](double& sum){
         if(!profile)return;
@@ -941,15 +1555,58 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         lastFragment_ = frag; lastFragmentFound_ = fragFound; lastFragmentValid_ = true;
     }
     if(draw.material!=Native::WorldMaterial::depth && !fragFound) return rejected(1);
+    const bool shadowProjector=std::strcmp(effectiveName,"XREngine_ShadowProj")==0 && fragmentFlags==8;
+    if(shadowProjector) {
+        // Fractional PCF coordinates require a valid logical texel pitch.
+        for(unsigned axis=0;axis<2;++axis)
+            if(!std::isfinite(draw.fragmentConstants[9][axis]) || draw.fragmentConstants[9][axis]<=0)
+                return rejected(11);
+    }
     if(fragFound)captureTextureMask=frag->textures;
     std::array<ID3D11ShaderResourceView*,16> views{};std::array<ID3D11SamplerState*,16> samplers{};
+    uint16_t promptSlots = 0;
     // Selecting a later slot can evict an earlier slot from either cache.
     // Retain each selection until the context has acquired its own reference.
     std::array<Ptr<ID3D11ShaderResourceView>,16> retainedViews;
     std::array<Ptr<ID3D11SamplerState>,16> retainedSamplers;
     std::array<Native::EngineVector,16> scales{};for(auto& scale:scales)scale.fill(1);
+    struct ColorLookup {float inverseLookupScale;uint32_t logicalLookupMask;uint32_t padding[2];};
+    ColorLookup colorLookup{1.0f/float(scale_),0,{0,0}};
+    static_assert(sizeof(colorLookup)==sizeof(uploadedColorLookup_));
+    const std::string_view fragmentName=effectiveName;
+    const bool bloomFilter=fragmentName=="XRUtil_ShrinkTexture8" || fragmentName=="XREngine_GaussClamped";
+    struct BloomControl {float renderScale;uint32_t snap;uint32_t padding[2];};
+    BloomControl bloomControl{float(scale_),0,{0,0}};
+    static_assert(sizeof(bloomControl)==sizeof(uploadedBloom_));
+    struct ShadowControl {uint32_t scale;uint32_t padding[3];};
+    ShadowControl shadowControl{1,{0,0,0}};
+    static_assert(sizeof(shadowControl)==sizeof(uploadedShadow_));
+    // Some geometric programs share the engine's "post" submission bucket.
+    // Restrict enhanced filtering to known surface programs, not that bucket:
+    // final composition, color LUTs, video, GUI and blur keep their own filters.
+    const bool surfaceFiltering=fragmentName.starts_with("XRShader_FP20_") || fragmentName.starts_with("XRShader_Decal") ||
+        fragmentName.starts_with("VBOp_FP20_") || fragmentName=="XRUtil_RenderSurface" ||
+        fragmentName=="TexEnvProj1";
+    const unsigned anisotropy=Native::graphicsSettings().anisotropyLevels;
+    const bool spatialColorCubeCopy=fragmentName=="XREngine_CCFuser" &&
+        (fragmentFlags==0 || fragmentFlags==1 || fragmentFlags==2);
+    const unsigned colorLookupSlots=scale_==1?0u:
+        fragmentName=="XREngine_CCFuser" && fragmentFlags==2?1u<<1:
+        fragmentName=="XREngine_Final5" && (fragmentFlags&4)?1u<<2:0u;
+    const auto unboundTexture=[&](unsigned slot) {
+        const auto& texture=draw.textureObjects[slot];
+        return !draw.textureIds[slot] && !texture.object && !texture.storage && !draw.textures[slot];
+    };
+    const bool radialBlur=draw.fragmentName=="XREngine_RadialBlurInvert";
+    const bool unmaskedRadialBlur=radialBlur && unboundTexture(1) && unboundTexture(2) && unboundTexture(3);
     if(fragFound) for(unsigned slot=0;slot<16;++slot)if(frag->textures&(1u<<slot)) {
         const auto& texture=draw.textureObjects[slot];const auto resolved=resolved_.find(texture.key());
+        // Retail RenderDeathScene0 (8235F390 -> 822968A8) explicitly binds
+        // texture zero in the three RadialBlurInvert mask slots. Keep those
+        // SRVs null: their zero samples select the shader's unmasked result.
+        // A named/resource-backed texture without pixels is still a failure.
+        if(radialBlur && slot>=1 && slot<=3 && unboundTexture(slot))
+            continue;
         const bool cube=(frag->cubes&(1u<<slot))!=0;
         unsigned firstMip=0;
         if(texture.object && resolved!=resolved_.end()) {
@@ -960,15 +1617,43 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
             // Owned prompt origin selects a cached icon without mutating the
             // draw snapshot. Controller source, unknown origins, cubemaps and
             // resolved render-targets keep the original image. Replacement
-            // icons are single-level, so the sampler is reset to a base-only
-            // default instead of reusing an original partial-mip LOD range.
+            // icons have their own complete mip chain, so the sampler uses
+            // that chain rather than the original texture's resident LODs.
             std::shared_ptr<const ColorImage> effective = draw.textures[slot];
             bool promptSubstituted = false;
-            if (promptKeyboardMouse_ && effective && effective->faces == 1 && !cube && effective->promptOrigin) {
+            bool subtitleSubstituted = false;
+            ID3D11SamplerState* subtitleSampler = nullptr;
+            if(draw.subtitle && slot==0 && effective && !cube &&
+               draw.material==Native::WorldMaterial::fixed && fragmentName=="MRenderXenon_Attrib_TexEnvMode01") {
+                const auto height=subtitleRenderHeight_?subtitleRenderHeight_:draw.viewport[3]*scale_;
+                const auto factor=Native::subtitleFontRasterScale(height,Native::graphicsSettings().subtitleScalePercent);
+                const bool failed=std::any_of(failedSubtitles_.begin(),failedSubtitles_.end(),
+                    [&](const auto& entry){return entry.factor==factor && entry.source.lock()==effective;});
+                if(!failed)if(auto replacement=Native::subtitleFontReplacementFor(draw.textureIds[slot],effective,factor)) {
+                    try {
+                        Native::WorldSampler fontSampler;
+                        fontSampler.valid=true;fontSampler.minLinear=fontSampler.magLinear=true;
+                        fontSampler.address.fill(2);fontSampler.anisotropy=1;
+                        fontSampler.minLevel=fontSampler.maxLevel=0;fontSampler.baseOnly=true;
+                        subtitleSampler=sampler(fontSampler);
+                        if(auto* view=image(replacement)) {
+                            views[slot]=view;effective=std::move(replacement);subtitleSubstituted=true;
+                        }
+                    } catch(const std::exception&) {} // Optional font resources may retain the original bitmap.
+                    if(!subtitleSubstituted) {
+                        failedSubtitles_[failedSubtitleNext_++%failedSubtitles_.size()]={effective,factor};
+                        std::fprintf(stderr,"[SubtitleFont] GPU atlas unavailable id=%u factor=%u; retaining original\n",
+                            draw.textureIds[slot],factor);
+                    }
+                }
+            }
+            if (!subtitleSubstituted && promptKeyboardMouse_ && effective && effective->faces == 1 && !cube && effective->promptOrigin) {
                 if (auto icon = Prompts::replacementFor(draw.textureIds[slot], effective,
-                        Prompts::Source::KeyboardMouse, Prompts::Context::Menu)) {
+                        Prompts::Source::KeyboardMouse, draw.promptContext == Native::PromptRenderContext::Gameplay ?
+                            Prompts::Context::Gameplay : Prompts::Context::Menu)) {
                     effective = std::move(icon);
                     promptSubstituted = true;
+                    promptSlots |= uint16_t(1u << slot);
                     static std::atomic<unsigned> promptLogs{0};
                     if (promptLogs++ < 8)
                         std::fprintf(stderr, "[PromptSubstitute] program=%s slot=%u id=%u origin=%u\n",
@@ -976,16 +1661,18 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
                             unsigned(draw.textures[slot]->promptOrigin));
                 }
             }
-            if(!effective || effective->faces!=(cube?6u:1u) || !(views[slot]=image(effective))) {
+            if(!effective || effective->faces!=(cube?6u:1u) || (!views[slot] && !(views[slot]=image(effective)))) {
                 static std::set<uint32_t> missing;
                 if(missing.size()<64 && missing.insert(draw.textureIds[slot]).second) std::fprintf(stderr,"[EngineWorldMissingTexture] program=%s slot=%u id=%u object=%08X storage=%08X format=%u size=%ux%u faces=%u\n",
                     lastFragmentKey_.c_str(),slot,draw.textureIds[slot],texture.object,texture.storage,texture.format,texture.width,texture.height,texture.faces);
                 return rejected(3);
             }
-            if (promptSubstituted) {
+            if (promptSubstituted || subtitleSubstituted) {
                 firstMip = 0;
-                samplers[slot] = (cube || draw.material==Native::WorldMaterial::post ||
-                    draw.material==Native::WorldMaterial::fixed) ? cubeSampler_.Get() : wrapSampler_.Get();
+                if(subtitleSubstituted) {
+                    samplers[slot]=subtitleSampler;
+                } else samplers[slot]=(cube || draw.material==Native::WorldMaterial::post ||
+                    draw.material==Native::WorldMaterial::fixed)?cubeSampler_.Get():wrapSampler_.Get();
                 scales[slot].fill(std::exp2(float(texture.exponent)));
                 retainedViews[slot]=views[slot];retainedSamplers[slot]=samplers[slot];
                 continue;
@@ -993,17 +1680,64 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         }
         if(!(texture.object && resolved!=resolved_.end()))firstMip=draw.textures[slot]->firstMip;
         auto captured=draw.samplers[slot];
-        if(scale_>1 && draw.fragmentName=="XREngine_CCFuser" && slot==1 &&
+        // These original filters cover logical texels, whereas a physical
+        // bilinear fetch covers just two high-resolution pixels. In particular
+        // ShrinkTexture8 otherwise leaves gaps between its sixteen taps.
+        // Only recognized bloom consumers of linear-clamped resolved color
+        // data use this view. Scene, LUT, CPU, point and damage paths retain
+        // their captured sampling and high-resolution detail.
+        const bool bloomInput=(bloomFilter && slot==0) ||
+            (fragmentName=="XREngine_Final5" && (fragmentFlags&8) && slot==1);
+        if(scale_>1 && bloomInput && texture.object && resolved!=resolved_.end() &&
+           !cube && texture.faces==1 && texture.mipLevels==1 && texture.firstMip==0 &&
+           captured.valid && captured.minLinear && captured.magLinear && captured.anisotropy==1 &&
+           captured.address[0]==2 && captured.address[1]==2 && captured.bias==0 &&
+           captured.minLevel==0 && (captured.maxLevel==0 || captured.baseOnly) &&
+           (texture.format==6 || texture.format==26 || texture.format==54)) {
+            views[slot]=logicalBloomView(resolved->second);
+            if(bloomFilter)bloomControl.snap=1;
+        }
+        if(scale_>1 && spatialColorCubeCopy && slot==(fragmentFlags==2?0u:1u) &&
            draw.textures[slot] && draw.textures[slot]->width==324 && draw.textures[slot]->height==18) {
             // This pass copies original 324x18 color-cube texels into a scaled
             // render target. Linear wrapping blends the opposite LUT edges
             // into its first physical pixels, tinting dark scenes at 2x/3x.
+            // Append copies its source cube in slot0; its fractional RGB
+            // lookup in slot1 keeps the original interpolation.
             captured.minLinear=captured.magLinear=captured.mipLinear=false;
             captured.anisotropy=1;captured.baseOnly=true;
+        }
+        if((colorLookupSlots&(1u<<slot)) && texture.object && resolved!=resolved_.end() &&
+           texture.width==324 && texture.height==18 && texture.faces==1 && texture.mipLevels==1 && texture.firstMip==0 &&
+           captured.valid && captured.minLinear && captured.magLinear && captured.anisotropy==1 &&
+           captured.bias==0 && captured.minLevel==0 && (captured.maxLevel==0 || captured.baseOnly)) {
+            // These original shaders use a fixed 18^3 color table, flattened
+            // into 324x18 texels. The supported CCFuser copy/lerp/append/gamma
+            // chain retains each logical texel in a constant scale-by-scale
+            // block. A lookup must interpolate neighboring logical colors,
+            // rather than acquire the flat intervals of physical block
+            // filtering. Name and dimensions identify that data convention;
+            // unknown consumers, CPU images and other sampler/LOD paths keep
+            // their original coordinates. Verify the resource actually bound,
+            // even when an owned CPU image is also present in the snapshot.
+            D3D11_TEXTURE2D_DESC desc{};resolved->second.texture->GetDesc(&desc);
+            if(desc.Width==324*scale_ && desc.Height==18*scale_ && desc.ArraySize==1 && desc.MipLevels==1)
+                colorLookup.logicalLookupMask|=1u<<slot;
         }
         if(captured.valid) {
             if(captured.maxLevel<firstMip)return rejected(3);
             captured.minLevel=(std::max)(captured.minLevel,uint8_t(firstMip));
+            // A completed resolve may be a depth/comparison texture or screen
+            // data. Only owned 2D surface images with verified linear filters
+            // are eligible. Preserve point sampling and explicit base-only
+            // fetches as well as addressing, signed bias and resident LODs.
+            // Original keeps the captured preference. Explicit 2x/4x/8x/16x
+            // selections override it: the game's ordinary world maps already
+            // request 16x, so taking the maximum makes every selection 16x.
+            if(anisotropy>1 && surfaceFiltering && !cube &&
+               !(texture.object && resolved!=resolved_.end()) && draw.textures[slot] &&
+               captured.minLinear && captured.magLinear && !captured.baseOnly)
+                captured.anisotropy=uint8_t(anisotropy);
             samplers[slot]=sampler(captured);
         }
         else if(firstMip || captured.lodValid) {
@@ -1023,6 +1757,27 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
             samplers[slot]=sampler(fallback);
         } else samplers[slot]=(cube || draw.material==Native::WorldMaterial::post ||
             draw.material==Native::WorldMaterial::fixed)?cubeSampler_.Get():wrapSampler_.Get();
+        if(shadowProjector && slot==0) {
+            // Only a completed native atlas contains additional caster pixels.
+            // CPU textures retain the guest pitch even if their dimensions
+            // differ. Check the resource bound, not an optional CPU snapshot.
+            if(scale_>1 && texture.object && resolved!=resolved_.end()) {
+                D3D11_TEXTURE2D_DESC atlas{};resolved->second.texture->GetDesc(&atlas);
+                if(atlas.Width==texture.width*scale_ && atlas.Height==texture.height*scale_ &&
+                   atlas.ArraySize==1 && atlas.MipLevels==1)
+                    shadowControl.scale=scale_;
+            }
+            // Xenon's tfetch2D reads point depths; getWeights2D interpolates
+            // their comparison results. Filtering depths before comparing
+            // creates hard edges and false occluders. Preserve the effective
+            // sampler's addressing, border and LOD, including fallback state.
+            D3D11_SAMPLER_DESC desc{};samplers[slot]->GetDesc(&desc);
+            desc.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;desc.MaxAnisotropy=1;
+            if(samplerStates_.size()>512)samplerStates_.clear();
+            auto& state=samplerStates_.entry(desc);
+            if(!state)check(device_->CreateSamplerState(&desc,&state),"shadow point sampler");
+            samplers[slot]=state.Get();
+        }
         // Fetch scaling belongs to the binding, including CPU-owned images.
         scales[slot].fill(std::exp2(float(texture.exponent)));
         retainedViews[slot]=views[slot];retainedSamplers[slot]=samplers[slot];
@@ -1052,7 +1807,12 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         // Original82871600 links an absent tangent semantic to constant zero
         // XYZ (cache record13), rather than a different UV stream. Tangents
         // consume XYZ only; decodeWorldVertices already owns that default.
-        if(textureInput && !formats[options.coordinates[s]+1])return rejected(7);
+        // The original unmasked RadialBlurInvert quad has only UV0. UV1
+        // feeds its three null masks exclusively, so this absent semantic
+        // cannot affect the result; decodeWorldVertices supplies finite zeros.
+        const bool deadMaskCoordinate=unmaskedRadialBlur && s==1 &&
+            options.modes[s]==0 && options.coordinates[s]==1;
+        if(textureInput && !formats[options.coordinates[s]+1] && !deadMaskCoordinate)return rejected(7);
     }
     auto it=geometry_.find(g.vertices.get());
     if (it==geometry_.end()) {
@@ -1062,22 +1822,19 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         const size_t estimate=size_t(g.vertices->vertexCount)*sizeof(Native::WorldVertex);
         if (storedUpload && !budgetFor(estimate)) return rejected(12);
         Geometry native;native.source=g.vertices;
+        std::vector<Native::WorldVertex> vertices;
         const auto decodeStart=Clock::now();
-        if (!Native::decodeWorldVertices(*g.vertices,native.vertices)) return rejected(8);
-        for(unsigned w=0;w<8;++w) {
-            auto value=[&](const auto& v){return w<4?v.indices[w]:v.indices2[w-4];};
-            auto& bounds=native.indexBounds[w];bounds.fill(value(native.vertices.front()));
-            for(const auto& v:native.vertices) {bounds[0]=(std::min)(bounds[0],value(v));bounds[1]=(std::max)(bounds[1],value(v));}
-        }
-        const size_t decodedBytes=native.vertices.size()*sizeof(Native::WorldVertex);
+        if (!Native::decodeWorldVertices(*g.vertices,vertices)) return rejected(8);
+        native.metadata=worldVertexMetadata(vertices,formats);
+        const size_t decodedBytes=vertices.size()*sizeof(Native::WorldVertex);
         const double decodeMs=millisBetween(decodeStart,Clock::now());
         if (decodeMs > worstDecodeMs_) { worstDecodeMs_=decodeMs; worstDecodeBytes_=decodedBytes; }
         const auto uploadStart=Clock::now();
-        D3D11_BUFFER_DESC b{};b.ByteWidth=UINT(native.vertices.size()*sizeof(Native::WorldVertex));b.BindFlags=D3D11_BIND_VERTEX_BUFFER;b.Usage=D3D11_USAGE_IMMUTABLE;
+        D3D11_BUFFER_DESC b{};b.ByteWidth=UINT(decodedBytes);b.BindFlags=D3D11_BIND_VERTEX_BUFFER;b.Usage=D3D11_USAGE_IMMUTABLE;
         if(!g.vertices->address && !g.vertices->id)
-            native.transientCapacity=transientBuffers_.upload(native.vertices.data(),b.ByteWidth,b.BindFlags,native.buffer);
+            native.transientCapacity=transientBuffers_.upload(vertices.data(),b.ByteWidth,b.BindFlags,native.buffer);
         else {
-            D3D11_SUBRESOURCE_DATA data{native.vertices.data(),0,0};check(device_->CreateBuffer(&b,&data,&native.buffer),"world VB");
+            D3D11_SUBRESOURCE_DATA data{vertices.data(),0,0};check(device_->CreateBuffer(&b,&data,&native.buffer),"world VB");
         }
         const size_t bytes=native.bytes();
         // Evict only the least recently used resource. Clearing the whole
@@ -1094,29 +1851,87 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
     }
     it->second.used=++resourceUse_;
     const auto& indices=g.indices->indices;
+    const auto clipMask=draw.clipPlanes.enabledMask();
+    if(clipMask)for(unsigned plane=0;plane<draw.clipPlanes.planes.size();++plane)
+        if(clipMask&(1u<<plane))for(float coefficient:draw.clipPlanes.planes[plane])
+            if(!std::isfinite(coefficient))return rejected(11);
+    const unsigned userClip=clipMask?(draw.clipPlanes.cullOnly()?2u:1u):0u;
     WorldVertexShaderD3D11* shaderPtr = nullptr;
-    if (lastShaderValid_ && draw.options == lastShaderOptions_) {
+    if (lastShaderValid_ && lastShaderUserClip_==userClip && draw.options == lastShaderOptions_) {
         shaderPtr = lastShader_;
     } else {
-        const auto key=shaderKey(draw.options);auto& shader=cacheEntry(shaders_,std::string_view(key.data(),key.size()));
-        if (!shader) shader=std::make_unique<WorldVertexShaderD3D11>(device_.Get(),draw.options,true);
+        const auto key=shaderKey(draw.options,userClip);auto& shader=cacheEntry(shaders_,std::string_view(key.data(),key.size()));
+        if (!shader) {
+            shader=std::make_unique<WorldVertexShaderD3D11>(device_.Get(),draw.options,true,userClip);
+            vertexShaderCompileCount_+=shader->compiled();
+        }
         shaderPtr = shader.get();
-        lastShaderOptions_ = draw.options; lastShader_ = shaderPtr; lastShaderValid_ = true;
+        lastShaderOptions_ = draw.options; lastShaderUserClip_ = userClip;
+        lastShader_ = shaderPtr; lastShaderValid_ = true;
     }
     timing(profileGeometry_);
     Native::setRenderSamplePhase(Native::RenderSamplePhase::constants);
-    if (!shaderPtr->bind(context_.Get(),draw.constants,it->second.vertices,&it->second.indexBounds,
+    if (!shaderPtr->bind(context_.Get(),draw.constants,{},&it->second.metadata.indexBounds,
                       bindingsValid_ && boundVertex_==shaderPtr)) return rejected(10);
     boundVertex_=shaderPtr;
     timing(profileBinding_);
     Native::setRenderSamplePhase(Native::RenderSamplePhase::states);
-    if(!viewportUploaded_ || std::memcmp(uploadedViewport_.data(),draw.depthRange.data(),sizeof(uploadedViewport_))) {
-        updateConstants(context_.Get(),viewportConstants_.Get(),draw.depthRange.data(),sizeof(uploadedViewport_));
-        uploadedViewport_=draw.depthRange;viewportUploaded_=true;
+    std::array<Native::EngineVector,2> viewportValues{draw.depthRange,Native::EngineVector{1,0,0,0}};
+    // Enlarge only owned, flat UI rectangles. The original constants and
+    // immutable geometry remain shared with any subsequent draw unchanged.
+    if(promptSlots && draw.material==Native::WorldMaterial::fixed && !(flags&6) &&
+       !options.weights && !options.positionConversion && options.modes[0]!=7 &&
+       g.vertices->vertexCount==4 && count==6) {
+        std::vector<Native::WorldVertex> vertices;
+        if(Native::decodeWorldVertices(*g.vertices,vertices) && vertices.size()==4) {
+            std::array<Native::EngineVector,4> clip{};
+            for(size_t vertex=0;vertex<4;++vertex) for(unsigned row=0;row<4;++row)
+                for(unsigned column=0;column<4;++column)
+                    clip[vertex][row] += draw.constants.vectors[row][column] *
+                        (vertices[vertex].position[column]+draw.constants.vectors[7][column]);
+            std::array<float,4> bounds{-1,-1,1,1};
+            if(flags&0x20) {
+                const auto leftTop=word(a+112),rightBottom=word(a+116);
+                const float width=float(draw.viewport[2]),height=float(draw.viewport[3]);
+                if(width>0 && height>0) {
+                    bounds={2*(float(leftTop&65535)-draw.viewport[0])/width-1,
+                        1-2*(float(rightBottom>>16)-draw.viewport[1])/height,
+                        2*(float(rightBottom&65535)-draw.viewport[0])/width-1,
+                        1-2*(float(leftTop>>16)-draw.viewport[1])/height};
+                } else bounds={0,0,0,0};
+            }
+            viewportValues[1]=Prompts::promptQuadTransform(clip,
+                std::span<const uint16_t>(indices).subspan(g.firstIndex,count),bounds);
+        }
+    }
+    if(!viewportUploaded_ || std::memcmp(uploadedViewport_.data(),viewportValues.data(),sizeof(uploadedViewport_))) {
+        updateConstants(context_.Get(),viewportConstants_.Get(),viewportValues.data(),sizeof(uploadedViewport_));
+        uploadedViewport_=viewportValues;viewportUploaded_=true;
     }
     if(!bindingsValid_) {
         ID3D11Buffer* viewportBuffer=viewportConstants_.Get();context_->VSSetConstantBuffers(2,1,&viewportBuffer);
-        pixelBuffersBound_=false;
+        pixelBuffersBound_=false;clipBufferBound_=false;
+    }
+    if(userClip) {
+        ClipConstants clipValues{};clipValues.control[0]=clipMask;
+        // Disabled slots may retain stale nonfinite engine coefficients. They
+        // are neither validated nor uploaded, and emit a constant +1 distance.
+        for(unsigned plane=0;plane<clipValues.planes.size();++plane)
+            if(clipMask&(1u<<plane))clipValues.planes[plane]=draw.clipPlanes.planes[plane];
+        if(!clipConstants_) {
+            D3D11_BUFFER_DESC buffer{};buffer.ByteWidth=sizeof(ClipConstants);
+            buffer.BindFlags=D3D11_BIND_CONSTANT_BUFFER;buffer.Usage=D3D11_USAGE_DYNAMIC;
+            buffer.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
+            check(device_->CreateBuffer(&buffer,nullptr,&clipConstants_),"user clip constants");
+        }
+        if(!clipUploaded_ || std::memcmp(&uploadedClip_,&clipValues,sizeof(clipValues))) {
+            updateConstants(context_.Get(),clipConstants_.Get(),&clipValues,sizeof(clipValues));
+            uploadedClip_=clipValues;clipUploaded_=true;
+        }
+        if(!clipBufferBound_) {
+            ID3D11Buffer* clipBuffer=clipConstants_.Get();context_->VSSetConstantBuffers(3,1,&clipBuffer);
+            clipBufferBound_=true;
+        }
     }
     auto cachedIndex=indices_.find(g.indices.get());
     Native::setRenderSamplePhase(Native::RenderSamplePhase::indices);
@@ -1146,9 +1961,9 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
     cachedIndex->second.used=++resourceUse_;
     // Most complete immutable index buffers fit this vertex stream. Keep the
     // subset fallback for shared IBs whose other draws use a larger VB.
-    if(cachedIndex->second.maximum>=it->second.vertices.size())
+    if(cachedIndex->second.maximum>=it->second.metadata.count)
         for(size_t i=g.firstIndex;i<g.firstIndex+count;++i)
-            if(indices[i]>=it->second.vertices.size())return rejected(9);
+            if(indices[i]>=it->second.metadata.count)return rejected(9);
     Native::setRenderSamplePhase(Native::RenderSamplePhase::states);
     auto width=draw.viewport[0]+draw.viewport[2],height=draw.viewport[1]+draw.viewport[3];
     // Allocation history can leave the two attachments at different extents.
@@ -1173,7 +1988,7 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         boundColor_=color;boundDepth_=depth;
     }
     // Original82248680 selects ALWAYS when testing is off while retaining
-    // independent depth writes. D3D11 disables writes as well when
+    // independent depth writes (82248118). D3D11 disables writes as well when
     // DepthEnable is false; DV5 needs those writes to mask its second pass.
     D3D11_DEPTH_STENCIL_DESC ds{};ds.DepthEnable=(flags&6)!=0;ds.DepthWriteMask=(flags&4)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO;
     ds.DepthFunc=(flags&2)?WorldRenderState::depthComparison(a[96]):D3D11_COMPARISON_ALWAYS;
@@ -1208,7 +2023,7 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
     // without0x1000, and face=0 (CCW front) with0x1000. Disabling culling
     // clears both cull and face bits, also defining the stencil front side.
     raster.FrontCounterClockwise=!(flags&0x800) || (flags&0x1000)!=0;
-    raster.DepthClipEnable=TRUE;raster.ScissorEnable=(flags&0x20)!=0;
+    raster.DepthClipEnable=TRUE;raster.ScissorEnable=(flags&0x20)!=0;raster.MultisampleEnable=sampleCount_>1;
     if(!WorldRenderState::depthBias(flags,std::bit_cast<float>(word(a+100)),
         std::bit_cast<float>(word(a+104)),scale_,raster))return rejected(11);
     if(rasterStates_.size()>512)rasterStates_.clear();
@@ -1230,23 +2045,65 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
             updateConstants(context_.Get(),alphaTestConstants_.Get(),&alpha,sizeof(alpha));
             std::memcpy(uploadedAlpha_.data(),&alpha,sizeof(alpha));
         }
-        if(!pixelConstantsUploaded_ || std::memcmp(uploadedFragment_.data(),draw.fragmentConstants.data(),sizeof(draw.fragmentConstants))) {
-            // The engine supplies at most16 fragment vectors. The remaining
+        const auto materialColor=darknessArmBloomColor(draw,bloom_);
+        if(!pixelConstantsUploaded_ || std::memcmp(&uploadedFragment_[0],&materialColor,sizeof(materialColor)) ||
+           std::memcmp(uploadedFragment_.data()+1,draw.fragmentConstants.data()+1,
+               sizeof(draw.fragmentConstants)-sizeof(materialColor))) {
+            // Captured decals can supply more than16 fragment vectors. The remaining
             // bank is permanently zero; don't rebuild/compare it every draw.
             std::copy(draw.fragmentConstants.begin(),draw.fragmentConstants.end(),uploadedFragment_.begin());
+            uploadedFragment_[0]=materialColor;
             updateConstants(context_.Get(),fragmentConstants_.Get(),uploadedFragment_.data(),sizeof(uploadedFragment_));
         }
         if(!pixelConstantsUploaded_ || std::memcmp(uploadedScales_.data(),scales.data(),sizeof(scales))) {
             updateConstants(context_.Get(),textureScales_.Get(),scales.data(),sizeof(scales));
             uploadedScales_=scales;
         }
+        if(!pixelConstantsUploaded_ || std::memcmp(uploadedColorLookup_.data(),&colorLookup,sizeof(colorLookup))) {
+            updateConstants(context_.Get(),colorLookupConstants_.Get(),&colorLookup,sizeof(colorLookup));
+            std::memcpy(uploadedColorLookup_.data(),&colorLookup,sizeof(colorLookup));
+        }
+        if(!pixelConstantsUploaded_ || std::memcmp(uploadedBloom_.data(),&bloomControl,sizeof(bloomControl))) {
+            updateConstants(context_.Get(),bloomConstants_.Get(),&bloomControl,sizeof(bloomControl));
+            std::memcpy(uploadedBloom_.data(),&bloomControl,sizeof(bloomControl));
+        }
+        if(!pixelConstantsUploaded_ || std::memcmp(uploadedShadow_.data(),&shadowControl,sizeof(shadowControl))) {
+            updateConstants(context_.Get(),shadowConstants_.Get(),&shadowControl,sizeof(shadowControl));
+            std::memcpy(uploadedShadow_.data(),&shadowControl,sizeof(shadowControl));
+        }
         pixelConstantsUploaded_=true;
         if(!pixelBuffersBound_) {
-            ID3D11Buffer* buffers[]{fragmentConstants_.Get(),textureScales_.Get(),alphaTestConstants_.Get()};
-            context_->PSSetConstantBuffers(0,3,buffers);pixelBuffersBound_=true;
+            ID3D11Buffer* buffers[]{fragmentConstants_.Get(),textureScales_.Get(),alphaTestConstants_.Get(),colorLookupConstants_.Get(),bloomConstants_.Get(),shadowConstants_.Get()};
+            context_->PSSetConstantBuffers(0,6,buffers);pixelBuffersBound_=true;
         }
         if(!bindingsValid_ || boundViews_!=views) {context_->PSSetShaderResources(0,16,views.data());boundViews_=views;}
         if(!bindingsValid_ || boundSamplers_!=samplers) {context_->PSSetSamplers(0,16,samplers.data());boundSamplers_=samplers;}
+    }
+    // Opt-in, bounded inspection of the actual context bindings. Captured
+    // guest samplers alone cannot establish which filtering reached a draw.
+    static const bool anisotropyProbe=std::getenv("DARK_AF_PROBE")!=nullptr;
+    if(anisotropyProbe && captureFrame_ && surfaceFiltering && smokeOrdinal<1024) {
+        for(unsigned slot=0;slot<16;++slot)if(captureTextureMask&(1u<<slot)) {
+            Ptr<ID3D11SamplerState> actualSampler;
+            context_->PSGetSamplers(slot,1,actualSampler.GetAddressOf());
+            Ptr<ID3D11ShaderResourceView> actualView;
+            context_->PSGetShaderResources(slot,1,actualView.GetAddressOf());
+            if(!actualSampler || !actualView)continue;
+            D3D11_SAMPLER_DESC samplerDesc{};actualSampler->GetDesc(&samplerDesc);
+            D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};actualView->GetDesc(&viewDesc);
+            Ptr<ID3D11Resource> resource;actualView->GetResource(&resource);
+            Ptr<ID3D11Texture2D> texture;resource.As(&texture);
+            if(!texture)continue;
+            D3D11_TEXTURE2D_DESC textureDesc{};texture->GetDesc(&textureDesc);
+            std::fprintf(stderr,"[AnisotropyProbe] inspection=%u draw=%u program=%s slot=%u id=%u selected=%u guest=%u filter=%u actual=%u lod=%g,%g bias=%g size=%ux%u levels=%u viewDim=%u firstMip=%u viewMips=%u resolved=%u\n",
+                inspection_,smokeOrdinal,effectiveName,slot,draw.textureIds[slot],anisotropy,
+                unsigned(draw.samplers[slot].anisotropy),unsigned(samplerDesc.Filter),samplerDesc.MaxAnisotropy,
+                double(samplerDesc.MinLOD),double(samplerDesc.MaxLOD),double(samplerDesc.MipLODBias),
+                textureDesc.Width,textureDesc.Height,textureDesc.MipLevels,unsigned(viewDesc.ViewDimension),
+                viewDesc.ViewDimension==D3D11_SRV_DIMENSION_TEXTURE2D?viewDesc.Texture2D.MostDetailedMip:0,
+                viewDesc.ViewDimension==D3D11_SRV_DIMENSION_TEXTURE2D?viewDesc.Texture2D.MipLevels:0,
+                unsigned((captureResolvedMask&(1u<<slot))!=0));
+        }
     }
     ID3D11Buffer* vb=it->second.buffer.Get();UINT stride=sizeof(Native::WorldVertex),offset=0;
     if(!bindingsValid_ || boundVB_!=vb) {context_->IASetVertexBuffers(0,1,&vb,&stride,&offset);boundVB_=vb;}
@@ -1265,7 +2122,7 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         (draw.fragmentName=="XRUtil_RenderSurface" || draw.fragmentName=="XRShader_FP20_NDSEATP") &&
         (flags&8)) {
         if(smokeRecords_<128) {
-            smokeEvidence(draw,flags,it->second.vertices,smokeOrdinal);
+            smokeEvidence(draw,flags,smokeOrdinal);
             ++smokeRecords_;
         } else if(!smokeTruncated_) {
             smokeTruncated_=true;
@@ -1282,7 +2139,6 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
     if (measure) {
         D3D11_QUERY_DESC desc{D3D11_QUERY_PIPELINE_STATISTICS,0};
         if (!queries_[material]) check(device_->CreateQuery(&desc,&queries_[material]),"world pipeline query");
-        context_->Begin(queries_[material].Get());
     }
     const bool captureProjector=captureFrame_ && draw.fragmentName=="XREngine_ShadowProj";
     unsigned shadowPass=0;
@@ -1290,11 +2146,23 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
         shadowPass=captureShadowPasses_++;
         captureShadow(draw,command,smokeOrdinal,shadowPass,false,views);
     }
+    const bool captureReflection=captureFrame_ && reflectionProbe_ && captureReflectionPasses_<4 &&
+        (draw.fragmentName=="VBOp_FP20_Water" || draw.fragmentName=="VBOp_FP20_Water2");
+    const unsigned reflectionPass=captureReflection?captureReflectionPasses_++:0;
+    if(captureReflection)captureReflectionDraw(draw,command,smokeOrdinal,reflectionPass,false);
+    if(otherWorldPass)captureOtherWorldDraw(draw,command,smokeOrdinal,otherWorldPass,false);
+    // MSAA diagnostic readbacks may draw depth/stencil transfer helpers. Only
+    // the native geometry belongs in this material's pipeline statistics.
+    if(measure)context_->Begin(queries_[material].Get());
     context_->DrawIndexed(count,g.firstIndex,0);
+    if(measure) {context_->End(queries_[material].Get());queryPending_[material]=true;queryOrdinals_[material]=ordinal;}
+    if(hasColor) {auto& output=surfaces_.at(draw.surfaceKey(0));output.resolveDirty=bool(output.multisample);}
+    if(depth) {auto& output=surfaces_.at(draw.surfaceKey(4));output.resolveDirty=output.stencilDirty=bool(output.multisample);}
+    if(otherWorldPass)captureOtherWorldDraw(draw,command,smokeOrdinal,otherWorldPass,true);
+    if(captureReflection)captureReflectionDraw(draw,command,smokeOrdinal,reflectionPass,true);
     if(captureProjector && shadowPass<8)captureShadow(draw,command,smokeOrdinal,shadowPass,true,views);
     if(captureFrame_)Native::traceWorldDrawResult(inspection_,command,smokeOrdinal,0,fragmentFlags,captureTextureMask,captureResolvedMask);
     bindingsValid_=true;
-    if (measure) {context_->End(queries_[material].Get());queryPending_[material]=true;queryOrdinals_[material]=ordinal;}
     if (inspectLighting) {
         const auto after=readSurface(draw,0);size_t changed=0,nonfinite=0;
         if (after.size()==beforeLighting.size()) for(size_t i=0;i+8<=after.size();i+=8) {
@@ -1334,8 +2202,7 @@ bool WorldRendererD3D11::draw(const Native::WorldDraw& draw) {
 // descriptors only: no guest-memory dereference, no GPU readback, no cache
 // mutation. StoredGeometry carries no per-upload generation counter, so
 // identity is reported via addresses/ids plus sampled content hashes.
-void WorldRendererD3D11::smokeEvidence(const Native::WorldDraw& draw,uint32_t flags,
-    const std::vector<Native::WorldVertex>& decoded,unsigned ordinal) {
+void WorldRendererD3D11::smokeEvidence(const Native::WorldDraw& draw,uint32_t flags,unsigned ordinal) {
     const auto* a=draw.attributes.data();
     const uint32_t alphaFunc=a[97];
     const uint32_t alphaRefRaw=(uint32_t(a[98])<<8)|a[99];
@@ -1407,10 +2274,13 @@ void WorldRendererD3D11::smokeEvidence(const Native::WorldDraw& draw,uint32_t fl
         inspection_,presentCount_,ordinal,sampledIndices,hashedVertices,
         static_cast<unsigned long long>(indexHash),static_cast<unsigned long long>(vertexHash));
     const unsigned showVertices=sampledIndices<3u?sampledIndices:3u;
+    std::vector<Native::WorldVertex> decoded;
+    const auto selected=std::span<const uint16_t>(ownedIndices).subspan(first,showVertices);
+    sampleWorldVertices(*stored,selected,decoded);
     for(unsigned n=0;n<showVertices;++n) {
         const uint16_t indexValue=ownedIndices[size_t(first)+n];
-        if(size_t(indexValue)>=decoded.size())continue;
-        const auto& v=decoded[indexValue];
+        if(n>=decoded.size())continue;
+        const auto& v=decoded[n];
         std::fprintf(stderr,
             "[SmokeEvidenceVertex] inspection=%u frame=%llu draw=%u n=%u index=%u "
             "pos=%g,%g,%g,%g normal=%g,%g,%g,%g tex0=%g,%g,%g,%g color=%g,%g,%g,%g\n",
@@ -1481,30 +2351,72 @@ void WorldRendererD3D11::smokeEvidence(const Native::WorldDraw& draw,uint32_t fl
 void WorldRendererD3D11::printPerformance() {
     std::fprintf(stderr,"[TransientGeometry] created=%llu reused=%llu evicted=%llu retainedEntries=%zu retainedKiB=%.2f fenceDeferred=%llu\n",
         transientBuffers_.created(),transientBuffers_.reused(),transientBuffers_.evicted(),transientBuffers_.retainedEntries(),double(transientBuffers_.retainedBytes())/1024,transientBuffers_.fenceDeferred());
-    std::fprintf(stderr,"[RenderCache] vertexUploads=%llu indexUploads=%llu vertexEntries=%zu indexEntries=%zu vertexMiB=%.2f indexMiB=%.2f depthStates=%zu blendStates=%zu rasterStates=%zu\n",
-                 vertexUploads_,indexUploads_,geometry_.size(),indices_.size(),double(geometryBytes_)/(1024*1024),double(indexBytes_)/(1024*1024),depthStates_.size(),blendStates_.size(),rasterStates_.size());
+    size_t expandedCpuBytesAvoided=0;
+    for(const auto& [source,geometry]:geometry_)expandedCpuBytesAvoided+=size_t(geometry.metadata.count)*sizeof(Native::WorldVertex);
+    std::fprintf(stderr,"[RenderCache] vertexUploads=%llu indexUploads=%llu vertexEntries=%zu indexEntries=%zu vertexMiB=%.2f indexMiB=%.2f depthStates=%zu blendStates=%zu rasterStates=%zu vertexMetadataKiB=%.2f expandedVertexCpuMiBAvoided=%.2f\n",
+        vertexUploads_,indexUploads_,geometry_.size(),indices_.size(),double(geometryBytes_)/(1024*1024),double(indexBytes_)/(1024*1024),
+        depthStates_.size(),blendStates_.size(),rasterStates_.size(),double(geometry_.size()*sizeof(WorldVertexMetadata))/1024,double(expandedCpuBytesAvoided)/(1024*1024));
     if(Native::profileEngineCpu)
         std::fprintf(stderr,"[RenderCPU] draws=%llu texturesMs=%.2f geometryMs=%.2f bindingMs=%.2f statesMs=%.2f submitMs=%.2f imageUploads=%llu imageMiB=%.2f samplers=%zu\n",
                      profileDraws_,profileTextures_,profileGeometry_,profileBinding_,profileStates_,profileSubmit_,imageUploads_,double(imageBytes_)/(1024*1024),samplerStates_.size());
     else
         std::fprintf(stderr,"[RenderCPU] draws=%llu timing=disabled imageUploads=%llu imageMiB=%.2f samplers=%zu\n",
                      profileDraws_,imageUploads_,double(imageBytes_)/(1024*1024),samplerStates_.size());
+    if(Native::profileEngineCpu || Native::sampleRendererCpu) {
+        uint64_t comparisons=0,plannedReadBytes=0,uploads=0,plansBuilt=0,referenceUploads=0;
+        for(const auto& [key,shader]:shaders_)if(shader) {
+            comparisons+=shader->constantCompareCalls();plannedReadBytes+=shader->constantCompareReadBytes();
+            uploads+=shader->constantUploadCount();
+            plansBuilt+=shader->constantPlansBuilt();referenceUploads+=shader->referenceUploadCount();
+        }
+        // Planned byte ranges precede memcmp's possible early exit; these are
+        // equality-work bounds, rather than measured memory traffic or RSS.
+        std::fprintf(stderr,"[RenderConstantRanges] vectorComparisons=%llu plannedReadMiB=%.2f fullReadMiB=%.2f vectorUploads=%llu rangePlans=%llu referenceUploads=%llu\n",
+            comparisons,double(plannedReadBytes)/(1024*1024),double(comparisons)*4096/(1024*1024),uploads,plansBuilt,referenceUploads);
+    }
     profileDraws_=0;profileTextures_=profileGeometry_=profileBinding_=profileStates_=profileSubmit_=0;
     std::fprintf(stderr,"[RenderClear] fullRegions=%llu partialRegions=%llu emptyRegions=%llu\n",fullClearRegions_,partialClearRegions_,emptyClearRegions_);
     std::fprintf(stderr,"[RenderBudget] deferred=%llu budgetMiB=%zu worstDecodeMs=%.3f worstDecodeBytes=%zu worstUploadMs=%.3f worstUploadBytes=%zu worstKind=%s\n",budgetDeferred_,kFrameUploadBudgetBytes/(1024*1024),worstDecodeMs_,worstDecodeBytes_,worstUploadMs_,worstUploadBytes_,worstUploadKind_);
     worstDecodeMs_=0;worstDecodeBytes_=0;worstUploadMs_=0;worstUploadBytes_=0;worstUploadKind_="";
+}
+bool WorldRendererD3D11::applyImageBudget(size_t budget) {
+    if(budget==imageBudget_)return false;
+    imageBudget_=budget;
+    while(!images_.empty() && imageBytes_>imageBudget_) {
+        const auto oldest=std::min_element(images_.begin(),images_.end(),[](const auto& l,const auto& r){return l.second.used<r.second.used;});
+        imageBytes_-=oldest->second.bytes;images_.erase(oldest);
+    }
+    return true;
+}
+void WorldRendererD3D11::refreshImageBudget() {
+    if(!TextureBudgetPolicy::sampleDue(GetTickCount64(),nextImageBudgetSample_))return;
+    MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
+    const bool memorySuccess=GlobalMemoryStatusEx(&memory)!=0;
+    const auto chosen=TextureBudgetPolicy::refreshBudget(imageBudget_,imageHardwareBudget_,memorySuccess,memory.ullAvailPhys);
+    const auto previous=imageBudget_;
+    if(!applyImageBudget(chosen))return;
+    std::fprintf(stderr,"[TextureBudget] phase=refresh dedicatedBytes=%llu memorySuccess=%u totalPhys=%llu availPhys=%llu memoryLoad=%lu hardwareCapMiB=%zu hostCapMiB=%zu previousMiB=%zu selectedMiB=%zu\n",
+        static_cast<unsigned long long>(imageDedicatedBytes_),unsigned(memorySuccess),memory.ullTotalPhys,memory.ullAvailPhys,
+        memory.dwMemoryLoad,imageHardwareBudget_/TextureBudgetPolicy::MiB,
+        TextureBudgetPolicy::hostCap(memory.ullAvailPhys)/TextureBudgetPolicy::MiB,
+        previous/TextureBudgetPolicy::MiB,imageBudget_/TextureBudgetPolicy::MiB);
 }
 void WorldRendererD3D11::beginFrame() {
     Native::setRenderSamplePhase(Native::RenderSamplePhase::frame);
     frameUploadBytes_ = 0;
     transientBuffers_.beginFrame();
     const auto graphics = Native::graphicsSettings();
+    setSampleCount(Native::antialiasingSampleCount(graphics.antialiasing));
     bloom_ = graphics.bloom;
     motionBlur_ = graphics.motionBlur;
     invalidateBindings();
     for(auto it=images_.begin();it!=images_.end();) {
         if(it->second.source.use_count()==1) {imageBytes_-=it->second.bytes;it=images_.erase(it);} else ++it;
     }
+    // Discard orphan images before pressure trims live LRU entries. No raw
+    // last-draw binding identity survives eviction at this boundary; snapshots
+    // and COM bindings retain their independent lifetimes.
+    refreshImageBudget();
     // Immediate geometry is owned by a single frame. Do not retain thousands
     // of obsolete snapshots or force scans of a full cache for every draw.
     for(auto it=geometry_.begin();it!=geometry_.end();) {

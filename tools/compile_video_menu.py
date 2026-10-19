@@ -2,13 +2,16 @@
 
 XCR 0x203 stores little-endian node records/hashes and separate LE/BE value
 pools. Child lists are shared by their word offset in the chunk allocation.
-Keep the shipped pools and shared lists intact; append only the PC page.
+Keep the shipped pools and shared lists intact when adding PC controls.
 """
 import argparse
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
+import re
 import struct
 import zlib
+from compile_native_menu_text import DEFAULT_CATALOG, load_catalog, write_if_changed
 
 
 @dataclass
@@ -109,8 +112,8 @@ class Registry:
 
     def set_children(self, node, children):
         node.children = list(children)
-        # Preserve authored child order; the hash table is parallel to the
-        # child array (not sorted). Use the original case-insensitive hash.
+        # The hash table is parallel to the child array. Preserve authored
+        # order; Cube text registration depends on TEXT preceding RGN.
         def hash_name(name):
             h = 5381
             for c in name.lower().encode("latin1"):
@@ -152,37 +155,231 @@ class Registry:
         return data
 
 
-SETTINGS = ("brightness", "gamma", "fov", "bloom", "vsync", "fps", "resolution", "mode", "motionblur", "antialiasing")
-SETTING_NAMES = ("Brightness", "Gamma", "Field of view", "Bloom", "Vertical sync", "Frame limit", "Resolution", "Display", "Motion blur", "Antialiasing")
-INITIAL_VALUES = ("100%", "1.00", "Original", "On", "Off", "60", "720p", "Borderless", "Off", "Off")
+SETTINGS = ("brightness", "fov", "bloom", "vsync", "fps", "resolution", "mode", "motionblur", "antialiasing", "language", "anisotropy")
+SETTING_NAMES = ("BRIGHTNESS", "FIELD OF VIEW", "BLOOM", "VERTICAL SYNC", "FRAME LIMIT", "RESOLUTION", "DISPLAY", "MOTION BLUR", "ANTIALIASING", "LANGUAGE", "TEXTURE FILTERING")
+INITIAL_VALUES = ("100%", "ORIGINAL", "ON", "OFF", "60", "720P", "BORDERLESS", "OFF", "OFF", "SYSTEM", "16X")
+# Match KeyboardAction's order. Compact labels fit the original small-font
+# action column; binding values retain fixed widths for native hit rectangles.
+KEYBOARD_ACTIONS = ("MOVE FORWARD", "MOVE BACKWARD", "MOVE LEFT", "MOVE RIGHT", "LOOK UP", "LOOK DOWN",
+                    "LOOK LEFT", "LOOK RIGHT", "JUMP", "USE / CONFIRM", "RELOAD", "CROUCH", "ZOOM",
+                    "FIRE RIGHT WEAPON", "FIRE LEFT WEAPON", "PREVIOUS WEAPON", "NEXT WEAPON",
+                    "PREV DARKNESS", "NEXT DARKNESS", "MANIFEST DARKNESS", "USE DARKNESS POWER",
+                    "REDIRECT DARKLING", "JOURNAL", "PAUSE", "PREV DIALOGUE", "NEXT DIALOGUE")
+KEYBOARD_PRIMARY = ("W", "S", "A", "D", "I", "K", "J", "L", "SPACE", "E", "R", "CTRL", "SHIFT",
+                    "X", "Z", "1", "2", "3", "4", "Q", "G", "F", "TAB", "ENTER", "3", "4")
+KEYBOARD_SECONDARY = tuple({"CROUCH": "C", "ZOOM": "MMB", "FIRE RIGHT WEAPON": "LMB",
+                            "FIRE LEFT WEAPON": "RMB", "PREVIOUS WEAPON": "WHEEL DN",
+                            "NEXT WEAPON": "WHEEL UP", "PREV DIALOGUE": "WHEEL UP",
+                            "NEXT DIALOGUE": "WHEEL DN"}.get(action, "UNBOUND") for action in KEYBOARD_ACTIONS)
 
 
-def replace_video_page(registry):
+def localized_text(text, region, translations):
+    """Translate generated TEXT only, retaining byte-based glyph/cell sizing."""
+    if translations is None:
+        return text
+    token, value = text.split(", ", 1)
+    if value.startswith("§"):
+        return text  # Original localized resources remain owned by the dump.
+
+    def lookup(english):
+        if english not in translations:
+            raise ValueError(f"Missing Russian menu translation: {english}")
+        return translations[english]
+
+    if value.startswith("< ") and value.endswith(" >"):
+        original = value[2:-2].strip()
+        translated = original if re.fullmatch(r"\d+(?:\.\d+)?(?:%|P|X)?", original) else lookup(original)
+        value = "< " + translated.center(12) + " >"
+    elif value.startswith("[") and value.endswith("]"):
+        original = value[1:-1].strip()
+        translated = lookup(original) if original == "UNBOUND" else original
+        value = "[" + translated.center(8) + "]"
+    elif value.startswith("PAGE "):
+        value = lookup("PAGE") + value[4:]
+    else:
+        value = lookup(value)
+    width = int(region.split(",")[2]) * (2 if token == "sc" else 1)
+    if len(value) > width:
+        raise ValueError(f"Russian menu text exceeds its {width}-glyph region: {text}")
+    return token + ", " + value
+
+
+def replace_video_page(registry, translations=None):
     r = registry
     page, = [n for n in r.roots if r.decode(n) == ("WINDOW", "options_video")]
-    template, = [n for n in r.roots if r.decode(n) == ("WINDOW", "options_video_dev")]
-    properties = [c for c in template.children if r.decode(c)[0] not in
-                  ("WINDOW", "ACCELLERATOR_3", "ACCELLERATOR_4", "ACCELLERATOR_5", "ACCELLERATOR_6")]
+    # Preserve the original calibration page class, properties and navigation.
+    # Its Gamma and color profile controls use the original option_update/save
+    # dispatch, including the profile list and selected-value localization.
+    properties = [c for c in page.children if r.decode(c)[0] != "WINDOW"]
+    original_controls = [(n, dict(r.decode(c) for c in n.children))
+                         for n in page.children if r.decode(n)[0] == "WINDOW"]
+    gamma_label, = [n for n, p in original_controls if p.get("TEXT") == "sc, §LMENU_GAMMA"]
+    gamma_controls = [n for n, p in original_controls if p.get("GROUP") == "gamma"]
+    assert len(gamma_controls) == 2
+    profile_label, = [n for n, p in original_controls if p.get("TEXT") == "sc, §LMENU_VIDEO_CABLEPROFILE"]
+    profile_controls = [n for n, p in original_controls if p.get("GROUP") == "cableprofile"]
+    assert len(profile_controls) == 2
+    def relocated(original, region, *, hidden_focus=False, group=None):
+        children = [r.make("RGN", region) if r.decode(c)[0] == "RGN" else
+                    r.make("GROUP", group) if group is not None and r.decode(c)[0] == "GROUP" else c
+                    for c in original.children]
+        if hidden_focus:
+            # The grouped value text paints the selection highlight. Suppress
+            # the blank button's wider rectangle without shrinking its hit
+            # area. Geometry loading looks up STYLE by sorted name hash, so
+            # insert it before OPTION instead of appending it to the list.
+            option_index = next(i for i, c in enumerate(children) if r.decode(c)[0] == "OPTION")
+            children.insert(option_index, r.make("STYLE", "HIDDENFOCUS"))
+        return r.make("WINDOW", r.decode(original)[1], children)
     def window(cls, text, region, script=None):
-        children = [r.make("CLASSNAME", cls), r.make("TEXT", text)]
+        children = [r.make("CLASSNAME", cls), r.make("TEXT", localized_text(text, region, translations))]
         if script:
             children.append(r.make("SCRIPT_PRESSED", script))
             children.append(r.make("ALWAYSPAINT", "1"))
         # Preserve the original control's property order and native sizing.
         children.append(r.make("RGN", region))
         return r.make("WINDOW", "", children)
-    properties.append(window("CubeText", "nc, §LMENU_VIDEO_HEADING", "0,2,20,2"))
+    # The eleven native rows and original calibration controls fit above the
+    # footer by starting the heading one cell earlier on the existing grid.
+    properties.append(window("CubeText", "nc, §LMENU_VIDEO_HEADING", "0,1,20,2"))
     for row, (key, name, initial) in enumerate(zip(SETTINGS, SETTING_NAMES, INITIAL_VALUES)):
-        y = 4 + row
+        y = 3 + row + 3 * (row > 0)
         properties.append(window("CubeText", "sc, " + name, f"1,{y},10,1"))
         properties.append(window("CubeButton", "sc, < " + initial.center(12) + " >", f"11,{y},8,1", "darkrecomp." + key))
-    properties.append(window("CubeText", "sc, Brightness: 100% is neutral", "0,15,20,1"))
-    properties.append(window("CubeText", "sc, Gamma: lower is darker; 1.00 is neutral", "0,16,20,1"))
-    properties.append(window("CubeText", "sc, Left/Right: change; restart resolution", "0,18,20,1"))
+        if row == 0:
+            properties.append(relocated(gamma_label, "1,4,10,1"))
+            properties.extend(relocated(n, "11,4,8,1") for n in gamma_controls)
+            # Keep the original two-row profile layout wide enough for its
+            # localized label and selected value. The button and value text
+            # intentionally share a region, like the Gamma button and meter.
+            # A separate focus group avoids the retail cableprofile arrow
+            # painter, which assumes the original calibration-page layout.
+            # The original option bindings still handle selection and saving.
+            properties.append(relocated(profile_label, "1,5,18,1"))
+            properties.extend(relocated(n, "1,6,18,1", hidden_focus=p["CLASSNAME"] == "CubeOptionButton",
+                                        group="colorprofile")
+                              for n, p in original_controls if p.get("GROUP") == "cableprofile")
+    properties.append(window("CubeText", "sc, RESOLUTION/LANGUAGE: RESTART TO APPLY", "0,18,20,1"))
+    properties.append(window("CubeText", "sc, LEFT/RIGHT: CHANGE; CONFIRM: NEXT", "0,19,20,1"))
     r.set_children(page, properties)
 
 
-def compile_menu(source):
+def add_subtitle_size(r, translations=None):
+    page, = [n for n in r.roots if r.decode(n) == ("WINDOW", "options_subtitles")]
+
+    def window(cls, text, region, script=None, identifier=None):
+        children = [r.make("CLASSNAME", cls), r.make("TEXT", localized_text(text, region, translations))]
+        if script:
+            children.extend((r.make("SCRIPT_PRESSED", script), r.make("ALWAYSPAINT", "1")))
+        if identifier:
+            children.extend((r.make("ALWAYSPAINT", "1"), r.make("ID", identifier)))
+        children.append(r.make("RGN", region))
+        return r.make("WINDOW", "", children)
+
+    # Keep all authored category controls and their native option bindings.
+    # The size value uses the same live CubeButton action as other PC settings.
+    r.set_children(page, [*page.children,
+        window("CubeText", "sc, SUBTITLE SIZE", "2,15,8,1", identifier="DARKRECOMP_SUBTITLE_SIZE"),
+        window("CubeButton", "sc, < " + "100%".center(12) + " >", "11,15,8,1", "darkrecomp.subtitle_scale"),
+        window("CubeText", "sc, LEFT/RIGHT: CHANGE; CONFIRM: NEXT", "0,19,20,1", identifier="DARKRECOMP_SUBTITLE_HELP"),
+    ])
+
+
+def add_pc_menu_actions(r, translations=None):
+    def window(cls, text, region, script=None, *, style=None, always_paint=False, identifier=None):
+        children = [r.make("CLASSNAME", cls), r.make("TEXT", localized_text(text, region, translations))]
+        if script:
+            children.append(r.make("SCRIPT_PRESSED", script))
+        if always_paint:
+            children.append(r.make("ALWAYSPAINT", "1"))
+        if style:
+            children.append(r.make("STYLE", style))
+        if identifier:
+            children.append(r.make("ID", identifier))
+        children.append(r.make("RGN", region))
+        return r.make("WINDOW", "", children)
+
+    # Extend the actual retail menus (MainMenu/GAMEMENU are only forks).
+    for name in ("MainMenu_NoCheckpoint", "MainMenu_GotCheckpoint", "GAMEMENU_real"):
+        page, = [n for n in r.roots if r.decode(n) == ("WINDOW", name)]
+        buttons = [dict(r.decode(c) for c in n.children) for n in page.children
+                   if r.decode(n)[0] == "WINDOW"]
+        last_row = max(int(b["RGN"].split(",")[1]) for b in buttons if b.get("CLASSNAME") == "CubeButton")
+        r.set_children(page, [*page.children, window("CubeButton", "nc, EXIT GAME",
+            f"0,{last_row + 2},20,1", "cg_submenu('darkrecomp_exit_confirm')")])
+
+    controls, = [n for n in r.roots if r.decode(n) == ("WINDOW", "options_controller")]
+    children = list(controls.children)
+    # Insert in authored navigation order between Advanced and Invert Y.
+    index = next(i for i, n in enumerate(children) if r.decode(n)[0] == "WINDOW"
+                 and dict(r.decode(c) for c in n.children).get("RGN") == "1, 11, 10, 1")
+    children.insert(index, window("CubeButton", "nc, KEYBOARD BINDINGS", "0,9,20,1", "darkrecomp.keybindings"))
+    # The retail controller settings end at row 15. Keep their option bindings
+    # and keyboard navigation intact, then add an independent mouse multiplier
+    # using the same native value button and sizing as the PC video settings.
+    children.extend([
+        window("CubeText", "sc, MOUSE SENSITIVITY", "1,17,10,1"),
+        window("CubeButton", "sc, < " + "1.0X".center(12) + " >", "11,17,8,1",
+               "darkrecomp.mouse_sensitivity", always_paint=True),
+        window("CubeText", "sc, LEFT/RIGHT: CHANGE; CONFIRM: NEXT", "0,19,20,1")])
+    r.set_children(controls, children)
+
+    original_root_count = len(r.roots)
+    # Keep confirmation inside the game and put Cancel first in focus order.
+    r.roots.append(r.make("WINDOW", "darkrecomp_exit_confirm", [
+        r.make("CLASSNAME", "CubeMenu"),
+        r.make("ACCELLERATOR_1", "gui_cancel,,cg_prevmenu()"),
+        r.make("ACCELLERATOR_2", "gui_back,,cg_prevmenu()"),
+        # CubeMenu's original registry loader (sub_8239AE50) initializes its
+        # glyph/cell lookup only when this property exists. Empty is the
+        # retail spelling; omitting it leaves an entirely black menu.
+        r.make("DEFAULTLOOKUP", ""), r.make("RGN", "0,0,640,480"),
+        r.make("STYLE", "HIDDENFOCUS"),
+        window("CubeText", "nc, EXIT GAME?", "0,5,20,2"),
+        window("CubeText", "sc, UNSAVED PROGRESS WILL BE LOST.", "0,8,20,1"),
+        window("CubeButton", "nc, CANCEL", "0,11,20,1", "cg_prevmenu()"),
+        window("CubeButton", "nc, EXIT GAME", "0,13,20,1", "darkrecomp.exit"),
+    ]))
+    page_count = (len(KEYBOARD_ACTIONS) + 5) // 6
+    for page in range(page_count):
+        # cg_switchmenu is the retail controller-template pagination route.
+        # It replaces the current page without adding a submenu history level.
+        previous, following = (page - 1) % page_count + 1, (page + 1) % page_count + 1
+        children = [r.make("CLASSNAME", "CubeMenu"),
+            r.make("ID", f"DARKRECOMP_KEYBOARD_{page + 1}"),
+            r.make("ACCELLERATOR_1", "gui_cancel,,cg_prevmenu()"),
+            r.make("ACCELLERATOR_2", "gui_back,,cg_prevmenu()"),
+            r.make("DEFAULTLOOKUP", ""), r.make("RGN", "0,0,640,480"),
+            r.make("STYLE", "HIDDENFOCUS"),
+            window("CubeText", "nc, KEYBOARD BINDINGS", "0,4,20,2"),
+            window("CubeText", "sc, ACTION", "1,6,9,1"),
+            window("CubeText", "sc, PRIMARY", "10,6,5,1"),
+            window("CubeText", "sc, SECONDARY", "15,6,5,1")]
+        for row, action in enumerate(range(page * 6, min((page + 1) * 6, len(KEYBOARD_ACTIONS)))):
+            y = 7 + row
+            children.append(window("CubeText", "sc, " + KEYBOARD_ACTIONS[action], f"1,{y},9,1"))
+            # Retail TEXT sizing trims plain padding. Visible endpoints keep
+            # the full five-cell hit/paint region for every live key name.
+            for slot, x, width, values in ((0, 10, 5, KEYBOARD_PRIMARY), (1, 15, 5, KEYBOARD_SECONDARY)):
+                children.append(window("CubeButton", "sc, [" + values[action].center(8) + "]",
+                    f"{x},{y},{width},1", f"darkrecomp.keyboard.bind.{action}.{slot}", always_paint=True))
+        children.extend([
+            window("CubeButton", "sc, PREVIOUS", "1,14,6,1", f"cg_switchmenu('darkrecomp_keyboard_{previous}')"),
+            window("CubeText", f"sc, PAGE {page + 1}/{page_count}", "7,14,6,1"),
+            window("CubeButton", "sc, NEXT", "13,14,6,1", f"cg_switchmenu('darkrecomp_keyboard_{following}')"),
+            window("CubeButton", "sc, DEFAULTS", "1,16,7,1", "darkrecomp.keyboard.defaults"),
+            window("CubeButton", "sc, SAVE", "8,16,5,1", "darkrecomp.keyboard.save", always_paint=True),
+            window("CubeButton", "sc, CANCEL", "13,16,6,1", "darkrecomp.keyboard.cancel")])
+        r.roots.append(r.make("WINDOW", f"darkrecomp_keyboard_{page + 1}", children))
+    # Preserve the parallel root lookup table, including descriptor roots.
+    h = 5381
+    for c in b"window":
+        h = (h * 33 + c) & 0xffffffff
+    r.root_hashes = r.root_hashes[:original_root_count * 2] + struct.pack("<H", (h - 5381) & 0xffff) * (len(r.roots) - original_root_count)
+    r.root_hashes += b"\0" * (-len(r.root_hashes) % 4)
+
+
+def compile_menu(source, translations=None):
     data = bytearray(source)
     assert data[:15] == b"MOS DATAFILE2.0"
     payloads = []
@@ -190,7 +387,9 @@ def compile_menu(source):
         offset, size, version = struct.unpack_from("<III", data, entry + 32)
         assert version == 0x203
         r = Registry(data[offset:offset + size], endian)
-        replace_video_page(r)
+        replace_video_page(r, translations)
+        add_subtitle_size(r, translations)
+        add_pc_menu_actions(r, translations)
         payloads.append(r.encode())
     output = data[:0x90]
     for entry, payload in zip((0x30, 0x60), payloads):
@@ -258,12 +457,19 @@ def compile_menu_archive(source, original_menu, replacement):
     return header + zlib.compress(rewritten, level=9)
 
 
+def menu_source_hashes(menu_source, archive_source):
+    """Pin the two original assets used for the bundled menu overrides."""
+    return hashlib.sha256(menu_source).hexdigest() + "\n" + hashlib.sha256(archive_source).hexdigest() + "\n"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--archive-source", type=Path)
     parser.add_argument("--archive-output", type=Path)
+    parser.add_argument("--russian-output", type=Path)
+    parser.add_argument("--russian-catalog", type=Path, default=DEFAULT_CATALOG)
     args = parser.parse_args()
     assert args.source.resolve() != args.output.resolve(), "Never overwrite the shipped registry"
     source = args.source.read_bytes()
@@ -271,10 +477,18 @@ if __name__ == "__main__":
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if not args.output.exists() or args.output.read_bytes() != result:
         args.output.write_bytes(result)
+    if args.russian_output:
+        assert args.russian_output.resolve() not in (args.source.resolve(), args.output.resolve()), "Russian menu output must be private"
+        write_if_changed(args.russian_output, compile_menu(source, load_catalog(args.russian_catalog)))
     if args.archive_source or args.archive_output:
         assert args.archive_source and args.archive_output
         assert args.archive_source.resolve() != args.archive_output.resolve()
-        archive = compile_menu_archive(args.archive_source.read_bytes(), source, result)
+        archive_source = args.archive_source.read_bytes()
+        archive = compile_menu_archive(archive_source, source, result)
         args.archive_output.parent.mkdir(parents=True, exist_ok=True)
         if not args.archive_output.exists() or args.archive_output.read_bytes() != archive:
             args.archive_output.write_bytes(archive)
+        metadata_path = args.output.with_name(args.output.name + ".source.sha256")
+        metadata = menu_source_hashes(source, archive_source).encode("ascii")
+        if not metadata_path.exists() or metadata_path.read_bytes() != metadata:
+            metadata_path.write_bytes(metadata)

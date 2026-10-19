@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(DarkRecomp LANGUAGES CXX)
+project(DarkRecomp LANGUAGES CXX RC)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "DarkRecomp requires native 64-bit Windows")
 endif()
@@ -11,10 +11,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Build-time only: parallelize source compilation within each target.
 # No runtime code change; speeds up the optimize+test loop on multi-core hosts.
 if(MSVC)
-    add_compile_options(/MP)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/MP>)
 endif()
 set(DARK_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated" CACHE PATH "Verified AOT output")
 option(DARK_ALLOW_INCOMPLETE "Compile explicit runtime traps for unresolved translation (diagnostics only)" OFF)
+option(DARK_STALL_PROFILER "Include opt-in runtime stall profiling (DARKRECOMP_STALL_PROFILE=1)" ON)
 find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
 set(GATE_ARGS --output "${DARK_GENERATED_DIR}" --verify)
 if(DARK_ALLOW_INCOMPLETE)
@@ -44,10 +45,38 @@ if(DARK_NATIVE_SSSE3)
     target_compile_definitions(DarkRecompPPC PUBLIC DARK_NATIVE_SSSE3=1)
 endif()
 add_library(DarkRuntime STATIC runtime/native/runtime.cpp runtime/native/kernel.cpp runtime/native/dispatcher.cpp runtime/native/filesystem.cpp runtime/native/storage.cpp runtime/native/guest_runner.cpp runtime/native/audio_driver.cpp runtime/native/input.cpp runtime/native/xma_bridge.cpp renderer/d3d11/display_context_d3d11.cpp)
+target_sources(DarkRuntime PRIVATE runtime/native/xex_image.cpp runtime/native/native_menu_assets.cpp)
+target_sources(DarkRuntime PRIVATE runtime/native/language_settings.cpp)
+
+set(DARK_MENU_TEXT_HEADER "${CMAKE_BINARY_DIR}/native_assets/native_menu_text.generated.h")
+add_custom_command(OUTPUT "${DARK_MENU_TEXT_HEADER}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/compile_native_menu_text.py"
+        --catalog "${CMAKE_SOURCE_DIR}/assets/localization/native_menu_ru.json" --output "${DARK_MENU_TEXT_HEADER}"
+    DEPENDS tools/compile_native_menu_text.py assets/localization/native_menu_ru.json
+        assets/localization/subtitle_menu.json VERBATIM)
+add_custom_target(NativeMenuText DEPENDS "${DARK_MENU_TEXT_HEADER}")
+function(add_native_menu_text target)
+    target_sources(${target} PRIVATE runtime/native/native_menu_text.cpp)
+    add_dependencies(${target} NativeMenuText)
+    target_include_directories(${target} PRIVATE "${CMAKE_BINARY_DIR}/native_assets")
+endfunction()
+add_native_menu_text(DarkRuntime)
+target_sources(DarkRuntime PRIVATE runtime/native/achievements.cpp runtime/native/achievements_catalog.cpp)
+
 target_sources(DarkRuntime PRIVATE runtime/native/fov_settings.cpp runtime/native/fov_camera.cpp)
 target_sources(DarkRuntime PRIVATE runtime/native/graphics_settings.cpp runtime/native/video_settings_menu.cpp)
 target_sources(DarkRuntime PRIVATE runtime/native/mouse_look.cpp)
+target_sources(DarkRuntime PRIVATE runtime/native/menu_pointer.cpp runtime/native/keyboard_bindings.cpp)
+target_sources(DarkRuntime PRIVATE runtime/native/keyboard_menu.cpp runtime/native/keyboard_menu_guest.cpp)
+target_sources(DarkRuntime PRIVATE runtime/native/developer_tools.cpp
+    runtime/native/developer_player.cpp runtime/native/developer_missions.cpp
+    runtime/native/developer_invincibility.cpp runtime/native/developer_player_lookup.cpp
+    runtime/native/developer_update.cpp runtime/native/developer_noclip.cpp
+    runtime/native/developer_darkness.cpp
+    runtime/native/developer_weapon_assets.cpp)
 target_include_directories(DarkRuntime PUBLIC "${CMAKE_SOURCE_DIR}")
+target_sources(DarkRuntime PRIVATE runtime/native/stall_profiler.cpp)
+target_compile_definitions(DarkRuntime PUBLIC DARK_STALL_PROFILER=$<BOOL:${DARK_STALL_PROFILER}>)
 target_sources(DarkRuntime PRIVATE renderer/engine/render_trace.cpp)
 target_sources(DarkRuntime PRIVATE renderer/engine/stored_geometry.cpp)
 target_sources(DarkRuntime PRIVATE renderer/engine/scene_work.cpp)
@@ -58,8 +87,9 @@ target_sources(DarkRuntime PRIVATE renderer/engine/engine_vertex_descriptor.cpp)
 target_sources(DarkRuntime PRIVATE renderer/engine/engine_palette.cpp)
 target_sources(DarkRuntime PRIVATE renderer/engine/engine_vertex_program.cpp)
 set_source_files_properties(renderer/engine/engine_transforms.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
-target_sources(DarkRuntime PRIVATE renderer/engine/simple_mesh.cpp renderer/d3d11/engine_preview.cpp)
-target_link_libraries(DarkRuntime PUBLIC d3dcompiler)
+target_sources(DarkRuntime PRIVATE renderer/engine/simple_mesh.cpp renderer/d3d11/engine_preview.cpp
+  renderer/d3d11/smaa_d3d11.cpp renderer/d3d11/msaa_depth_transfer.cpp renderer/engine/subtitle_font.cpp)
+target_link_libraries(DarkRuntime PUBLIC d3dcompiler dwrite gdi32)
 set(DARK_SHADER_DIR "${CMAKE_BINARY_DIR}/native_shaders")
 add_custom_command(OUTPUT "${DARK_SHADER_DIR}/engine_vertex_template.generated.h"
     "${DARK_SHADER_DIR}/engine_vertex_template.hlsl" "${DARK_SHADER_DIR}/engine_vertex_template.source.json"
@@ -85,10 +115,27 @@ add_custom_command(OUTPUT "${DARK_SHADER_DIR}/engine_world_fragments.generated.h
     "${DARK_SHADER_DIR}/XRShader_FP20_NDSP.native.hlsl" "${DARK_SHADER_DIR}/XRShader_MotionMap.native.hlsl"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/compile_world_fragment.py"
         --game-dir "${CMAKE_SOURCE_DIR}/Darkness" --output-dir "${DARK_SHADER_DIR}"
-    DEPENDS tools/compile_world_fragment.py tools/compile_vertex_template.py Darkness/System/Gl/ARB_fragment_program/XRShader_FP20_NDSP.fp
+    DEPENDS tools/compile_world_fragment.py tools/compile_vertex_template.py
+        Darkness/System/Gl/ARB_fragment_program/VBOp_FP20_Water.fp
+        Darkness/System/Gl/ARB_fragment_program/VBOp_FP20_Water2.fp
+        Darkness/System/Gl/ARB_fragment_program/VBOp_FP20_CubeWater.fp
+        Darkness/System/Gl/ARB_fragment_program/VBOp_FP20_CubeWater2.fp
+        Darkness/System/Gl/ARB_fragment_program/XRShader_FP20_Decal.fp
+        Darkness/System/Gl/ARB_fragment_program/XRShader_DecalTMProj.fp
+        Darkness/System/Gl/ARB_fragment_program/XRShader_DecalTM.fp
+        Darkness/System/Gl/ARB_fragment_program/XRShader_DecalNormalTransform.fp
+        Darkness/System/Gl/ARB_fragment_program/XRShader_DecalNormalTransformTM.fp
+        Darkness/System/Gl/ARB_fragment_program/WModel_FXRenderSurface.fp
+        Darkness/System/Gl/ARB_fragment_program/WModel_FXBlackHole.fp
+        Darkness/System/Gl/ARB_fragment_program/WModel_FXHeatHazeMask.fp
+        Darkness/System/Gl/ARB_fragment_program/GUIRGB2Grey.fp
+        Darkness/System/Gl/ARB_fragment_program/CMWnd_ModTexture_PaintVideo_YUV2RGB.fp
+        Darkness/System/Gl/ARB_fragment_program/XRShader_FP20_NDSP.fp
         Darkness/System/Gl/ARB_fragment_program/XRShader_FP20_NDS.fp
         Darkness/System/Gl/ARB_fragment_program/WClientMod_DV5_0.fp
         Darkness/System/Gl/ARB_fragment_program/WClientMod_DV5_1.fp
+        Darkness/System/Gl/ARB_fragment_program/WClientMod_OW1_1.fp
+        Darkness/System/Gl/ARB_fragment_program/WClientMod_OW1_2.fp
         Darkness/System/Gl/ARB_fragment_program/XRShader_MotionMap.fp Darkness/System/Xenon/FPInclude_Xenon.xrg
         Darkness/System/Gl/ARB_fragment_program/GUIFadeToWhite.fp
         Darkness/System/Gl/ARB_fragment_program/XRShader_FP20_LFM.fp
@@ -111,6 +158,7 @@ add_custom_command(OUTPUT "${DARK_SHADER_DIR}/engine_world_fragments.generated.h
         Darkness/System/Gl/ARB_fragment_program/XREngine_CCFuser.fp
         Darkness/System/Gl/ARB_fragment_program/XREngine_Final5.fp
         Darkness/System/Gl/ARB_fragment_program/XREngine_MulFilter.fp
+        Darkness/System/Gl/ARB_fragment_program/XREngine_TransparentMesh.fp
         Darkness/System/Xenon/FragmentProgram/MRenderXenon_Attrib_TexEnvMode00.fp
         Darkness/System/Xenon/FragmentProgram/MRenderXenon_Attrib_TexEnvMode01.fp
         Darkness/System/Xenon/FragmentProgram/MRenderXenon_Attrib_TexEnvMode02.fp
@@ -118,17 +166,30 @@ add_custom_command(OUTPUT "${DARK_SHADER_DIR}/engine_world_fragments.generated.h
 target_sources(DarkRuntime PRIVATE "${DARK_SHADER_DIR}/engine_world_fragments.generated.h" "${DARK_SHADER_DIR}/engine_world_fragment_bindings.generated.h")
 target_link_libraries(DarkRuntime PUBLIC DarkRecompPPC bcrypt dbghelp d3d11 dxgi xaudio2 ole32 xinput)
 target_compile_options(DarkRuntime PRIVATE /Zi)
-add_executable(DarkRecomp app/windows/native_main.cpp app/windows/display_settings.cpp)
+configure_file(app/windows/darkrecomp.rc.in "${CMAKE_CURRENT_BINARY_DIR}/darkrecomp.rc" @ONLY)
+set(DARK_ICON_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/darkrecomp.rc")
+set_source_files_properties("${DARK_ICON_RESOURCE}" PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/windows/darkrecomp.ico")
+add_executable(DarkRecomp app/windows/native_main.cpp app/windows/display_settings.cpp
+    app/windows/developer_tools_window.cpp app/windows/keyboard_settings.cpp app/windows/mouse_settings.cpp
+    app/windows/achievements_window.cpp)
+target_sources(DarkRecomp PRIVATE "${DARK_ICON_RESOURCE}")
 set(DARK_VIDEO_MENU "${CMAKE_BINARY_DIR}/native_assets/CubeWnd.pc.xcr")
+set(DARK_VIDEO_MENU_RUSSIAN "${CMAKE_BINARY_DIR}/native_assets/CubeWnd.pc.ru.xcr")
 set(DARK_VIDEO_ARCHIVE "${CMAKE_BINARY_DIR}/native_assets/GameContext_Create.pc.xdf")
-add_custom_command(OUTPUT "${DARK_VIDEO_MENU}" "${DARK_VIDEO_ARCHIVE}"
+set(DARK_VIDEO_MENU_SOURCE "${DARK_VIDEO_MENU}.source.sha256")
+add_custom_command(OUTPUT "${DARK_VIDEO_MENU}" "${DARK_VIDEO_MENU_RUSSIAN}" "${DARK_VIDEO_ARCHIVE}" "${DARK_VIDEO_MENU_SOURCE}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/compile_video_menu.py"
         --source "${CMAKE_SOURCE_DIR}/Darkness/Content/Gui/CubeWnd.xcr" --output "${DARK_VIDEO_MENU}"
+        --russian-output "${DARK_VIDEO_MENU_RUSSIAN}" --russian-catalog "${CMAKE_SOURCE_DIR}/assets/localization/native_menu_ru.json"
         --archive-source "${CMAKE_SOURCE_DIR}/Darkness/Content/Xdf/GameContext_Create.XDF" --archive-output "${DARK_VIDEO_ARCHIVE}"
-    DEPENDS tools/compile_video_menu.py Darkness/Content/Gui/CubeWnd.xcr Darkness/Content/Xdf/GameContext_Create.XDF VERBATIM)
-add_custom_target(NativeVideoMenu ALL DEPENDS "${DARK_VIDEO_MENU}" "${DARK_VIDEO_ARCHIVE}"
+    DEPENDS tools/compile_video_menu.py tools/compile_native_menu_text.py assets/localization/native_menu_ru.json
+        Darkness/Content/Gui/CubeWnd.xcr Darkness/Content/Xdf/GameContext_Create.XDF VERBATIM)
+add_custom_target(NativeVideoMenu ALL DEPENDS "${DARK_VIDEO_MENU}" "${DARK_VIDEO_MENU_RUSSIAN}" "${DARK_VIDEO_ARCHIVE}" "${DARK_VIDEO_MENU_SOURCE}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${DARK_VIDEO_MENU}" "$<TARGET_FILE_DIR:DarkRecomp>/CubeWnd.pc.xcr"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${DARK_VIDEO_ARCHIVE}" "$<TARGET_FILE_DIR:DarkRecomp>/GameContext_Create.pc.xdf")
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${DARK_VIDEO_MENU_RUSSIAN}" "$<TARGET_FILE_DIR:DarkRecomp>/CubeWnd.pc.ru.xcr"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${DARK_VIDEO_ARCHIVE}" "$<TARGET_FILE_DIR:DarkRecomp>/GameContext_Create.pc.xdf"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${DARK_VIDEO_MENU_SOURCE}" "$<TARGET_FILE_DIR:DarkRecomp>/CubeWnd.pc.xcr.source.sha256")
 add_dependencies(DarkRecomp NativeVideoMenu)
 target_link_libraries(DarkRecomp PRIVATE DarkRuntime winmm comctl32)
 target_link_options(DarkRecomp PRIVATE /DEBUG /STACK:67108864,1048576)
@@ -147,31 +208,153 @@ function(stage_dark_xma target)
 endfunction()
 stage_dark_xma(DarkRecomp)
 add_executable(DarkRecompPreview WIN32 app/windows/preview_launcher.cpp)
+target_sources(DarkRecompPreview PRIVATE "${DARK_ICON_RESOURCE}")
 target_compile_definitions(DarkRecompPreview PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(DarkRecompPreview PRIVATE shell32)
 add_dependencies(DarkRecompPreview DarkRecomp)
+add_executable(DarkRecompSettings WIN32
+    app/windows/video_settings_launcher.cpp
+    app/windows/display_settings.cpp
+    runtime/native/graphics_settings.cpp
+    runtime/native/fov_settings.cpp
+    runtime/native/language_settings.cpp)
+target_sources(DarkRecompSettings PRIVATE "${DARK_ICON_RESOURCE}")
+target_include_directories(DarkRecompSettings PRIVATE "${CMAKE_SOURCE_DIR}")
+target_compile_definitions(DarkRecompSettings PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+target_link_libraries(DarkRecompSettings PRIVATE user32 gdi32 shell32 comctl32)
+add_dependencies(DarkRecompSettings DarkRecompPreview)
 if(BUILD_TESTING)
+    add_executable(NativeLaunchPathsTests tests/native_launch_paths_tests.cpp)
+    target_include_directories(NativeLaunchPathsTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(NativeLaunchPathsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME NativeLaunchPathsContract COMMAND NativeLaunchPathsTests)
+    add_executable(MouseCapturePolicyTests tests/mouse_capture_policy_tests.cpp)
+    target_include_directories(MouseCapturePolicyTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    add_test(NAME MouseCapturePolicyContract COMMAND MouseCapturePolicyTests)
+
+    add_executable(NativeMessagePumpTests tests/native_message_pump_tests.cpp)
+    target_include_directories(NativeMessagePumpTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(NativeMessagePumpTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(NativeMessagePumpTests PRIVATE user32)
+    add_test(NAME NativeMessagePumpContract COMMAND NativeMessagePumpTests)
+    set_tests_properties(NativeMessagePumpContract PROPERTIES TIMEOUT 10)
+
+    add_library(NativeShutdownDetachFixture SHARED tests/native_shutdown_detach_fixture.cpp)
+    target_compile_definitions(NativeShutdownDetachFixture PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_executable(NativeShutdownTests tests/native_shutdown_tests.cpp)
+    target_include_directories(NativeShutdownTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(NativeShutdownTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_dependencies(NativeShutdownTests NativeShutdownDetachFixture)
+    add_test(NAME NativeShutdownContract COMMAND NativeShutdownTests "$<TARGET_FILE:NativeShutdownDetachFixture>" --baseline-exit-process)
+    set_tests_properties(NativeShutdownContract PROPERTIES TIMEOUT 45)
+
+    add_executable(StallProfilerTests tests/stall_profiler_tests.cpp runtime/native/stall_profiler.cpp)
+    target_include_directories(StallProfilerTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(StallProfilerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN DARK_STALL_PROFILER=1)
+    add_test(NAME StallProfilerContract COMMAND StallProfilerTests)
+    add_test(NAME StallProfilerDisabledContract COMMAND StallProfilerTests --disabled)
+    add_executable(StallProfilerCompiledOutTests tests/stall_profiler_tests.cpp)
+    target_include_directories(StallProfilerCompiledOutTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(StallProfilerCompiledOutTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN DARK_STALL_PROFILER=0)
+    add_test(NAME StallProfilerCompiledOutContract COMMAND StallProfilerCompiledOutTests --compiled-out)
+    add_executable(AchievementsCatalogTests tests/achievements_catalog_tests.cpp
+        runtime/native/achievements_catalog.cpp)
+    target_include_directories(AchievementsCatalogTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    add_test(NAME AchievementsCatalogContract COMMAND AchievementsCatalogTests)
+    add_executable(FlashbackLayoutTests tests/flashback_layout_tests.cpp)
+    target_include_directories(FlashbackLayoutTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_options(FlashbackLayoutTests PRIVATE /fp:strict)
+    add_test(NAME FlashbackLayoutContract COMMAND FlashbackLayoutTests)
+    add_executable(MenuPointerTests tests/menu_pointer_tests.cpp)
+    target_include_directories(MenuPointerTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    add_test(NAME MenuPointerContract COMMAND MenuPointerTests)
+    add_executable(DeveloperResolutionShortcutTests tests/developer_resolution_shortcut_contract.cpp)
+    target_include_directories(DeveloperResolutionShortcutTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    add_test(NAME DeveloperResolutionShortcutContract COMMAND DeveloperResolutionShortcutTests)
+    add_executable(DeveloperSpeedDropdownTests tests/developer_speed_dropdown_contract.cpp
+        app/windows/developer_tools_window.cpp)
+    target_include_directories(DeveloperSpeedDropdownTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(DeveloperSpeedDropdownTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(DeveloperSpeedDropdownTests PRIVATE user32 gdi32 xinput)
+    add_test(NAME DeveloperSpeedDropdownContract COMMAND DeveloperSpeedDropdownTests)
+    set_tests_properties(DeveloperSpeedDropdownContract PROPERTIES TIMEOUT 15)
+    add_executable(KeyboardBindingsTests tests/keyboard_bindings_tests.cpp
+        app/windows/keyboard_settings.cpp runtime/native/keyboard_bindings.cpp)
+    target_include_directories(KeyboardBindingsTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(KeyboardBindingsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(KeyboardBindingsTests PRIVATE user32)
+    add_test(NAME KeyboardBindingsContract COMMAND KeyboardBindingsTests)
+    add_executable(KeyboardMenuTests tests/keyboard_menu_tests.cpp
+        runtime/native/keyboard_menu.cpp runtime/native/keyboard_bindings.cpp)
+    add_native_menu_text(KeyboardMenuTests)
+    target_include_directories(KeyboardMenuTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(KeyboardMenuTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(KeyboardMenuTests PRIVATE user32)
+    add_test(NAME KeyboardMenuContract COMMAND KeyboardMenuTests)
+    add_executable(NativeMenuTextTests tests/native_menu_text_tests.cpp)
+    add_native_menu_text(NativeMenuTextTests)
+    target_include_directories(NativeMenuTextTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    add_test(NAME NativeMenuTextContract COMMAND NativeMenuTextTests)
+    add_executable(DisplayGammaTests tests/display_gamma_tests.cpp)
+    target_compile_options(DisplayGammaTests PRIVATE /fp:strict)
+    target_link_libraries(DisplayGammaTests PRIVATE DarkRuntime)
+    stage_dark_xma(DisplayGammaTests)
+    add_test(NAME OriginalDisplayGammaContract COMMAND DisplayGammaTests "${CMAKE_SOURCE_DIR}/Darkness")
+    add_test(NAME OriginalDisplayGammaWarpContract COMMAND DisplayGammaTests --warp)
+    set_tests_properties(OriginalDisplayGammaContract OriginalDisplayGammaWarpContract PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+    add_executable(XexImageTests tests/xex_image_tests.cpp runtime/native/xex_image.cpp)
+    target_include_directories(XexImageTests PRIVATE "${CMAKE_SOURCE_DIR}" "${DARK_GENERATED_DIR}")
+    target_compile_definitions(XexImageTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(XexImageTests PRIVATE bcrypt)
+    add_test(NAME OriginalXexImageContract COMMAND XexImageTests "${CMAKE_SOURCE_DIR}/Darkness/default.xex")
+    add_test(NAME GameRevisionContract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_game_revisions.py")
+    add_executable(NativeMenuAssetsTests tests/native_menu_assets_tests.cpp runtime/native/native_menu_assets.cpp)
+    target_include_directories(NativeMenuAssetsTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(NativeMenuAssetsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(NativeMenuAssetsTests PRIVATE bcrypt)
+    add_test(NAME NativeMenuLocalizationContract COMMAND NativeMenuAssetsTests)
+    add_test(NAME NativeLocalizedMenuFileContract COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tests/check_localized_menu.py"
+        "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness")
+    set_tests_properties(NativeLocalizedMenuFileContract PROPERTIES TIMEOUT 40)
     add_executable(DisplaySettingsTests tests/display_settings_tests.cpp app/windows/display_settings.cpp)
     target_link_libraries(DisplaySettingsTests PRIVATE DarkRuntime comctl32)
     stage_dark_xma(DisplaySettingsTests)
     add_test(NAME DisplaySettingsContract COMMAND DisplaySettingsTests)
+    add_executable(MouseSettingsTests tests/mouse_settings_tests.cpp app/windows/mouse_settings.cpp)
+    target_include_directories(MouseSettingsTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(MouseSettingsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME MouseSettingsContract COMMAND MouseSettingsTests)
+    set_tests_properties(MouseSettingsContract PROPERTIES TIMEOUT 30)
     add_test(NAME NativeVideoMenuAssetContract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_video_menu.py")
+    add_test(NAME NativeMenuTextGeneratorContract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_native_menu_text.py")
     set_tests_properties(DisplaySettingsContract PROPERTIES TIMEOUT 30)
     add_test(NAME AOTGenerationContract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_recompile.py")
     set_tests_properties(AOTGenerationContract PROPERTIES TIMEOUT 30)
     add_test(NAME GeneratorSetupContract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_setup_generator.py")
     set_tests_properties(GeneratorSetupContract PROPERTIES TIMEOUT 60)
     add_test(NAME ReleasePackagingContract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_release.py")
+    add_test(NAME ReleaseUpdaterContract COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+        -File "${CMAKE_SOURCE_DIR}/tests/test_update_release.ps1")
+    set_tests_properties(ReleaseUpdaterContract PROPERTIES TIMEOUT 120)
+    add_test(NAME CommitUpdaterContract COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+        -File "${CMAKE_SOURCE_DIR}/tests/test_update_commits.ps1")
+    set_tests_properties(CommitUpdaterContract PROPERTIES TIMEOUT 120)
     set_tests_properties(ReleasePackagingContract PROPERTIES TIMEOUT 60)
     add_subdirectory(tests/generator)
     add_test(NAME NativeCompilationRollback COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_native_stamp.py")
     set_tests_properties(NativeCompilationRollback PROPERTIES TIMEOUT 120)
     add_test(NAME WorldFragmentContract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_world_fragment.py")
-    add_executable(WorldRenderStateTests tests/world_render_state_tests.cpp)
+    add_executable(WorldRenderStateTests tests/world_render_state_tests.cpp runtime/native/xex_image.cpp)
+    target_link_libraries(WorldRenderStateTests PRIVATE bcrypt)
     target_include_directories(WorldRenderStateTests PRIVATE "${CMAKE_SOURCE_DIR}")
     target_compile_definitions(WorldRenderStateTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    add_test(NAME WorldRenderStateContract COMMAND WorldRenderStateTests "${CMAKE_SOURCE_DIR}/Darkness/basefile.exe")
+    add_test(NAME WorldRenderStateContract COMMAND WorldRenderStateTests "${CMAKE_SOURCE_DIR}/Darkness/default.xex")
     set_tests_properties(WorldRenderStateContract PROPERTIES TIMEOUT 30)
     add_executable(WorldRendererTests tests/world_renderer_tests.cpp)
+    add_executable(TextureBudgetPolicyTests tests/texture_budget_policy_tests.cpp)
+    target_include_directories(TextureBudgetPolicyTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    add_test(NAME TextureBudgetPolicyContract COMMAND TextureBudgetPolicyTests)
     # Opt-in timings, separate from correctness tests: no machine-dependent threshold.
     add_executable(WorldGeometryBenchmark EXCLUDE_FROM_ALL tests/world_geometry_benchmark.cpp)
     target_link_libraries(WorldGeometryBenchmark PRIVATE DarkRuntime)
@@ -179,14 +362,68 @@ if(BUILD_TESTING)
     add_executable(SceneSubmissionBenchmark EXCLUDE_FROM_ALL tests/scene_submission_benchmark.cpp)
     target_link_libraries(SceneSubmissionBenchmark PRIVATE DarkRuntime)
     stage_dark_xma(SceneSubmissionBenchmark)
+    add_executable(AudioPcmBenchmark EXCLUDE_FROM_ALL tests/audio_pcm_benchmark.cpp)
+    target_link_libraries(AudioPcmBenchmark PRIVATE DarkRuntime)
+    target_compile_options(AudioPcmBenchmark PRIVATE /fp:strict)
+    stage_dark_xma(AudioPcmBenchmark)
+    add_executable(WorldVertexMetadataTests tests/world_vertex_metadata_tests.cpp)
+    target_link_libraries(WorldVertexMetadataTests PRIVATE DarkRuntime)
+    target_compile_options(WorldVertexMetadataTests PRIVATE /fp:strict)
+    stage_dark_xma(WorldVertexMetadataTests)
+    add_test(NAME WorldVertexMetadataContract COMMAND WorldVertexMetadataTests)
+    set_tests_properties(WorldVertexMetadataContract PROPERTIES TIMEOUT 30)
+    add_executable(ShaderBytecodeCacheTests tests/shader_bytecode_cache_tests.cpp)
+    target_link_libraries(ShaderBytecodeCacheTests PRIVATE DarkRuntime)
+    stage_dark_xma(ShaderBytecodeCacheTests)
+    add_test(NAME ShaderBytecodeCacheContract COMMAND ShaderBytecodeCacheTests)
+    add_test(NAME ShaderBytecodeCacheWarpContract COMMAND ShaderBytecodeCacheTests --warp)
+    # A fresh cache now prepares every authored vertex program and clipping
+    # form before exercising the first-use draw contract.
+    set_tests_properties(ShaderBytecodeCacheContract ShaderBytecodeCacheWarpContract PROPERTIES TIMEOUT 120)
+    add_executable(DisplayReuseTests tests/display_reuse_tests.cpp)
+    target_link_libraries(DisplayReuseTests PRIVATE DarkRuntime)
+    stage_dark_xma(DisplayReuseTests)
+    add_test(NAME DisplayReuseContract COMMAND DisplayReuseTests)
+    set_tests_properties(DisplayReuseContract PROPERTIES TIMEOUT 30)
+    add_executable(WorldConstantRangesTests tests/world_constant_ranges_tests.cpp)
+    target_link_libraries(WorldConstantRangesTests PRIVATE DarkRuntime)
+    target_include_directories(WorldConstantRangesTests PRIVATE "${DARK_SHADER_DIR}")
+    target_compile_options(WorldConstantRangesTests PRIVATE /fp:strict)
+    stage_dark_xma(WorldConstantRangesTests)
+    add_test(NAME WorldConstantRangesContract COMMAND WorldConstantRangesTests)
+    set_tests_properties(WorldConstantRangesContract PROPERTIES TIMEOUT 30)
+    add_executable(WorldConstantBindingTests tests/world_constant_binding_tests.cpp)
+    target_link_libraries(WorldConstantBindingTests PRIVATE DarkRuntime)
+    target_compile_options(WorldConstantBindingTests PRIVATE /fp:strict)
+    stage_dark_xma(WorldConstantBindingTests)
+    add_test(NAME WorldConstantBindingContract COMMAND WorldConstantBindingTests)
+    add_test(NAME WorldConstantBindingWarpContract COMMAND WorldConstantBindingTests --warp)
+    set_tests_properties(WorldConstantBindingContract WorldConstantBindingWarpContract PROPERTIES TIMEOUT 30)
     target_link_libraries(WorldRendererTests PRIVATE DarkRuntime)
     target_compile_options(WorldRendererTests PRIVATE /fp:strict)
     stage_dark_xma(WorldRendererTests)
     add_test(NAME WorldRendererContract COMMAND WorldRendererTests)
     add_test(NAME WorldRendererWarpContract COMMAND WorldRendererTests --warp)
+    add_test(NAME WorldTextureBudgetRecoveryContract COMMAND WorldRendererTests --texture-budget-only)
+    add_test(NAME WorldTextureBudgetRecoveryWarpContract COMMAND WorldRendererTests --warp --texture-budget-only)
+    set_tests_properties(WorldTextureBudgetRecoveryContract WorldTextureBudgetRecoveryWarpContract PROPERTIES TIMEOUT 120)
+    add_test(NAME WorldGuiFadeContract COMMAND WorldRendererTests --gui-fade-only)
+    add_test(NAME WorldGuiFadeWarpContract COMMAND WorldRendererTests --warp --gui-fade-only)
+    add_test(NAME SubtitleFontContract COMMAND WorldRendererTests --subtitle-font-only)
+    add_test(NAME SubtitleFontWarpContract COMMAND WorldRendererTests --warp --subtitle-font-only)
+    set_tests_properties(SubtitleFontContract SubtitleFontWarpContract PROPERTIES TIMEOUT 60)
+    add_test(NAME WorldBloomResolutionContract COMMAND WorldRendererTests --bloom-only)
+    add_test(NAME WorldBloomResolutionWarpContract COMMAND WorldRendererTests --warp --bloom-only)
+    set_tests_properties(WorldBloomResolutionContract WorldBloomResolutionWarpContract PROPERTIES TIMEOUT 60)
+    add_test(NAME DarknessArmBloomContract COMMAND WorldRendererTests --arm-bloom-only)
+    add_test(NAME DarknessArmBloomWarpContract COMMAND WorldRendererTests --warp --arm-bloom-only)
+    set_tests_properties(DarknessArmBloomContract DarknessArmBloomWarpContract PROPERTIES TIMEOUT 60)
     add_test(NAME WorldVertexPreparationContract COMMAND WorldRendererTests --cpu-only)
     set_tests_properties(WorldVertexPreparationContract PROPERTIES TIMEOUT 30)
-    set_tests_properties(WorldRendererContract WorldRendererWarpContract PROPERTIES TIMEOUT 60)
+    set_tests_properties(WorldGuiFadeContract WorldGuiFadeWarpContract PROPERTIES TIMEOUT 30)
+    # A template change invalidates every vertex permutation in the disk cache.
+    # Allow the expanded material suite to compile its shaders on a cold run.
+    set_tests_properties(WorldRendererContract WorldRendererWarpContract PROPERTIES TIMEOUT 120)
     add_executable(WorldTextureBindingTests tests/world_texture_binding_tests.cpp)
     target_link_libraries(WorldTextureBindingTests PRIVATE DarkRuntime)
     stage_dark_xma(WorldTextureBindingTests)
@@ -207,7 +444,7 @@ if(BUILD_TESTING)
     add_executable(DescriptorCacheTests tests/descriptor_cache_tests.cpp)
     add_executable(PresentationTests tests/presentation_tests.cpp renderer/d3d11/display_context_d3d11.cpp)
     target_include_directories(PresentationTests PRIVATE "${CMAKE_SOURCE_DIR}")
-    target_compile_definitions(PresentationTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(PresentationTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN DARK_STALL_PROFILER=0)
     target_link_libraries(PresentationTests PRIVATE d3d11 dxgi)
     add_test(NAME PresentationContract COMMAND PresentationTests)
     set_tests_properties(PresentationContract PROPERTIES TIMEOUT 30)
@@ -284,8 +521,21 @@ if(BUILD_TESTING)
     stage_dark_xma(NativeTests)
     target_link_options(NativeTests PRIVATE /DEBUG /STACK:67108864,1048576)
     add_test(NAME NativeRuntime COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness")
+    add_test(NAME NativeAchievementsContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --achievements)
+    add_test(NAME NativeScreenFadeContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --screen-fade)
+    set_tests_properties(NativeScreenFadeContract PROPERTIES TIMEOUT 60)
+    add_test(NAME NativeTitleTextLayoutContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --title-text-layout)
+    set_tests_properties(NativeTitleTextLayoutContract PROPERTIES TIMEOUT 30)
+    add_test(NAME NativeTitleTextShadowContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --title-text-shadow)
+    set_tests_properties(NativeTitleTextShadowContract PROPERTIES TIMEOUT 30)
+    add_test(NAME NativeTitleTextHeadingContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --title-text-heading)
+    set_tests_properties(NativeTitleTextHeadingContract PROPERTIES TIMEOUT 30)
+    add_test(NAME NativeSubtitleScaleContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --subtitle-scale)
+    set_tests_properties(NativeSubtitleScaleContract PROPERTIES TIMEOUT 30)
     add_test(NAME NativeTextureMipContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --texture-mip-layout)
     add_test(NAME NativeTextureUploadContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --texture-upload)
+    add_test(NAME NativeTexturePreloadContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --texture-preload)
+    set_tests_properties(NativeTexturePreloadContract PROPERTIES TIMEOUT 30)
     set_tests_properties(NativeTextureUploadContract PROPERTIES TIMEOUT 30)
     set_tests_properties(NativeTextureMipContract PROPERTIES TIMEOUT 30)
     add_test(NAME NativeFormatAbiContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --format-abi)
@@ -305,6 +555,8 @@ if(BUILD_TESTING)
     add_test(NAME SuspendResumeContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--suspend-resume")
     add_test(NAME NativeDelayContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--native-delay")
     set_tests_properties(NativeDelayContract PROPERTIES TIMEOUT 30)
+    add_test(NAME NativeSynchronizationContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--native-sync")
+    set_tests_properties(NativeSynchronizationContract PROPERTIES TIMEOUT 30)
     add_test(NAME SystemVersionContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--system-version")
     add_test(NAME XmpControlContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--xmp-control")
     add_test(NAME AudioDriverContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--audio-driver")
@@ -314,18 +566,46 @@ if(BUILD_TESTING)
     add_test(NAME KernelObjectOutputContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --object-outputs)
     set_tests_properties(KernelObjectOutputContract PROPERTIES TIMEOUT 30)
     add_test(NAME InputContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--input")
+    add_test(NAME MenuPointerGuestContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --menu-pointer)
+    add_test(NAME KeyboardMenuGuestContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --keyboard-menu)
+    add_test(NAME KeyboardMenuStatusGuestContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --keyboard-status)
+    add_executable(LanguageSettingsTests tests/language_settings_tests.cpp runtime/native/language_settings.cpp)
+    target_include_directories(LanguageSettingsTests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(LanguageSettingsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME LanguageSettingsContract COMMAND LanguageSettingsTests)
+    add_test(NAME NativeLanguageContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --language)
+    add_test(NAME NativeRevisionGlyphContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --revision-glyphs)
+    add_test(NAME DeveloperToolsContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --developer-tools)
+    set_tests_properties(DeveloperToolsContract PROPERTIES TIMEOUT 30)
+    set_tests_properties(LanguageSettingsContract NativeLanguageContract PROPERTIES TIMEOUT 30)
     add_test(NAME VideoSettingsContract COMMAND NativeTests "${CMAKE_SOURCE_DIR}/Darkness" --video-settings)
     set_tests_properties(VideoSettingsContract PROPERTIES TIMEOUT 30)
     set_tests_properties(AudioDriverContract DispatcherContract PROPERTIES TIMEOUT 60)
     add_test(NAME XmaLifecycleContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--xma-lifecycle")
-    add_test(NAME XmaBridgeContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--xma-bridge" "${CMAKE_SOURCE_DIR}/build_native/run/xma-capture-000.bin")
+    # Captures contain data from the developer's game dump and are not shipped.
+    # Fresh source builds still run the live/staged decoder and lifecycle tests.
+    set(DARK_XMA_CAPTURE "${CMAKE_SOURCE_DIR}/build_native/run/xma-capture-000.bin"
+        CACHE FILEPATH "Private captured XMA test fixture (optional)")
+    if(EXISTS "${DARK_XMA_CAPTURE}")
+        add_test(NAME XmaBridgeContract COMMAND "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--xma-bridge" "${DARK_XMA_CAPTURE}")
+    else()
+        message(STATUS "Skipping captured XMA bridge test: no private ${DARK_XMA_CAPTURE}")
+    endif()
     add_test(NAME XmaDecodeLive COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_SOURCE_DIR}/tests/check_xma_decode.py" "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--xma-submit-live")
     add_test(NAME XmaDecodeStaged COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_SOURCE_DIR}/tests/check_xma_decode.py" "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness" "--xma-submit-staged")
     add_test(NAME OriginalGameInflate COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_SOURCE_DIR}/tests/check_inflate.py" "$<TARGET_FILE:NativeTests>" "${CMAKE_SOURCE_DIR}/Darkness")
-    set(FFMPEG_SHARED_ROOT "${CMAKE_SOURCE_DIR}/build_native/deps/ffmpeg-8.1.2-full_build-shared")
+    set(FFMPEG_SHARED_ROOT "${CMAKE_SOURCE_DIR}/build_native/deps/ffmpeg-8.1.2-full_build-shared"
+        CACHE PATH "Stock FFmpeg SDK for independent captured-XMA oracle tests (optional)")
+    if(EXISTS "${DARK_XMA_CAPTURE}" AND
+       EXISTS "${FFMPEG_SHARED_ROOT}/include/libavcodec/avcodec.h" AND
+       EXISTS "${FFMPEG_SHARED_ROOT}/lib/avcodec.lib" AND
+       EXISTS "${FFMPEG_SHARED_ROOT}/lib/avutil.lib" AND
+       EXISTS "${FFMPEG_SHARED_ROOT}/bin/avcodec-62.dll" AND
+       EXISTS "${FFMPEG_SHARED_ROOT}/bin/avutil-60.dll" AND
+       EXISTS "${FFMPEG_SHARED_ROOT}/bin/swresample-6.dll")
     add_executable(XmaAdapterTests tests/xma_adapter_tests.cpp runtime/native/xma_decoder.cpp)
     target_include_directories(XmaAdapterTests PRIVATE "${CMAKE_SOURCE_DIR}" "${FFMPEG_SHARED_ROOT}/include")
     target_link_directories(XmaAdapterTests PRIVATE "${FFMPEG_SHARED_ROOT}/lib")
@@ -340,15 +620,17 @@ if(BUILD_TESTING)
         "${FFMPEG_SHARED_ROOT}/bin/avutil-60.dll" "$<TARGET_FILE_DIR:XmaAdapterTests>/avutil-60.dll"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${FFMPEG_SHARED_ROOT}/bin/swresample-6.dll" "$<TARGET_FILE_DIR:XmaAdapterTests>/swresample-6.dll")
-    add_test(NAME XmaAdapterContract COMMAND XmaAdapterTests
-        "${CMAKE_SOURCE_DIR}/build_native/run/xma-capture-000.bin")
+    add_test(NAME XmaAdapterContract COMMAND XmaAdapterTests "${DARK_XMA_CAPTURE}")
     add_executable(XmaRawTests tests/xma_raw_tests.cpp)
     target_include_directories(XmaRawTests PRIVATE "${CMAKE_SOURCE_DIR}" "${DARK_XMA_ROOT}/include")
     target_compile_definitions(XmaRawTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(XmaRawTests PRIVATE DarkXmaRaw)
     add_dependencies(XmaRawTests XmaAdapterTests)
     stage_dark_xma(XmaRawTests)
-    add_test(NAME XmaRawContract COMMAND XmaRawTests "${CMAKE_SOURCE_DIR}/build_native/run/xma-capture-000.bin")
+    add_test(NAME XmaRawContract COMMAND XmaRawTests "${DARK_XMA_CAPTURE}")
+    else()
+        message(STATUS "Skipping captured XMA oracle tests: private capture and stock FFmpeg test SDK required")
+    endif()
     add_executable(TestInputParserTests tests/test_input_parser_contract.cpp)
     target_include_directories(TestInputParserTests PRIVATE "${CMAKE_SOURCE_DIR}")
     target_compile_definitions(TestInputParserTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
@@ -356,7 +638,7 @@ if(BUILD_TESTING)
     set_tests_properties(TestInputParserContract PROPERTIES TIMEOUT 30)
     add_executable(FramePacerTests tests/frame_pacer_tests.cpp)
     target_include_directories(FramePacerTests PRIVATE "${CMAKE_SOURCE_DIR}")
-    target_compile_definitions(FramePacerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(FramePacerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS DARK_STALL_PROFILER=0)
     target_link_libraries(FramePacerTests PRIVATE winmm)
     add_test(NAME FramePacerContract COMMAND FramePacerTests)
     set_tests_properties(FramePacerContract PROPERTIES TIMEOUT 30)

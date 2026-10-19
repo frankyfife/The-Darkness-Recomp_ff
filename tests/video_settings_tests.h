@@ -2,18 +2,23 @@
 #include "runtime/native/graphics_settings.h"
 #include "runtime/native/video_settings_menu.h"
 #include "runtime/native/fov_settings.h"
+#include "runtime/native/language_settings.h"
+#include "runtime/native/native_menu_text.h"
+#include "runtime/native/input.h"
 #include <fstream>
+#include <utility>
 
 // Read through the guest's real file imports, including the startup archive.
 // A correct loose registry alone cannot affect the prefetched pause menu.
 static void testVideoMenuFiles(PPCContext& ctx) {
-    wchar_t executable[32768]{};
-    check(GetModuleFileNameW(nullptr, executable, DWORD(std::size(executable))) != 0, "test executable path missing");
-    const auto directory = std::filesystem::path(executable).parent_path();
     auto* base = memory->base();
-    for (const auto& pair : {std::pair{"game:\\Content\\Gui\\CubeWnd.xcr", L"CubeWnd.pc.xcr"},
-                             std::pair{"D:\\Content\\Xdf\\GameContext_Create.XDF", L"GameContext_Create.pc.xdf"}}) {
-        std::ifstream input(directory / pair.second, std::ios::binary);
+    const auto& assets = memory->nativeMenuAssets();
+    const auto menu = assets.menu.empty() ? memory->gameDirectory() / "Content/Gui/CubeWnd.xcr" : assets.menu;
+    const auto archive = assets.archive.empty()
+        ? memory->gameDirectory() / "Content/Xdf/GameContext_Create.XDF" : assets.archive;
+    for (const auto& pair : {std::pair{"game:\\Content\\Gui\\CubeWnd.xcr", menu},
+                             std::pair{"D:\\Content\\Xdf\\GameContext_Create.XDF", archive}}) {
+        std::ifstream input(pair.second, std::ios::binary);
         const std::vector<char> expected{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
         check(!expected.empty(), "packaged menu dependency missing");
         const auto scratch = memory->allocate(uint32_t(expected.size()) + 4096);
@@ -42,7 +47,7 @@ static void testVideoMenuFiles(PPCContext& ctx) {
         __imp__NtReadFile(call, base);
         check(call.r3.u32 == 0 && memory->read32(ios + 4) == expected.size() &&
               std::memcmp(base + data, expected.data(), expected.size()) == 0,
-              "guest read original menu bytes instead of the packaged replacement");
+              "guest read menu bytes from the wrong dump or replacement");
     }
 }
 
@@ -52,10 +57,17 @@ static void testVideoMenuFiles(PPCContext& ctx) {
 // This does not render, start the game, or use a GPU.
 static void testVideoSettings(PPCContext& ctx) {
     testVideoMenuFiles(ctx);
+    const bool russian = russianNativeMenus();
+    struct RestoreMenuLanguage {
+        bool russian;
+        ~RestoreMenuLanguage() { initializeNativeMenuText(russian, 1); }
+    } restoreMenuLanguage{russian};
+    initializeNativeMenuText(false, 1);
     initializeVideoSettingsMenu();
     check(!graphicsSettings().motionBlur, "motion blur must default to Off");
-    check(!graphicsSettings().antialiasing, "antialiasing must default to Off");
+    check(graphicsSettings().antialiasing == AntialiasingMode::Off, "antialiasing must default to Off");
     check(graphicsSettings().brightnessPercent == 100, "brightness must default to neutral");
+    check(graphicsSettings().subtitleScalePercent == 100, "subtitles must default to the original size");
     for (unsigned bits = 0; bits < 16; ++bits) {
         for (const auto name : {"XREngine_Final5", "XREngine_Final4"}) {
             check(graphicsFragmentFlags(name, bits, true) == (bits & 14), "motion blur remained enabled");
@@ -72,14 +84,23 @@ static void testVideoSettings(PPCContext& ctx) {
     for (const GraphicsSettings s : {GraphicsSettings{0,180,false,false,false,false}, GraphicsSettings{1000,720,true,true,true,true},
                                    GraphicsSettings{60,1080,true,false,false,true}, GraphicsSettings{60,1440,false,true,true,false},
                                    GraphicsSettings{1000,2160,true,true,true,true}})
-        for (bool aa : {false, true}) {
+        for (const auto aa : {AntialiasingMode::Off, AntialiasingMode::FXAA, AntialiasingMode::SMAA,
+                              AntialiasingMode::MSAA2x, AntialiasingMode::MSAA4x, AntialiasingMode::MSAA8x}) {
             auto selected = s; selected.antialiasing = aa;
-            for (unsigned gamma : {50u, 95u, 100u, 150u}) for (unsigned brightness : {50u, 95u, 100u, 200u}) {
-                selected.gammaPercent = gamma;
-                selected.brightnessPercent = brightness;
-                check(setGraphicsSettings(selected) && graphicsSettings() == selected, "graphics packing boundary corrupted another setting");
-            }
+            for (unsigned brightness : {50u, 95u, 100u, 200u})
+                for (unsigned anisotropy : {1u, 2u, 4u, 8u, 16u})
+                    for (unsigned scale : {50u, 73u, 90u, 100u, 137u, 150u, 200u}) {
+                        selected.brightnessPercent = brightness;
+                        selected.anisotropyLevels = anisotropy;
+                        selected.subtitleScalePercent = scale;
+                        check(setGraphicsSettings(selected) && graphicsSettings() == selected,
+                              "graphics packing boundary corrupted antialiasing, brightness, filtering or subtitle size");
+                    }
         }
+    for (const auto [mode, samples] : {std::pair{AntialiasingMode::Off, 1u}, {AntialiasingMode::FXAA, 1u},
+                                      {AntialiasingMode::SMAA, 1u}, {AntialiasingMode::MSAA2x, 2u},
+                                      {AntialiasingMode::MSAA4x, 4u}, {AntialiasingMode::MSAA8x, 8u}})
+        check(antialiasingSampleCount(mode) == samples, "antialiasing mode has the wrong world sample count");
     setGraphicsSettings({1000,720,true,true,true,true});
     auto invalid = graphicsSettings(); invalid.frameRateLimit = 1001;
     check(!setGraphicsSettings(invalid) && graphicsSettings().frameRateLimit == 1000, "invalid cap changed settings");
@@ -87,21 +108,23 @@ static void testVideoSettings(PPCContext& ctx) {
     check(!setGraphicsSettings(invalid) && graphicsSettings().renderHeight == 720, "invalid height changed settings");
     invalid.renderHeight = 2161;
     check(!setGraphicsSettings(invalid) && graphicsSettings().renderHeight == 720, "oversized height changed settings");
-    for (unsigned gamma : {0u,49u,151u,~0u}) {
-        invalid = graphicsSettings(); invalid.gammaPercent = gamma;
-        const auto saved = graphicsSettings();
-        check(!setGraphicsSettings(invalid) && graphicsSettings() == saved, "invalid gamma changed settings");
-    }
     for (unsigned brightness : {0u,49u,201u,~0u}) {
         invalid = graphicsSettings(); invalid.brightnessPercent = brightness;
         const auto saved = graphicsSettings();
         check(!setGraphicsSettings(invalid) && graphicsSettings() == saved, "invalid brightness changed settings");
     }
+    for (unsigned mode : {6u, 7u, 255u}) {
+        invalid = graphicsSettings(); invalid.antialiasing = AntialiasingMode(mode);
+        const auto saved = graphicsSettings();
+        check(!setGraphicsSettings(invalid) && graphicsSettings() == saved, "invalid antialiasing mode changed settings");
+    }
     setGraphicsSettings({});
 
     const uint32_t block = memory->allocate(0x10000);
     check(block != 0, "menu fixture allocation failed");
-    struct Cleanup { uint32_t block; ~Cleanup() { setGraphicsSettings({}); setFieldOfViewSetting(0); memory->release(block); } } cleanup{block};
+    struct Cleanup { uint32_t block; GameLanguage language; ~Cleanup() {
+        setGraphicsSettings({}); setFieldOfViewSetting(0); setGameLanguageSetting(language); memory->release(block);
+    } } cleanup{block, gameLanguageSetting()};
     auto* base = memory->base();
     std::memset(base + block, 0, 0x10000);
     const uint32_t button = block, parent = block + 0x1000, message = block + 0x2000;
@@ -170,14 +193,82 @@ static void testVideoSettings(PPCContext& ctx) {
     takeDisplaySettingsSaveRequest();
     key(227);
     check(graphicsSettings().motionBlur && graphicsSettings().bloom && takeDisplaySettingsSaveRequest() &&
-          videoSettingLabel("darkrecomp.motionblur").find("On") != std::string::npos,
+          videoSettingLabel("darkrecomp.motionblur").find("ON") != std::string::npos,
           "native Motion Blur row did not enable/persist independently of bloom");
     key(227 | 0x8000);
     check(graphicsSettings().motionBlur && !takeDisplaySettingsSaveRequest(), "key release toggled motion blur twice");
     key(226);
     check(!graphicsSettings().motionBlur && takeDisplaySettingsSaveRequest() &&
-          videoSettingLabel("darkrecomp.motionblur").find("Off") != std::string::npos,
+          videoSettingLabel("darkrecomp.motionblur").find("OFF") != std::string::npos,
           "native Motion Blur row did not disable/persist");
+    // The Controls menu uses the same original value-button callbacks.
+    auto& mouseInput = nativeInput();
+    const float previousMouseSensitivity = mouseInput.mouseSensitivity();
+    const auto beforeMouseGraphics = graphicsSettings();
+    const auto beforeMouseFov = fieldOfViewSetting();
+    check(mouseInput.setMouseSensitivity(1), "seed mouse sensitivity menu fixture");
+    string(block + 0x3800, "darkrecomp.mouse_sensitivity");
+    call = ctx; call.r3.u64 = button; call.r4.u64 = block + 0x3200;
+    call.r5.u64 = block + 0x3000; call.r6.u64 = block + 0x3800;
+    sub_8239F0E0(call, base);
+    takeMouseSensitivitySaveRequest();
+    takeDisplaySettingsSaveRequest();
+    key(227);
+    check(mouseInput.mouseSensitivity() == 1.1f && takeMouseSensitivitySaveRequest() &&
+          videoSettingLabel("darkrecomp.mouse_sensitivity").find("1.1X") != std::string::npos,
+          "Right did not adjust mouse sensitivity or request persistence");
+    key(227 | 0x8000);
+    check(mouseInput.mouseSensitivity() == 1.1f && !takeMouseSensitivitySaveRequest(),
+          "release changed mouse sensitivity twice");
+    key(226);
+    check(mouseInput.mouseSensitivity() == 1 && takeMouseSensitivitySaveRequest(),
+          "Left did not decrease mouse sensitivity");
+    key(228);
+    check(mouseInput.mouseSensitivity() == 1.1f && takeMouseSensitivitySaveRequest(),
+          "Confirm did not adjust mouse sensitivity");
+    call = ctx; call.r3.u64 = button;
+    sub_823981D8(call, base);
+    check(mouseInput.mouseSensitivity() == 1.2f && call.r3.u32 == 1 && takeMouseSensitivitySaveRequest(),
+          "mouse pressed callback did not adjust mouse sensitivity");
+    mouseInput.setMouseSensitivity(std::nextafter(10.f, 0.f));
+    key(227);
+    check(mouseInput.mouseSensitivity() == 10 && takeMouseSensitivitySaveRequest(),
+          "mouse step skipped the maximum");
+    key(227);
+    check(mouseInput.mouseSensitivity() == 10 && !takeMouseSensitivitySaveRequest(),
+          "maximum mouse sensitivity changed or requested a redundant save");
+    key(226);
+    check(mouseInput.mouseSensitivity() == 9.9f && takeMouseSensitivitySaveRequest(), "fine mouse step failed");
+    mouseInput.setMouseSensitivity(0.1f);
+    key(226);
+    check(mouseInput.mouseSensitivity() == 0.1f && !takeMouseSensitivitySaveRequest(),
+          "minimum mouse sensitivity wrapped or requested a redundant save");
+    mouseInput.setMouseSensitivity(10);
+    key(227);
+    check(mouseInput.mouseSensitivity() == 10 && !takeMouseSensitivitySaveRequest(),
+          "maximum mouse sensitivity wrapped or requested a redundant save");
+    check(!changeVideoSetting("darkrecomp.mouse_sensitivity", 0) &&
+          !changeVideoSetting("darkrecomp.mouse_sensitivity", 2) && mouseInput.mouseSensitivity() == 10 &&
+          !takeMouseSensitivitySaveRequest(), "invalid direction changed or persisted mouse sensitivity");
+    reportMouseSensitivitySave(false);
+    const auto failedMouseLabel = videoSettingLabel("darkrecomp.mouse_sensitivity");
+    check(failedMouseLabel.find("SAVE FAILED") != std::string::npos && failedMouseLabel.size() - 4 == 16,
+          "mouse save failure is invisible or changes value-button width");
+    initializeNativeMenuText(true, 1);
+    const auto russianFailedMouseLabel = videoSettingLabel("darkrecomp.mouse_sensitivity");
+    check(russianFailedMouseLabel != failedMouseLabel &&
+          russianFailedMouseLabel.find(nativeMenuText("SAVE FAILED")) != std::string::npos &&
+          russianFailedMouseLabel.size() - 4 == 16,
+          "Russian mouse save failure is untranslated or changes value-button width");
+    reportMouseSensitivitySave(true);
+    check(videoSettingLabel("darkrecomp.mouse_sensitivity").find("10X") != std::string::npos,
+          "Russian menu changed the numeric mouse multiplier");
+    initializeNativeMenuText(false, 1);
+    const auto mouseLabel = videoSettingLabel("darkrecomp.mouse_sensitivity");
+    check(mouseLabel.find("10X") != std::string::npos && mouseLabel.size() - 4 == 16 &&
+          graphicsSettings() == beforeMouseGraphics && fieldOfViewSetting() == beforeMouseFov &&
+          !takeDisplaySettingsSaveRequest(), "mouse setting altered graphics preferences or value-button width");
+    mouseInput.setMouseSensitivity(previousMouseSensitivity);
     string(block + 0x3500, "darkrecomp.antialiasing");
     call = ctx;
     call.r3.u64 = button; call.r4.u64 = block + 0x3200;
@@ -185,43 +276,57 @@ static void testVideoSettings(PPCContext& ctx) {
     sub_8239F0E0(call, base);
     const auto beforeAA = graphicsSettings();
     takeDisplaySettingsSaveRequest();
-    key(227);
-    auto expectedAA = beforeAA; expectedAA.antialiasing = true;
-    check(graphicsSettings() == expectedAA && takeDisplaySettingsSaveRequest() &&
-          videoSettingLabel("darkrecomp.antialiasing").find("FXAA") != std::string::npos,
-          "native antialiasing row did not enable/persist FXAA independently");
-    key(227 | 0x8000);
-    check(graphicsSettings() == expectedAA && !takeDisplaySettingsSaveRequest(), "release toggled antialiasing twice");
-    key(226);
-    check(graphicsSettings() == beforeAA && takeDisplaySettingsSaveRequest() &&
-          videoSettingLabel("darkrecomp.antialiasing").find("Off") != std::string::npos,
-          "native antialiasing row did not disable/persist FXAA");
+    check(!changeVideoSetting("darkrecomp.antialiasing", 0) &&
+          !changeVideoSetting("darkrecomp.antialiasing", 2) && graphicsSettings() == beforeAA &&
+          !takeDisplaySettingsSaveRequest(), "invalid antialiasing direction changed or persisted settings");
+    auto expectedAA = beforeAA;
+    const auto checkAALabel = [&](const char* label) {
+        check(videoSettingLabel("darkrecomp.antialiasing").find(label) != std::string::npos,
+              "native antialiasing label does not match its selected mode");
+    };
+    for (const auto [mode, label] : {std::pair{AntialiasingMode::FXAA, "FXAA"}, {AntialiasingMode::SMAA, "SMAA"},
+                                    {AntialiasingMode::MSAA2x, "MSAA 2X"}, {AntialiasingMode::MSAA4x, "MSAA 4X"},
+                                    {AntialiasingMode::MSAA8x, "MSAA 8X"}, {AntialiasingMode::Off, "OFF"}}) {
+        key(227);
+        expectedAA.antialiasing = mode;
+        check(graphicsSettings() == expectedAA && takeDisplaySettingsSaveRequest(),
+              "Right skipped an antialiasing mode, failed to wrap or changed another setting");
+        checkAALabel(label);
+        key(227 | 0x8000); key(227 | 0x8000);
+        check(graphicsSettings() == expectedAA && !takeDisplaySettingsSaveRequest(),
+              "repeated release messages advanced antialiasing again");
+    }
+    for (const auto [mode, label] : {std::pair{AntialiasingMode::MSAA8x, "MSAA 8X"}, {AntialiasingMode::MSAA4x, "MSAA 4X"},
+                                    {AntialiasingMode::MSAA2x, "MSAA 2X"}, {AntialiasingMode::SMAA, "SMAA"},
+                                    {AntialiasingMode::FXAA, "FXAA"}, {AntialiasingMode::Off, "OFF"}}) {
+        key(226);
+        expectedAA.antialiasing = mode;
+        check(graphicsSettings() == expectedAA && takeDisplaySettingsSaveRequest(),
+              "Left skipped an antialiasing mode, failed to wrap or changed another setting");
+        checkAALabel(label);
+        key(226 | 0x8000);
+        check(graphicsSettings() == expectedAA && !takeDisplaySettingsSaveRequest(),
+              "Left release advanced antialiasing again");
+    }
     key(228);
-    check(graphicsSettings() == expectedAA, "Confirm did not enable FXAA");
+    expectedAA.antialiasing = AntialiasingMode::FXAA;
+    check(graphicsSettings() == expectedAA && takeDisplaySettingsSaveRequest(), "Confirm did not advance to FXAA");
+    key(228 | 0x8000);
+    check(graphicsSettings() == expectedAA && !takeDisplaySettingsSaveRequest(), "Confirm release advanced antialiasing again");
     call = ctx; call.r3.u64 = button; call.r4.u64 = message;
     sub_823981D8(call, base);
-    check(graphicsSettings() == beforeAA, "mouse/pressed callback did not disable FXAA");
+    expectedAA.antialiasing = AntialiasingMode::SMAA;
+    check(graphicsSettings() == expectedAA && takeDisplaySettingsSaveRequest(), "mouse/pressed callback did not advance to SMAA");
+    memory->write32(button + 84, 0);
+    key(227);
+    check(graphicsSettings() == expectedAA && !takeDisplaySettingsSaveRequest(), "inactive row advanced antialiasing");
+    memory->write32(button + 84, 1);
+    setGraphicsSettings(beforeAA);
     const auto before = graphicsSettings();
     while(takeDisplaySettingsSaveRequest()) {}
-    string(block + 0x3600, "darkrecomp.gamma");
-    call = ctx;
-    call.r3.u64 = button; call.r4.u64 = block + 0x3200;
-    call.r5.u64 = block + 0x3000; call.r6.u64 = block + 0x3600;
-    sub_8239F0E0(call, base);
-    key(226);
-    auto darker = before; darker.gammaPercent = 95;
-    check(graphicsSettings() == darker && takeDisplaySettingsSaveRequest() &&
-          videoSettingLabel("darkrecomp.gamma").find("0.95") != std::string::npos,
-          "gamma row did not darken independently through original input dispatch");
-    key(227 | 0x8000);
-    check(graphicsSettings() == darker && !takeDisplaySettingsSaveRequest(), "gamma changed on key release");
-    key(227);
-    check(graphicsSettings() == before && takeDisplaySettingsSaveRequest(), "gamma did not return to neutral");
-    for (int i=0;i<32;++i) changeVideoSetting("darkrecomp.gamma",-1);
-    check(graphicsSettings().gammaPercent==50,"gamma lower bound wrapped to a brighter value");
-    for (int i=0;i<32;++i) changeVideoSetting("darkrecomp.gamma",1);
-    check(graphicsSettings().gammaPercent==150,"gamma upper bound wrapped to a darker value");
-    setGraphicsSettings(before);
+    check(!changeVideoSetting("darkrecomp.gamma", -1) && !changeVideoSetting("darkrecomp.gamma", 1) &&
+          videoSettingLabel("darkrecomp.gamma").empty() && graphicsSettings() == before &&
+          !takeDisplaySettingsSaveRequest(), "retired native gamma action changed settings or requested persistence");
     string(block + 0x3700, "darkrecomp.brightness");
     call = ctx;
     call.r3.u64 = button; call.r4.u64 = block + 0x3200;
@@ -249,6 +354,100 @@ static void testVideoSettings(PPCContext& ctx) {
     for (int i=0;i<40;++i) changeVideoSetting("darkrecomp.brightness",1);
     check(graphicsSettings().brightnessPercent==200,"brightness upper bound wrapped");
     setGraphicsSettings(before);
+    // Subtitle size uses the same original button input path and persists live.
+    string(block + 0x3900, "darkrecomp.subtitle_scale");
+    call = ctx;
+    call.r3.u64 = button; call.r4.u64 = block + 0x3200;
+    call.r5.u64 = block + 0x3000; call.r6.u64 = block + 0x3900;
+    sub_8239F0E0(call, base);
+    while (takeDisplaySettingsSaveRequest()) {}
+    key(227);
+    auto largerSubtitles = before; largerSubtitles.subtitleScalePercent = 110;
+    check(graphicsSettings() == largerSubtitles && takeDisplaySettingsSaveRequest() &&
+          videoSettingLabel("darkrecomp.subtitle_scale").find("110%") != std::string::npos,
+          "Right did not enlarge subtitles independently or request persistence");
+    key(227 | 0x8000);
+    check(graphicsSettings() == largerSubtitles && !takeDisplaySettingsSaveRequest(),
+          "key release changed subtitle size twice");
+    key(226);
+    check(graphicsSettings() == before && takeDisplaySettingsSaveRequest(), "Left did not restore original subtitle size");
+    key(226);
+    auto smallerSubtitles = before; smallerSubtitles.subtitleScalePercent = 90;
+    check(graphicsSettings() == smallerSubtitles && takeDisplaySettingsSaveRequest() &&
+          videoSettingLabel("darkrecomp.subtitle_scale").find("90%") != std::string::npos,
+          "Left did not shrink subtitles independently or request persistence");
+    key(227);
+    check(graphicsSettings() == before && takeDisplaySettingsSaveRequest(), "Right did not restore original subtitle size");
+    key(228);
+    check(graphicsSettings() == largerSubtitles && takeDisplaySettingsSaveRequest(), "Confirm did not enlarge subtitles");
+    call = ctx; call.r3.u64 = button;
+    sub_823981D8(call, base);
+    largerSubtitles.subtitleScalePercent = 120;
+    check(graphicsSettings() == largerSubtitles && call.r3.u32 == 1 && takeDisplaySettingsSaveRequest(),
+          "pressed callback did not enlarge subtitles");
+    memory->write32(button + 84, 0);
+    key(227);
+    check(graphicsSettings() == largerSubtitles && !takeDisplaySettingsSaveRequest(),
+          "inactive subtitle size row consumed input");
+    memory->write32(button + 84, 1);
+    for (int i = 0; i < 30; ++i) changeVideoSetting("darkrecomp.subtitle_scale", -1);
+    check(graphicsSettings().subtitleScalePercent == 50, "subtitle size lower bound wrapped");
+    for (int i = 0; i < 30; ++i) changeVideoSetting("darkrecomp.subtitle_scale", 1);
+    check(graphicsSettings().subtitleScalePercent == 200, "subtitle size upper bound wrapped");
+    while (takeDisplaySettingsSaveRequest()) {}
+    check(!changeVideoSetting("darkrecomp.subtitle_scale", 0) && !changeVideoSetting("darkrecomp.subtitle_scale", 2) &&
+          graphicsSettings().subtitleScalePercent == 200 && !takeDisplaySettingsSaveRequest(),
+          "invalid direction changed or persisted subtitle size");
+    auto customSubtitles = before; customSubtitles.subtitleScalePercent = 137;
+    setGraphicsSettings(customSubtitles);
+    check(videoSettingLabel("darkrecomp.subtitle_scale").find("137%") != std::string::npos,
+          "subtitle row rounded an untouched saved percentage");
+    changeVideoSetting("darkrecomp.subtitle_scale", 1);
+    check(graphicsSettings().subtitleScalePercent == 147, "subtitle row discarded a custom saved percentage");
+    setGraphicsSettings(before);
+    // Select the language through the original CubeButton property parser,
+    // directional messages, Confirm dispatch and pressed callback. Preference
+    // changes must request persistence without changing any graphics setting.
+    string(block + 0x3800, "darkrecomp.language");
+    call = ctx;
+    call.r3.u64 = button; call.r4.u64 = block + 0x3200;
+    call.r5.u64 = block + 0x3000; call.r6.u64 = block + 0x3800;
+    sub_8239F0E0(call, base);
+    setGameLanguageSetting(GameLanguage::System);
+    while (takeDisplaySettingsSaveRequest()) {}
+    for (const auto language : {GameLanguage::English, GameLanguage::German, GameLanguage::French,
+                               GameLanguage::Spanish, GameLanguage::Italian, GameLanguage::System}) {
+        key(227);
+        check(gameLanguageSetting() == language && graphicsSettings() == before && takeDisplaySettingsSaveRequest(),
+              "language row skipped a supported language, failed to wrap or changed graphics settings");
+        const auto display = language == GameLanguage::System ? std::wstring_view(L"System") : gameLanguageDisplayName(language);
+        std::string expectedLanguage(display.begin(), display.end());
+        for (char& glyph : expectedLanguage)
+            if (glyph >= 'a' && glyph <= 'z') glyph = char(glyph - 'a' + 'A');
+        check(videoSettingLabel("darkrecomp.language").find(expectedLanguage) != std::string::npos,
+              "language row label differs from the selected preference");
+        key(227 | 0x8000);
+        check(gameLanguageSetting() == language && !takeDisplaySettingsSaveRequest(),
+              "language release event changed or saved the selection twice");
+    }
+    key(226);
+    check(gameLanguageSetting() == GameLanguage::Italian && takeDisplaySettingsSaveRequest(),
+          "Left did not wrap System language to Italian");
+    key(228);
+    check(gameLanguageSetting() == GameLanguage::System && takeDisplaySettingsSaveRequest(),
+          "original Confirm did not cycle the language preference");
+    call = ctx; call.r3.u64 = button; call.r4.u64 = message;
+    sub_823981D8(call, base);
+    check(gameLanguageSetting() == GameLanguage::English && call.r3.u32 == 1 && takeDisplaySettingsSaveRequest(),
+          "mouse/pressed callback did not change and save language");
+    memory->write32(button + 84, 0);
+    key(227);
+    check(gameLanguageSetting() == GameLanguage::English && !takeDisplaySettingsSaveRequest(),
+          "inactive language row consumed directional input");
+    memory->write32(button + 84, 1);
+    check(!changeVideoSetting("darkrecomp.language", 0) && gameLanguageSetting() == GameLanguage::English &&
+          !takeDisplaySettingsSaveRequest() && graphicsSettings() == before,
+          "invalid language direction changed settings");
     check(!changeVideoSetting("cg_prevmenu()", 1) && graphicsSettings() == before,
           "non-PC script was consumed by native settings");
     for (const auto action : {"darkrecomp.vsync", "darkrecomp.mode", "darkrecomp.fps", "darkrecomp.resolution"}) {
@@ -260,7 +459,7 @@ static void testVideoSettings(PPCContext& ctx) {
     for (const auto height : {480u,720u,1080u,1440u,2160u,360u}) {
         changeVideoSetting("darkrecomp.resolution", 1);
         check(graphicsSettings().renderHeight == height, "resolution menu skipped a supported setting or failed to wrap");
-        check(videoSettingLabel("darkrecomp.resolution").find(std::to_string(height) + "p") != std::string::npos,
+        check(videoSettingLabel("darkrecomp.resolution").find(std::to_string(height) + "P") != std::string::npos,
               "resolution label does not match the selected height");
     }
     setFieldOfViewSetting(114.25f);
@@ -273,12 +472,12 @@ static void testVideoSettings(PPCContext& ctx) {
     changeVideoSetting("darkrecomp.fov", -1);
     check(fieldOfViewSetting() == 120, "FOV wrap failed");
     reportDisplaySettingsSave(false);
-    check(videoSettingLabel("darkrecomp.bloom").find("Save failed") != std::string::npos, "save failure is invisible in menu");
+    check(videoSettingLabel("darkrecomp.bloom").find("SAVE FAILED") != std::string::npos, "save failure is invisible in menu");
     reportDisplaySettingsSave(true);
     // The engine gives small text two glyphs per cell. Dynamic values must
     // fit the authored eight-cell column without a font change or word wrap.
     for (const auto action : {"darkrecomp.fov", "darkrecomp.bloom", "darkrecomp.vsync",
-                              "darkrecomp.fps", "darkrecomp.resolution", "darkrecomp.mode", "darkrecomp.motionblur", "darkrecomp.antialiasing", "darkrecomp.gamma", "darkrecomp.brightness"}) {
+                              "darkrecomp.fps", "darkrecomp.resolution", "darkrecomp.mode", "darkrecomp.motionblur", "darkrecomp.antialiasing", "darkrecomp.brightness", "darkrecomp.language", "darkrecomp.subtitle_scale"}) {
         for (int i = 0; i < 128; ++i) {
             for (bool saved : {true, false}) {
                 reportDisplaySettingsSave(saved);
@@ -290,5 +489,42 @@ static void testVideoSettings(PPCContext& ctx) {
         }
     }
     reportDisplaySettingsSave(true);
-    std::puts("Native video settings: shader flags, safe resolution, original button constructor/property/input ABI, all choices and save requests passed; no rendering performed.");
+    setGraphicsSettings(before);
+    check(graphicsSettings().anisotropyLevels == 16, "texture filtering must default to 16x");
+    for (unsigned level : {8u, 4u, 2u, 1u, 16u}) {
+        check(changeVideoSetting("darkrecomp.anisotropy", -1) && graphicsSettings().anisotropyLevels == level &&
+              takeDisplaySettingsSaveRequest(), "texture filtering did not step/wrap and request persistence");
+        check(videoSettingLabel("darkrecomp.anisotropy").find(level == 1 ? "ORIGINAL" : std::to_string(level) + "X") !=
+              std::string::npos, "filtering row label does not match selected level");
+    }
+    while (takeDisplaySettingsSaveRequest()) {}
+    check(!activateNativeMenuAction("unknown") && !takeExitGameRequest(),
+          "unknown action queued host work");
+    for (const auto action : {"darkrecomp.exit"}) {
+        string(block + 0x3900, action);
+        call = ctx; call.r3.u64 = button; call.r4.u64 = block + 0x3200;
+        call.r5.u64 = block + 0x3000; call.r6.u64 = block + 0x3900;
+        sub_8239F0E0(call, base);
+        key(226); key(227);
+        check(!takeExitGameRequest(), "directional input activated host action");
+        key(228);
+        check(takeExitGameRequest(), "Confirm did not queue host action");
+        key(228 | 0x8000);
+        check(!takeExitGameRequest(), "release queued duplicate host action");
+        call = ctx; call.r3.u64 = button;
+        sub_823981D8(call, base);
+        check(call.r3.u32 == 1 && takeExitGameRequest(),
+              "pressed callback did not queue host action");
+        check(!takeExitGameRequest() && !takeDisplaySettingsSaveRequest(),
+              "host action consumed more than once or requested display save");
+    }
+    initializeNativeMenuText(true, 1);
+    check(videoSettingLabel("darkrecomp.fov").size() == 20 &&
+          videoSettingLabel("darkrecomp.mode").size() == 20,
+          "Russian values changed the original button hit width");
+    reportDisplaySettingsSave(false);
+    check(videoSettingLabel("darkrecomp.bloom").find("\xce\xd8\xc8\xc1\xca\xc0") != std::string::npos,
+          "Russian save failure remained in English");
+    reportDisplaySettingsSave(true);
+    std::puts("Native video settings: shader flags, resolution, original button ABI, filtering, host actions, Russian labels and persistence passed; no rendering performed.");
 }

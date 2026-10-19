@@ -16,12 +16,16 @@ using Microsoft::WRL::ComPtr;
 static void require(bool ok,const char* what) {if(!ok)throw std::runtime_error(what);}
 static void check(HRESULT hr,const char* what) {require(SUCCEEDED(hr),what);}
 #include "world_sampler_cache_tests.h"
+#include "world_anisotropy_tests.h"
 using Result=std::array<float,40>;
 static void put(uint8_t* p,uint32_t x) {for(unsigned i=0;i<4;++i)p[i]=uint8_t(x>>(24-i*8));}
+#include "world_anisotropy_visual_tests.h"
 #include "darkness_vision_tests.h"
+#include "otherworld_tests.h"
 #include "world_palette_usage_tests.h"
 #include "world_shadow_input_tests.h"
 #include "world_position_usage_tests.h"
+#include "world_water_usage_tests.h"
 #include "world_vertex_validation_tests.h"
 static void formats() {
     StoredGeometry g;g.vertexCount=1;g.stride=12;g.formats[0]=15;g.formats[1]=10;g.formats[9]=14;
@@ -210,19 +214,51 @@ static void constantTexgen(WorldDraw& draw,unsigned stage,EngineVector value) {
     for(unsigned row=0;row<4;++row)draw.constants.vectors[base+row]={0,0,0,value[row]};
 }
 static void constantCopyContract() {
-    auto b=fixture(8,false);WorldVertexOptions options;WorldVertexConstants constants;
-    const auto vector=b.descriptor.palette;
-    for(auto bits:{0u,0x80000000u,1u,0x80000001u,0x7F7FFFFFu,0xFF7FFFFFu}) {
-        put(b.constantBytes.data()+vector*16+8,bits);
-        require(prepareWorldVertexProgram(b,options,constants) && std::bit_cast<uint32_t>(constants.vectors[vector][2])==bits,
-                "Native constant copy changed finite endian/float bits");
-    }
-    for(auto bits:{0x7F800000u,0xFF800000u,0x7FC00000u,0xFFFFFFFFu}) {
-        const auto savedOptions=options;const auto savedConstants=constants;
-        put(b.constantBytes.data()+vector*16+8,bits);
-        require(!prepareWorldVertexProgram(b,options,constants),"Native vertex constants accepted infinity or NaN");
-        require(options==savedOptions && constants.vectors==savedConstants.vectors && constants.references==savedConstants.references,
-                "Rejected vertex preparation changed published constants");
+    auto baseline=fixture(8,false);
+    // Mode10 supplies a three-vector range, alongside the projection's four,
+    // offset/scale pair, color row and full 156-vector palette.
+    baseline.descriptor.modes[1]=10;
+    baseline.descriptor.parameters[1][0]=32;
+    const auto descriptor=encodeEngineVertexDescriptor(baseline.descriptor);
+    baseline.key={};
+    for(unsigned i=0;i<5;++i)for(unsigned n=0;n<4;++n)
+        baseline.key[i+1]=(baseline.key[i+1]<<8)|descriptor[i*4+n];
+    WorldVertexOptions options;WorldVertexConstants constants;
+    constexpr std::array finiteBits{0u,0x80000000u,1u,0x80000001u,0x7F7FFFFFu,0xFF7FFFFFu};
+    const std::array ranges{std::pair{0u,4u},std::pair{32u,3u},std::pair{7u,2u},
+        std::pair{unsigned(baseline.descriptor.color),1u},std::pair{unsigned(baseline.descriptor.palette),156u}};
+    for(const auto [first,count]:ranges) {
+        // Rotate finite patterns through every lane, including signed zero,
+        // signed subnormals and the largest finite positive/negative floats.
+        for(unsigned pattern=0;pattern<finiteBits.size();++pattern) {
+            auto b=baseline;
+            for(unsigned vector=0;vector<count;++vector)for(unsigned lane=0;lane<4;++lane)
+                put(b.constantBytes.data()+(first+vector)*16+lane*4,
+                    finiteBits[(vector*4+lane+pattern)%finiteBits.size()]);
+            require(prepareWorldVertexProgram(b,options,constants),"Native finite constant range rejected");
+            for(unsigned vector=0;vector<count;++vector)for(unsigned lane=0;lane<4;++lane)
+                require(std::bit_cast<uint32_t>(constants.vectors[first+vector][lane])==
+                            finiteBits[(vector*4+lane+pattern)%finiteBits.size()],
+                        "Native constant copy changed finite endian/float bits");
+        }
+        auto rejectAt=[&](unsigned vector) {
+            for(unsigned lane=0;lane<4;++lane)
+                for(auto bits:{0x7F800000u,0xFF800000u,0x7FC00000u,0x7F800001u,0xFFFFFFFFu}) {
+                    auto b=baseline;
+                    put(b.constantBytes.data()+(first+vector)*16+lane*4,bits);
+                    const auto savedOptions=options;const auto savedConstants=constants;
+                    require(!prepareWorldVertexProgram(b,options,constants),"Native vertex constants accepted infinity or NaN");
+                    require(options==savedOptions &&
+                            !std::memcmp(constants.vectors.data(),savedConstants.vectors.data(),sizeof(constants.vectors)) &&
+                            constants.references==savedConstants.references,
+                            "Rejected vertex preparation changed published constants");
+                }
+        };
+        if(count==156) {
+            // First, middle and final vectors; each position inside a batch
+            // and the boundary between adjacent batches must reject poison.
+            for(unsigned vector:{0u,1u,3u,4u,78u,152u,153u,154u,155u})rejectAt(vector);
+        } else for(unsigned vector=0;vector<count;++vector)rejectAt(vector);
     }
 }
 // Independent analytic oracle for diagonal affine palette matrices. Each bone
@@ -365,17 +401,17 @@ static void partialClears(WorldRendererD3D11& renderer,ID3D11DeviceContext* cont
     require(query->result->samples.load()==3*1152,"Clear helper geometry contaminated exposure queries or lost a resumed segment");
     std::puts("Rectangular clears passed: all7 color/depth/stencil masks,35 clipped/empty/full regions, HDR pixels, retained borders, and resumed GPU queries.");
 }
-static void retainedDepthGrowth(WorldRendererD3D11& renderer) {
+static void retainedDepthGrowth(WorldRendererD3D11& renderer,uint32_t identity=701) {
     // An atlas first visits its left tile, then a tile extending the retained
     // allocation. Earlier depth and every stencil bit must survive the growth.
-    WorldClear base;base.targets={0,0,0,0,701};base.viewport={0,0,64,32};base.flags=48;
+    WorldClear base;base.targets={0,0,0,0,identity};base.viewport={0,0,64,32};base.flags=48;
     base.depth=.25f;base.stencil=0x35;renderer.clear(base);
     auto patch=base;patch.rectangle=std::array<int32_t,4>{4,7,20,23};patch.depth=.75f;patch.stencil=0xCA;
-    renderer.clear(patch);const auto before=renderer.readSurface(701,true);
+    renderer.clear(patch);const auto before=renderer.readSurface(identity,true);
     require(before.size()==64*32*4,"Depth growth fixture extent");
     auto next=base;next.viewport={64,0,32,64};next.rectangle=std::array<int32_t,4>{64,0,96,64};
     next.depth=.5f;next.stencil=0x96;renderer.clear(next);
-    const auto after=renderer.readSurface(701,true);
+    const auto after=renderer.readSurface(identity,true);
     require(after.size()==96*64*4,"Depth growth did not retain the new atlas extent");
     for(unsigned y=0;y<64;++y)for(unsigned x=0;x<96;++x) {
         uint32_t actual=0;std::memcpy(&actual,after.data()+(y*96+x)*4,4);
@@ -391,11 +427,10 @@ static void retainedDepthGrowth(WorldRendererD3D11& renderer) {
         } else require(actual==0,"Depth growth left uninitialized pixels outside the old atlas and new tile");
     }
 }
-static void retainedAttachmentPair(WorldRendererD3D11& renderer,ID3D11DeviceContext* context,const WorldDraw& queryDraw) {
+static void retainedAttachmentPair(WorldRendererD3D11& renderer,ID3D11DeviceContext* context,const WorldDraw& queryDraw,uint32_t identity=711) {
     // Exercise larger depth, larger color, and crossed width/height histories.
     // All must retain the union without discarding either attachment's pixels.
     const std::array<std::array<uint32_t,4>,3> extents{{{64,64,96,80},{96,80,64,64},{96,64,64,80}}};
-    uint32_t identity=711;
     for(const auto& e:extents) {
         const uint32_t colorId=identity++,depthId=identity++;
         WorldClear color;color.targets={colorId,0,0,0,0};color.viewport={0,0,e[0],e[1]};color.flags=1;
@@ -951,15 +986,26 @@ static void immediateCanonicalContract(WorldRendererD3D11& renderer) {
 }
 #include "darkness_effect_tests.h"
 #include "world_alpha_coverage_tests.h"
+#include "world_transparent_mesh_tests.h"
+#include "world_prompt_render_tests.h"
 #include "world_projected_texture_tests.h"
+#include "world_material_tests.h"
+#include "world_image_initialization_tests.h"
+#include "world_clip_plane_tests.h"
+#include "world_video_tests.h"
 #include "world_shadow_projection_tests.h"
 #include "world_shadow_bias_tests.h"
 #include "world_shadow_camera_tests.h"
 #include "world_shadow_volume_tests.h"
 #include "world_shadow_capture_tests.h"
 #include "world_color_lookup_tests.h"
+#include "world_gui_fade_tests.h"
+#include "bloom_resolution_tests.h"
+#include "darkness_arm_bloom_tests.h"
+#include "flare_visibility_tests.h"
 #include "world_resolve_fringe_tests.h"
 static void shadowExtrusionRasterPass(WorldRendererD3D11& renderer,const WorldDraw& seed,unsigned scale);
+#include "world_msaa_tests.h"
 static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
     context->ClearState();WorldRendererD3D11 renderer(device,context);
     WorldClear clear;clear.targets={1,0,0,0,2};clear.viewport={0,0,64,64};clear.flags=49;renderer.clear(clear);
@@ -1094,6 +1140,8 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
         require(renderer.draw(optional),"Missing original tangent defaults rejected a draw");
     }
     const auto lightingDraw=draw;
+    worldAnisotropyContract(device,context,lightingDraw);renderer.invalidateBindings();
+    worldAnisotropyVisualContract(device,context);renderer.invalidateBindings();
     samplerCachePressure(device,context,lightingDraw);renderer.invalidateBindings();
     // Resolve HDR with the original signed -4 exponent, then sample with +4.
     clear.color={8,4,2,1};clear.flags=1;renderer.clear(clear);
@@ -1192,7 +1240,11 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
             auto* pixel=checker->pixels.data()+(y*8+x)*4;pixel[((x+y)&1)?0:2]=255;pixel[3]=255;
         }
         sampled.textures[0]=checker;sampled.samplers[0]=decodeWorldSampler({2,0,0,0,(3u<<2)|(3u<<6),0});
+        const auto generatedUploads=renderer.imageUploadCount();
+        require(!renderer.preloadImage(checker) && renderer.imageUploadCount()==generatedUploads,
+                "Generated mip image entered authored preload path");
         renderer.clear(clear);require(renderer.draw(sampled),"Minified checker draw rejected");
+        require(renderer.imageUploadCount()==generatedUploads+1,"Generated mip fallback did not upload one image");
         const auto minified=renderer.readSurface(1,false);std::memcpy(h,minified.data()+(32*64+32)*8,8);
         require(std::abs(halfFloat(h[0])-.5f)<.01 && std::abs(halfFloat(h[2])-.5f)<.01,
                 "Minification sampled an aliased base level instead of the averaged mip");
@@ -1227,6 +1279,14 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
         auto image=std::make_shared<ColorImage>();
         require(!decodeWorldTextureImage(b,resource,*image),"Authored mip fixture decode rejected");
         auto sampled=draw;sampled.textureObjects[0]={};sampled.textures[0]=image;
+        ComPtr<ID3D11ShaderResourceView> previousView;context->PSGetShaderResources(0,1,&previousView);
+        const auto authoredUploads=renderer.imageUploadCount();
+        require(renderer.preloadImage(image) && renderer.imageUploadCount()==authoredUploads+1,
+                "Complete authored 2D mip chain was not preloaded once");
+        ComPtr<ID3D11ShaderResourceView> preservedView;context->PSGetShaderResources(0,1,&preservedView);
+        require(previousView.Get()==preservedView.Get(),"Authored 2D preload changed active draw bindings");
+        require(renderer.preloadImage(image) && renderer.imageUploadCount()==authoredUploads+1,
+                "Repeated authored 2D preload duplicated GPU upload");
         constantTexgen(sampled,0,{.5f,.5f,0,1});
         for(unsigned mip=0;mip<colors.size();++mip) {
             sampled.samplers[0]=decodeWorldSampler({2,0,0,0,(mip<<2)|(mip<<6),0});
@@ -1238,8 +1298,11 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
                 throw std::runtime_error("Authored texture mip replaced by generated base-level pixels");
             }
         }
+        require(renderer.imageUploadCount()==authoredUploads+1,"Authored 2D draw did not reuse preloaded GPU image");
         auto sparse=std::make_shared<ColorImage>(*image);
         sparse->firstMip=2;sparse->pixels.clear();sparse->mips[0].clear();sampled.textures[0]=sparse;
+        require(!renderer.preloadImage(sparse) && renderer.imageUploadCount()==authoredUploads+1,
+                "Sparse authored image entered complete-chain preload path");
         for(unsigned mip=2;mip<colors.size();++mip) {
             sampled.samplers[0]=decodeWorldSampler({2,0,0,0,(mip<<2)|(mip<<6),0});
             renderer.clear(clear);require(renderer.draw(sampled),"Resident-tail image rejected");
@@ -1308,6 +1371,7 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
         require(desc.Width==64 && desc.Height==64 && desc.MipLevels==7 &&
                 viewDesc.Texture2D.MostDetailedMip==0 && viewDesc.Texture2D.MipLevels==7,
                 "Resident-tail GPU resource rebased dimensions or mip indices");
+        require(desc.Usage==D3D11_USAGE_DEFAULT,"Sparse authored image lost streaming fallback storage");
         // A newly completed prefix is a different immutable image; revisiting
         // the old queued generation must still sample its retained tail.
         for(const auto& current:{image,sparse,image}) {
@@ -1445,6 +1509,8 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
                 "Resident cube view rebased authored levels");
         std::puts("ResidentMip: cube faces preserve original four-level indices with missing base.");
     }
+    authoredCubeInitializationContract(renderer,device,context,lightingDraw,clear);
+    imagePreloadBudgetContract(renderer,context,draw,clear);
     // A clear of another engine identity must preserve the original surface.
     clear.targets[4]=3;clear.depth=.75f;clear.flags=49;renderer.clear(clear);
     require(renderer.readSurface(2,true)==greater,"Distinct engine depth targets alias");
@@ -1495,6 +1561,7 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
     }
     deadNormalContract(renderer);
     darknessEffectContract(renderer);
+    deathSceneContract(renderer,1);
     immediateCanonicalContract(renderer);
     context->ClearState();renderer.invalidateBindings();
     std::weak_ptr<const StoredGeometry> temporary;
@@ -1509,7 +1576,12 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
     partialClears(renderer,context,histogramDraw);
     deeperResources(renderer,device,context,histogramDraw);
     alphaCoveragePass(renderer,histogramDraw,1);
+    transparentMeshPass(renderer,1);
     projectedTexturePass(renderer,1);
+    waterMaterialPass(renderer,1);
+    worldClipPlanePass(renderer,1);
+    worldVideoPass(renderer,1);
+    projectedMarkPass(renderer,1);
     shadowProjectionPass(renderer,histogramDraw,1);
     shadowBiasPass(renderer,histogramDraw,1);
     shadowCameraPass(renderer,histogramDraw,1);
@@ -1517,6 +1589,7 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
     shadowExtrusionRasterPass(renderer,histogramDraw,1);
     colorLookupUpscalePass(renderer,1);
     resolvePartialTilePass(renderer,device,context,1);
+    worldPromptRenderPass(renderer,1);
     // A diagonal must resolve to different coverage values inside individual
     // logical pixels. Enlarging a 64x64 raster would repeat each pixel instead.
     for(unsigned scale:{2u,3u}) {
@@ -1556,7 +1629,15 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
         require(matched,"Resolve/present lost native subpixel edge coverage");
         std::printf("PhysicalRaster%u: %u covered pixels, %u mixed logical edge blocks retained through resolve/present.\n",scale,physicalCoverage,mixedBlocks);
         alphaCoveragePass(scaled,histogramDraw,scale);
+        if(scale==2) {
+            transparentMeshPass(scaled,scale);
+            worldClipPlanePass(scaled,scale);
+        }
         projectedTexturePass(scaled,scale);
+        waterMaterialPass(scaled,scale);
+        worldVideoPass(scaled,scale);
+        if(scale==2)deathSceneContract(scaled,scale);
+        projectedMarkPass(scaled,scale);
         shadowProjectionPass(scaled,histogramDraw,scale);
         shadowBiasPass(scaled,histogramDraw,scale);
         shadowCameraPass(scaled,histogramDraw,scale);
@@ -1564,6 +1645,7 @@ static void passes(ID3D11Device* device,ID3D11DeviceContext* context) {
         shadowExtrusionRasterPass(scaled,histogramDraw,scale);
         colorLookupUpscalePass(scaled,scale);
         resolvePartialTilePass(scaled,device,context,scale);
+        worldPromptRenderPass(scaled,scale);
     }
     shadowCapturePass(device,context,histogramDraw);
 }
@@ -1643,7 +1725,7 @@ static void promptWorldContract() {
     auto prompt = owned(200, 40, 40, uint8_t(Origin::A));
     const auto snapshot = prompt;
     const auto icon = replacementFor(9, prompt, Source::KeyboardMouse, Context::Menu);
-    require(icon && icon->valid() && icon->width == 32 && prompt == snapshot &&
+    require(icon && icon->valid() && icon->width == 64 && prompt == snapshot &&
             prompt->pixels[0] == 200, "World prompt substitution mutated its draw snapshot");
     require(replacementFor(9, prompt, Source::Controller, Context::Menu) == nullptr,
             "World controller source did not preserve original artwork");
@@ -1724,22 +1806,110 @@ static void format19GpuContract(ID3D11Device* device,ID3D11DeviceContext* contex
     require(actualPacked[0][8]!=actualPacked[1][8] && actualPacked[0][4]!=0,"Format19 GPU outputs not nonzero/converted");
     std::printf("Format19GPU passed: 3 packed vs 3 FLOAT3 vertices, %u output comparisons, nonuniform conversion analytically verified.\n",comparisons);
 }
+#include "world_resolution_switch_tests.h"
+#include "world_frontbuffer_precision_tests.h"
+#include "subtitle_font_tests.h"
+static void worldRendererDebugContract(ID3D11Device* device) {
+    ComPtr<ID3D11InfoQueue> messages;
+    if(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages))))
+        for(UINT64 i=0;i<messages->GetNumStoredMessagesAllowedByRetrievalFilter();++i) {
+            SIZE_T size=0;messages->GetMessage(i,nullptr,&size);std::vector<uint8_t> bytes(size);
+            auto* message=reinterpret_cast<D3D11_MESSAGE*>(bytes.data());
+            check(messages->GetMessage(i,message,&size),"D3D debug message retrieval");
+            require(message->Severity>D3D11_MESSAGE_SEVERITY_ERROR,"D3D debug layer reported invalid rendering commands");
+        }
+}
 int main(int argc,char** argv) {
-    constantCopyContract();
-    lightingValidationContract();
-    promptWorldContract();
     ComPtr<ID3D11Device> device;
     try {
-        formats();paletteUsageContract();paletteArithmeticContract();worldPositionUsageContract();worldShadowInputContract();
-        worldVertexValidationContract();immediateIndexOwnershipContract();
-        if(argc>1 && std::strcmp(argv[1],"--cpu-only")==0) {
+        bool warp=false,cpuOnly=false,colorGradeOnly=false,guiFadeOnly=false,resolutionSwitchOnly=false,frontbufferOnly=false,clipPlanesOnly=false,bloomOnly=false,armBloomOnly=false,textureBudgetOnly=false,subtitleFontOnly=false;
+        for(int i=1;i<argc;++i) {
+            if(std::strcmp(argv[i],"--warp")==0)warp=true;
+            else if(std::strcmp(argv[i],"--cpu-only")==0)cpuOnly=true;
+            else if(std::strcmp(argv[i],"--color-grade-only")==0)colorGradeOnly=true;
+            else if(std::strcmp(argv[i],"--gui-fade-only")==0)guiFadeOnly=true;
+            else if(std::strcmp(argv[i],"--resolution-switch-only")==0)resolutionSwitchOnly=true;
+            else if(std::strcmp(argv[i],"--frontbuffer-only")==0)frontbufferOnly=true;
+            else if(std::strcmp(argv[i],"--clip-planes-only")==0)clipPlanesOnly=true;
+            else if(std::strcmp(argv[i],"--bloom-only")==0)bloomOnly=true;
+            else if(std::strcmp(argv[i],"--arm-bloom-only")==0)armBloomOnly=true;
+            else if(std::strcmp(argv[i],"--texture-budget-only")==0)textureBudgetOnly=true;
+            else if(std::strcmp(argv[i],"--subtitle-font-only")==0)subtitleFontOnly=true;
+            else throw std::runtime_error("Unknown argument; expected --warp, --cpu-only, --color-grade-only, --gui-fade-only, --resolution-switch-only, --frontbuffer-only, --clip-planes-only, --bloom-only, --arm-bloom-only, --texture-budget-only or --subtitle-font-only");
+        }
+        require(unsigned(cpuOnly)+unsigned(colorGradeOnly)+unsigned(guiFadeOnly)+unsigned(resolutionSwitchOnly)+unsigned(frontbufferOnly)+unsigned(clipPlanesOnly)+unsigned(bloomOnly)+unsigned(armBloomOnly)+unsigned(textureBudgetOnly)+unsigned(subtitleFontOnly)<=1,
+            "Focused contract modes are mutually exclusive");
+        if(!colorGradeOnly && !guiFadeOnly && !resolutionSwitchOnly && !frontbufferOnly && !clipPlanesOnly && !bloomOnly && !armBloomOnly && !textureBudgetOnly && !subtitleFontOnly) {
+            constantCopyContract();lightingValidationContract();promptWorldContract();
+            formats();paletteUsageContract();paletteArithmeticContract();worldPositionUsageContract();worldWaterUsageContract();worldShadowInputContract();
+            worldVertexValidationContract();immediateIndexOwnershipContract();
+        }
+        if(cpuOnly) {
             std::puts("World vertex preparation CPU contracts passed; no D3D device created.");
             return 0;
         }
-        const bool warp=argc>1 && std::strcmp(argv[1],"--warp")==0;
         ComPtr<ID3D11DeviceContext> context;const D3D_FEATURE_LEVEL level=D3D_FEATURE_LEVEL_11_0;
         const auto deviceFlags=GetEnvironmentVariableA("DARK_D3D_DEBUG",nullptr,0)?D3D11_CREATE_DEVICE_DEBUG:0;
         check(D3D11CreateDevice(nullptr,warp?D3D_DRIVER_TYPE_WARP:D3D_DRIVER_TYPE_HARDWARE,nullptr,deviceFlags,&level,1,D3D11_SDK_VERSION,&device,nullptr,&context),"D3D device");
+        if(subtitleFontOnly) {
+            subtitleFontContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("SubtitleFontContract passed: %s.\n",warp?"WARP":"hardware");return 0;
+        }
+        if(textureBudgetOnly) {
+            imageBudgetRecoveryContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("WorldTextureBudgetRecoveryContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
+        if(armBloomOnly) {
+            darknessArmBloomContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("DarknessArmBloomContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
+        if(bloomOnly) {
+            bloomResolutionContract(device.Get(),context.Get());
+            flareVisibilityContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("WorldBloomResolutionContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
+        if(colorGradeOnly) {
+            colorGradeChainContract(device.Get(),context.Get());
+            colorGradeChainContract(device.Get(),context.Get(),26,4);
+            colorGradeEligibilityContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("WorldColorGradeContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
+        if(guiFadeOnly) {
+            worldGuiFadeContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("WorldGuiFadeContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
+        if(resolutionSwitchOnly) {
+            resolutionSwitchContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("WorldResolutionSwitchContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
+        if(frontbufferOnly) {
+            worldFrontbufferPrecisionContract(device.Get(),context.Get());
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("WorldFrontbufferPrecisionContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
+        if(clipPlanesOnly) {
+            for(unsigned scale:{1u,2u}) {
+                context->ClearState();WorldRendererD3D11 renderer(device.Get(),context.Get(),scale);
+                worldClipPlanePass(renderer,scale);
+            }
+            worldRendererDebugContract(device.Get());context->ClearState();
+            std::printf("WorldClipPlaneContract passed: %s.\n",warp?"WARP":"hardware");
+            return 0;
+        }
         std::vector<WorldVertex> vertices(7);
         for(unsigned i=0;i<vertices.size();++i) {
             auto& v=vertices[i];v.position={float(i)/8,-float(i)/16,float(i)/32,1};v.normal={0,0,1,0};
@@ -1891,15 +2061,19 @@ int main(int argc,char** argv) {
         format19GpuContract(device.Get(),context.Get());
         shadowExtrusionGpuContract(device.Get(),context.Get());
         passes(device.Get(),context.Get());
+        worldMsaaContract(device.Get(),context.Get());
+        colorGradeChainContract(device.Get(),context.Get());
+        colorGradeChainContract(device.Get(),context.Get(),26,4);
+        colorGradeEligibilityContract(device.Get(),context.Get());
+        bloomResolutionContract(device.Get(),context.Get());
+        darknessArmBloomContract(device.Get(),context.Get());
+        flareVisibilityContract(device.Get(),context.Get());
+        resolutionSwitchContract(device.Get(),context.Get());
+        worldFrontbufferPrecisionContract(device.Get(),context.Get());
         budgetContract(device.Get(),context.Get());
         darknessVisionContract(device.Get(),context.Get());
-        ComPtr<ID3D11InfoQueue> messages;
-        if(SUCCEEDED(device.As(&messages)))for(UINT64 i=0;i<messages->GetNumStoredMessagesAllowedByRetrievalFilter();++i) {
-            SIZE_T size=0;messages->GetMessage(i,nullptr,&size);std::vector<uint8_t> bytes(size);
-            auto* message=reinterpret_cast<D3D11_MESSAGE*>(bytes.data());
-            check(messages->GetMessage(i,message,&size),"D3D debug message retrieval");
-            require(message->Severity>D3D11_MESSAGE_SEVERITY_ERROR,"D3D debug layer reported invalid rendering commands");
-        }
+        otherworldContract(device.Get(),context.Get());
+        worldRendererDebugContract(device.Get());
         context->ClearState();std::printf("WorldRendererContract passed: %s,162 variants,1134 vertices,%u output comparisons; original stage-1/5 bump-cube basis, environment mapping, light field, depth-offset, constant and Lighting_Nonormal distance modes; packed fetch; DXN/L8; depth/stencil, motion, cube-projected lighting and additive pixels; separate targets.\n",warp?"WARP":"hardware",comparisons);return 0;
     } catch(const std::exception& e){
         ComPtr<ID3D11InfoQueue> messages;

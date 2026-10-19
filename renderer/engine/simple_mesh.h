@@ -8,7 +8,53 @@
 #include <vector>
 
 namespace DarkRecomp {
-namespace Native {struct WorldDraw;struct WorldClear;struct WorldResolve;struct WorldTexture;struct StoredDraw;struct WorldQuery;}
+namespace Native {
+struct WorldDraw;struct WorldClear;struct WorldResolve;struct WorldTexture;struct StoredDraw;struct WorldQuery;struct DisplayGamma;
+enum class PromptRenderContext : uint8_t { Menu = 0, Gameplay = 1 };
+// Original UI owners scope the producer; queued draws retain their own copy.
+// Outside a verified gameplay HUD owner, menu alternatives remain available.
+PromptRenderContext currentPromptRenderContext() noexcept;
+PromptRenderContext setPromptRenderContext(PromptRenderContext context) noexcept;
+class ScopedPromptRenderContext {
+    PromptRenderContext previous_;
+public:
+    explicit ScopedPromptRenderContext(PromptRenderContext context) noexcept
+        : previous_(setPromptRenderContext(context)) {}
+    ~ScopedPromptRenderContext() noexcept { setPromptRenderContext(previous_); }
+    ScopedPromptRenderContext(const ScopedPromptRenderContext&) = delete;
+    ScopedPromptRenderContext& operator=(const ScopedPromptRenderContext&) = delete;
+    ScopedPromptRenderContext(ScopedPromptRenderContext&&) = delete;
+    ScopedPromptRenderContext& operator=(ScopedPromptRenderContext&&) = delete;
+};
+// Original VBManager queues HUD geometry before executing it. Contexts live
+// only in a known manager frame and are invalidated by allocation/re-enqueue.
+// Unknown managers, addresses and exhausted budgets resolve to Menu.
+void resetQueuedPromptContexts(uint8_t* base, uint32_t manager) noexcept;
+void retireQueuedPromptContexts() noexcept;
+void retireQueuedPromptContexts(uint8_t* base, uint32_t manager) noexcept;
+uint64_t queuedPromptGeneration(uint8_t* base, uint32_t manager) noexcept;
+void forgetQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw) noexcept;
+void forgetQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, uint64_t generation) noexcept;
+void recordQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, PromptRenderContext context) noexcept;
+void recordQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, PromptRenderContext context, uint64_t generation) noexcept;
+PromptRenderContext queuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw) noexcept;
+PromptRenderContext queuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, uint64_t generation) noexcept;
+// Subtitle ownership follows the same original VB frame/generation lifetime.
+// The queued value is independent of gameplay prompt/icon ownership.
+bool currentSubtitleRenderContext() noexcept;
+bool setSubtitleRenderContext(bool subtitle) noexcept;
+class ScopedSubtitleRenderContext {
+    bool previous_;
+public:
+    explicit ScopedSubtitleRenderContext(bool subtitle) noexcept
+        : previous_(setSubtitleRenderContext(subtitle)) {}
+    ~ScopedSubtitleRenderContext() noexcept { setSubtitleRenderContext(previous_); }
+    ScopedSubtitleRenderContext(const ScopedSubtitleRenderContext&) = delete;
+    ScopedSubtitleRenderContext& operator=(const ScopedSubtitleRenderContext&) = delete;
+};
+void recordQueuedSubtitleContext(uint8_t* base, uint32_t manager, uint32_t draw, bool subtitle, uint64_t generation) noexcept;
+bool queuedSubtitleContext(uint8_t* base, uint32_t manager, uint32_t draw, uint64_t generation) noexcept;
+}
 struct SimpleVertex { float position[3]; float uv[2]; float color[4]; };
 struct AlphaImage {
     uint32_t width = 0, height = 0;
@@ -19,6 +65,8 @@ struct ColorImage {
     uint32_t faces = 1;
     std::vector<uint8_t> pixels; // Owned, tightly packed RGBA8.
     uint32_t sourceCodec = 0; // Decoder provenance only; all owned levels contain RGBA8 pixels.
+    // Only host-rasterized subtitle atlases exceed the authored image cap.
+    bool generatedSubtitleFont = false;
     // Verified original prompt origin, owned with this immutable generation.
     // Unknown (0) renders the original pixels; a known origin selects a cached
     // native icon at the render boundary. Set once at publish; never mutated
@@ -33,7 +81,8 @@ struct ColorImage {
     // leading levels stay empty; dimensions and mip indices are never rebased.
     unsigned firstMip = 0;
     bool valid() const {
-        if(!width || !height || width>2048 || height>2048 || (faces!=1 && faces!=6) ||
+        if(!width || !height || width>(generatedSubtitleFont?4096u:2048u) || height>2048 ||
+           (generatedSubtitleFont && faces!=1) || (faces!=1 && faces!=6) ||
            (faces==6 && width!=height) || mips.size()>=unsigned(std::bit_width((std::max)(width,height))) ||
            firstMip>mips.size() || (!authoredMips && (firstMip || !mips.empty())))return false;
         for(unsigned mip=0;mip<=mips.size();++mip) {
@@ -56,6 +105,7 @@ struct VideoFrame {
     double timestampSeconds = 0;
 };
 struct SimpleMesh {
+    std::shared_ptr<const Native::DisplayGamma> displayGamma;
     std::shared_ptr<Native::WorldQuery> worldQuery;
     bool worldQueryBegin=false;
     std::shared_ptr<const Native::WorldDraw> world;
@@ -70,6 +120,8 @@ struct SimpleMesh {
     std::shared_ptr<const ColorImage> colorTexture;
     uint32_t textureId = 0;
     bool opaque = false;
+    Native::PromptRenderContext promptContext = Native::PromptRenderContext::Menu;
+    bool subtitle = false;
 };
 
 namespace Native {
@@ -96,12 +148,23 @@ void previewPrepareTexture(uint32_t textureId);
 // from borrowing another generation or a different texture subobject.
 std::shared_ptr<const ColorImage> previewCapturedTexture(uint32_t id,uint32_t resource);
 void previewPublishTexture(uint32_t id,uint32_t resource,std::shared_ptr<const ColorImage> image);
+// Optional render-thread preloading of completed immutable upload snapshots.
+// The bounded queue retains weak references only. A successful pop may yield
+// nullptr when the source expired; false means the queue is empty.
+bool takePreviewTexturePreload(std::shared_ptr<const ColorImage>& image);
+struct PreviewTexturePreloadCounters {
+    uint64_t queued=0,taken=0,expired=0,overflow=0;
+    size_t pending=0;
+};
+PreviewTexturePreloadCounters previewTexturePreloadCounters();
 void previewObserveImage(uint8_t* base, uint32_t image, uint32_t textureId, uint32_t mip);
+// A font definition binds to this owned upload generation, never an ID alone.
+std::shared_ptr<const AlphaImage> previewAlphaImageForSubtitleFont(uint32_t textureId) noexcept;
+std::shared_ptr<const ColorImage> previewColorImageForSubtitleFont(uint32_t textureId) noexcept;
 void previewObserveVideo(uint8_t* base, uint32_t container, uint32_t localId);
 // Adaptive prompt icon substitution, resolved at the render boundary.
 // Returns nullptr to keep the original controller artwork.
 enum class PromptRenderSource : uint8_t { KeyboardMouse = 0, Controller = 1 };
-enum class PromptRenderContext : uint8_t { Menu = 0, Gameplay = 1 };
 std::shared_ptr<const ColorImage> promptReplacementFor(uint32_t textureId,
     const std::shared_ptr<const ColorImage>& image, PromptRenderSource source, PromptRenderContext context);
 // Immediate-path variant with the draw's sampled UV bounds so atlas tiles and
@@ -132,6 +195,7 @@ uint64_t promptOriginAttempts();
 uint64_t promptOriginClassified();
 void previewObserveTriangles(uint8_t* base, uint32_t indices, uint32_t triangles);
 void previewObserveWorld(uint8_t* base,const StoredDraw&);
+void previewObserveWorld(uint8_t* base,StoredDraw&&);
 void previewObserveImmediateWorld(uint8_t* base,uint32_t device,uint32_t indices,uint32_t indexCount);
 void previewObserveClear(uint8_t* base,uint32_t device,uint32_t flags,uint32_t color,float depth,uint32_t stencil,const std::array<int32_t,4>& rectangle);
 // Output of original 8225F320 at the triangle draw call site in 8225DE78.
@@ -147,10 +211,17 @@ bool previewWorldActive();
 void previewObserveResolve(uint8_t*,uint32_t device,uint32_t flags,uint32_t rectangle,uint32_t destination,
                            uint32_t offset,uint32_t color,float depth,uint32_t stencil,uint32_t face,uint32_t mip);
 void previewObservePresent(uint8_t*,uint32_t frontbuffer);
+// Observe the original completed display table at its PM4 emission boundary.
+void previewObserveDisplayGamma(uint8_t*,uint32_t ramp,bool piecewise);
 // Original histogram callbacks bracket draws and consume prior completed bins.
 void previewBeginHistogram(unsigned bin);
 void previewEndHistogram();
 bool previewReadHistogram(unsigned bin,uint64_t& samples);
+// Original flare visibility callbacks use u16 IDs independently of exposure
+// bins and read the latest completed logical-pixel count without blocking.
+void previewBeginFlare(unsigned id);
+void previewEndFlare();
+bool previewReadFlare(unsigned id,uint64_t& samples);
 // A bounded wait lets the window consume a late frame immediately instead of
 // adding another display-period delay. Zero retains nonblocking behavior.
 struct PreviewFramePart {bool first=true,last=true;};

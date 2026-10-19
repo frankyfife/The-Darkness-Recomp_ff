@@ -1,4 +1,5 @@
 #include "engine_vertex_program.h"
+#include "runtime/native/stall_profiler.h"
 #include "engine_performance.h"
 #include "simple_mesh.h"
 #include "render_trace.h"
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 
 namespace DarkRecomp::Native {
 namespace {
@@ -25,15 +27,26 @@ bool copy(uint8_t* base, uint64_t address, void* out, size_t size) {
     return copyRenderMemory(base,address,out,size);
 }
 bool initializedModes(uint8_t* base) {
-    std::array<uint8_t, 108> flags{}; std::array<uint8_t, 27> counts{};
+    std::array<uint8_t, 108> flags; std::array<uint8_t, 27> counts;
     if (!copy(base, 0x82A5CD88, flags.data(), flags.size()) || !copy(base, 0x82A5CDF4, counts.data(), counts.size())) return false;
-    const auto& modes = engineVertexModes();
-    for (unsigned i = 0; i < modes.size(); ++i)
-        if (be32(flags.data() + i*4) != modes[i].flags || counts[i] != modes[i].reservation) return false;
-    return true;
+    struct ModeBytes {std::array<uint8_t,108> flags;std::array<uint8_t,27> counts;};
+    // Mode definitions are immutable. Own their exact BE representation,
+    // while retaining both complete guarded guest reads before validation.
+    static const ModeBytes expected=[] {
+        ModeBytes bytes;
+        const auto& modes=engineVertexModes();
+        for(unsigned i=0;i<modes.size();++i) {
+            for(unsigned byte=0;byte<4;++byte)bytes.flags[i*4+byte]=uint8_t(modes[i].flags>>(24-byte*8));
+            bytes.counts[i]=modes[i].reservation;
+        }
+        return bytes;
+    }();
+    return std::memcmp(flags.data(),expected.flags.data(),flags.size())==0 &&
+        std::memcmp(counts.data(),expected.counts.data(),counts.size())==0;
 }
 bool readSource(uint8_t* base, EngineVertexProgramSource& out) {
-    std::array<uint8_t, 12> selector{}; std::array<uint8_t, 840> state{}; std::array<uint8_t, 8> model{};
+    // Each local is consumed only after its complete guarded copy succeeds.
+    std::array<uint8_t, 12> selector; std::array<uint8_t, 840> state; std::array<uint8_t, 8> model;
     if (!copy(base, context + 8224, selector.data(), selector.size()) || !copy(base, context + 16420, state.data(), state.size())) return false;
     EngineVertexProgramSource result;
     result.matrixBase = be32(selector.data()); result.matrixIndex = be32(selector.data() + 8);
@@ -83,9 +96,10 @@ bool buildEngineVertexProgramKey(const EngineVertexProgramInput& input, EngineVe
         if (input.conversionMask & 1) descriptor.flags |= 0x04000000;
         descriptor.flags |= (descriptor.flags & 0xFFFFFF00u) + (std::rotl(input.conversionMask, 31) & 15u);
     }
-    const auto bytes = encodeEngineVertexDescriptor(descriptor);
-    EngineVertexProgramKey result{input.declarationAddress};
-    for (unsigned i = 0; i < 5; ++i) result[i + 1] = be32(bytes.data() + i*4);
+    // Key1..5 are exactly the descriptor's encoded first20 bytes. The unused
+    // descriptor tail need not be encoded and decoded to produce these words.
+    EngineVertexProgramKey result{input.declarationAddress,descriptor.coordinateMapping,descriptor.flags,
+        be32(descriptor.modes.data()),be32(descriptor.modes.data()+4),descriptor.declarationFlags};
     output = result; return true;
 }
 bool lookupEngineVertexProgram(uint8_t* base, uint32_t root, const EngineVertexProgramKey& key,
@@ -168,7 +182,7 @@ static bool snapshotEngineVertexBindingsInto(uint8_t* base, EngineVertexBindingS
     const auto& prepared = *preparedBinding;
     auto current = [&] {
         EngineVertexProgramSource source;
-        std::array<uint8_t,4> device{}, record{}, binding{};
+        std::array<uint8_t,4> device, record, binding;
         // The retained key was already proved from this exact source during
         // preparation. Rebuilding it three times per draw adds no validation.
         return readSource(base, source) && source == prepared.source &&
@@ -186,12 +200,12 @@ static bool snapshotEngineVertexBindingsInto(uint8_t* base, EngineVertexBindingS
     ++bindingsCaptured; return true;
 }
 bool snapshotEngineVertexBindings(uint8_t* base,EngineVertexBindingSnapshot& output) noexcept {
-    EngineVertexBindingSnapshot result;
+    EngineVertexBindingSnapshot result(EngineVertexBindingSnapshot::captureStorage());
     if(!snapshotEngineVertexBindingsInto(base,result))return false;
     output=result;return true;
 }
 bool captureEngineVertexBindings(uint8_t* base,std::optional<EngineVertexBindingSnapshot>& output) noexcept {
-    if(snapshotEngineVertexBindingsInto(base,output.emplace()))return true;
+    if(snapshotEngineVertexBindingsInto(base,output.emplace(EngineVertexBindingSnapshot::captureStorage())))return true;
     output.reset();return false;
 }
 // Retain the completed original selection directly during ordinary rendering.
@@ -241,6 +255,7 @@ void printEngineVertexProgramCounters() {
 }
 extern "C" PPC_FUNC(__imp__sub_82248C80);
 PPC_FUNC(sub_82248C80) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82248C80", 0x82248C80, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::vertexProgram);
     using namespace DarkRecomp::Native;
     if(enginePreviewEnabled() && !renderTraceEnabled()) {

@@ -1,6 +1,7 @@
 #pragma once
 #include "runtime.h"
 #include "storage.h"
+#include "achievements.h"
 #include <memory>
 #include <deque>
 #include <utility>
@@ -15,6 +16,8 @@ struct KernelObject {
     bool isEvent = false;
     bool writable = false;
     bool unbuffered = false;
+    uint32_t fileOpenOptions = 0;
+    std::shared_ptr<const DarkRecomp::Native::CachedWeaponFile> cachedWeaponFile;
     bool notificationListener = false;
     uint64_t notificationAreas = 0;
     uint32_t notificationMaxVersion = 0;
@@ -23,8 +26,18 @@ struct KernelObject {
     uint32_t enumFetch = 0;
     size_t enumCursor = 0;
     std::vector<DarkRecomp::Native::Storage::ContentInfo> enumItems;
+    bool isAchievementEnumerator = false;
+    uint32_t achievementFlags = 0;
+    uint32_t achievementStringBytes = 0;
+    uint32_t achievementBufferBytes = 0;
+    std::vector<DarkRecomp::Native::Achievements::Entry> achievementItems;
     uint32_t affinity = 0x3f;
     int32_t priority = 0;
+    // Immutable creation metadata, published before the native thread resumes.
+    uint32_t threadEntry = 0;
+    uint32_t threadArgument = 0;
+    bool resourcePoolWorker = false;
+    bool applicationSystemWorker = false;
     std::filesystem::path path;
     std::mutex ioMutex;
     // A native directory read advances before its UTF-8 guest record is copied.

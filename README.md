@@ -9,7 +9,9 @@ renderer — no emulation at runtime.
 > (step 1 below).
 
 Playable today: full gameplay, mouse look + controller input, video settings
-(resolution, FOV, gamma, bloom, frame cap, VSync), XMA audio, and saves.
+(resolution, FOV, original Xbox gamma calibration and color profiles, bloom,
+frame cap, VSync, FXAA/SMAA/MSAA antialiasing, 16x texture filtering), keyboard
+remapping, cursor menu selection, XMA audio, and saves.
 
 ## Download and play
 
@@ -19,83 +21,144 @@ The GitHub **Source code** downloads are for building the project yourself.
 
 1. Right-click the Windows ZIP and choose **Extract All**.
 2. Copy your own extracted Xbox 360 game dump into the included **Darkness**
-   folder: `_uncrypted.xex`, `basefile.exe`, `default.xex`, `Content`, `System`,
-   and all the other files and folders from your dump. If the first two files
-   are missing, follow **Preparing the game files** below to generate them.
+   folder: the original `default.xex`, `Content`, `System`, and all the other
+   files and folders from your dump. No XexTool preparation is required.
 3. Double-click **Launch.cmd** to play with sound.
 
-No compiler, Python, or separate audio setup is needed for the Windows release.
+Use **LaunchWithSettings.cmd** to choose settings and language before playing.
+Use **LaunchWithUpdates.cmd** to check for new commits on GitHub's `main` branch
+before playing. It rebuilds and installs the selected commit automatically,
+preserving game files, saves, achievements, and settings. Commit updates require
+Git, Python 3.11+, CMake, and Visual Studio 2022 with C++ and Clang tools installed.
+The audio build also requires MSYS2 MinGW64 build tools at `C:\msys64` and LLVM
+at `C:\Program Files\LLVM` (including `llvm-lib.exe`).
+For a downloaded installation, it keeps a separate source/build copy and copies
+your own dump there; allow space for another game copy and the compiler outputs.
+The first build can take several minutes. Source checkouts must be clean and able
+to fast-forward to `main`; local edits and divergent commits are preserved.
+
+No compiler, Python, or separate audio setup is needed to play the Windows release.
+Use **Launch.cmd** for the installed build, or extract a newer release ZIP to
+update without building. The previous release-only updater remains available as
+`powershell -NoProfile -ExecutionPolicy Bypass -File tools\update_release.ps1`.
 Use 64-bit Windows 10/11 with a Direct3D 11-capable graphics device.
 See [START_HERE.txt](START_HERE.txt) for the folder layout and troubleshooting.
-An ISO alone is not enough; the dump must include the decrypted executable
-images for the supported game revision.
+An ISO alone is not enough; use an extracted dump of the supported game revision.
+The port decodes `default.xex` in memory at startup; `_uncrypted.xex` and
+`basefile.exe` are no longer required.
 
-Click the game window to capture the mouse. **F1** shows controls, **F2** toggles
-capture, and **Esc** releases it. Graphics options are in **Options > Video Settings**.
+The original supported disc executable and the Russian localization identified
+in [issue #37](https://github.com/portingpete/The-Darkness-Recomp/issues/37) are
+recognized automatically. Copy all files from the matching dump, including its
+own `default.xex`. The Russian localization uses the game's English content
+slot: choose **English**, or **System default** on Russian Windows. Its translated
+text, fonts, and audio come from that dump.
+
+The added in-game PC menus also use Russian with that dump: video settings,
+keyboard and mouse bindings, and Exit Game. Their translation source is
+[assets/localization/native_menu_ru.json](assets/localization/native_menu_ru.json).
+See [the translation guide](assets/localization/README.md) to improve the wording
+and rebuild the menus.
+
+The mouse captures automatically when keyboard/mouse gameplay starts or resumes
+after a menu. Click the game window to recapture after a manual release or Alt-Tab.
+**F1** shows controls, **F2** toggles
+capture, and **Esc** releases it. Graphics options are in **Options > Video Quality**
+and in the video settings launcher. Both use the same saved settings.
+**Options > Subtitles > Subtitle Size** adjusts dialogue subtitles from 50% to 200%
+and applies immediately in game. The default 100% retains the original text size;
+the setting is saved for the next launch.
+Higher-resolution subtitles use scalable Arial glyphs with grayscale antialiasing,
+while retaining the game's spacing, wrapping, fades and outlines. Original bitmap
+glyphs remain the fallback when the system font or a character is unavailable.
+Click menu choices to select them; the mouse wheel also changes choices and **E** confirms.
+Choose **Extra Content > Achievements** in the main menu to see the original
+achievement list. Unlocks from gameplay are stored in
+**saves/achievements.dat** and persist between launches. The list uses your game
+dump's achievement text and selected language; multiplayer achievements require
+their original gameplay conditions. Xbox Live synchronization is unavailable.
+Use **Options > Controls > Keyboard bindings** to remap gameplay keys and mouse buttons.
+The five-page game menu supports primary/secondary keys, clear, defaults, and Save/Cancel.
+Page 5 configures dialogue-choice controls independently of weapon switching;
+the same keys and wheel directions can be used in both contexts.
+**Exit Game** in the pause or main menu closes the game after confirmation.
+Press **F5** to open developer tools for mission selection, player speed,
+invincibility, noclip, all Darkness abilities and maximum Darkness level.
+Enable the F6 resolution shortcut there to allow live 720p/1440p switching;
+the shortcut starts off. Mission loading and Darkness grants can autosave;
+see [CONTROLS.md](CONTROLS.md#developer-tools) before changing progression.
+Choose **Language** in **Options > Video Settings** or the settings launcher:
+System default, English, German, French, Spanish, or Italian. In-game changes
+take effect after restarting. See [CONTROLS.md](CONTROLS.md) for language overrides
+and the full input guide.
+
+## Steam on Windows
+
+In Steam, choose **Games > Add a Non-Steam Game > Browse** and select
+`build_native/Release/DarkRecomp.exe` in the extracted release. Set **Start In**
+to the extracted release folder and leave **Launch Options** empty. Sound and
+normal gameplay are enabled by default. Keep the whole release folder together.
+
+The shortcut must target the game executable so Steam can follow the running
+game for its overlay, Steam Input, and session status. If you already added
+`Launch.cmd` or `DarkRecompPreview.exe`, edit that shortcut's **Properties** to
+use `DarkRecomp.exe` and remove `--sound` from Launch Options. The optional
+`tools/add_steam_shortcut.py` helper preserves existing shortcuts; it does not
+retarget them automatically.
+
+## Steam Deck and Linux
+
+The Windows build can run through Proton on Linux. `Launch.sh` and the file I/O
+compatibility fixes were tested with GE-Proton11-7 in Ubuntu 24.04 under WSL2.
+The opening level rendered with audio and created checkpoint saves; memory,
+file I/O and save-storage tests passed. Visible camera movement and completion
+of the opening tutorial were not confirmed. Steam Deck gameplay and performance
+remain unverified; a native Linux build is not available.
+
+For automatic setup from Windows with Ubuntu in WSL2, double-click
+**SetupLinux.cmd**, then **PlayLinux.cmd**. The installer copies the game to
+Linux storage and preserves that copy's saves and settings on later updates.
+See [STEAM_DECK.md](STEAM_DECK.md) for prerequisites, options, Steam shortcuts
+and the verified test scope.
+
+## Other games and title updates
+
+This executable ports **The Darkness**, using translated code and engine
+integration for its supported Xbox 360 revision. It cannot load another Xbox
+game by replacing the files or changing a hash. Supporting a different title
+requires its own translation configuration, runtime integration, renderer,
+and testing; the upstream XenonRecomp toolchain is a starting point for that
+work. The automatic revision check also applies to The Darkness title updates: an
+updated executable needs a separate verified translation before it can be used.
 
 ## Preparing the game files
 
-`_uncrypted.xex` and `basefile.exe` are generated from your own `default.xex`;
-they are not normally present in a disc extraction. `basefile.exe` is a raw
-Xbox 360 memory image read by the port, not a Windows application to run.
+Copy the original extracted files into **Darkness**, then launch the game.
+The runtime uses Windows' built-in AES provider to decode `default.xex` and
+expand its zero-filled blocks in memory. It checks both the original file and
+decoded image against an approved pair of SHA-256 hashes before executing game code.
+The Russian executable shares the same translated code, imports and TLS layout;
+its localization data remains intact. Startup menu overrides also preserve the
+dump's cached strings and fonts.
+The source generator also reads the original `default.xex` directly.
+Any approved executable can be used to build the shared translation.
+Existing prepared files may be left in the folder; they are not read.
 
-1. Obtain **xorloser's XexTool** separately; **v6.3** is the version tested here.
-   It is not included with this release.
-2. Place `xextool.exe` beside `default.xex` in your **Darkness** folder.
-3. Open that folder in File Explorer, type `powershell` into its address bar,
-   and press Enter. Run these commands one at a time:
-
-   ```powershell
-   .\xextool.exe -e u -c u -o _uncrypted.xex default.xex
-   .\xextool.exe -b basefile.exe default.xex
-   ```
-
-   Confirm that each command reports success. These commands preserve
-   `default.xex`. Keep the `-o _uncrypted.xex` option on the first command;
-   do not rename files or apply region/devkit patches. If you already have
-   generated files, back them up before regenerating them.
-4. Keep both generated files in **Darkness**, together with the original dump,
-   then double-click `Launch.cmd` in the parent folder.
-
-### Checking the supported game revision
-
-For **v0.1.1**, run this in the same PowerShell window:
-
-```powershell
-Get-FileHash .\_uncrypted.xex, .\basefile.exe -Algorithm SHA256 | Format-List
-```
-
-The generated SHA-256 hashes must match these values (case does not matter):
-
-```text
-_uncrypted.xex  a7ccd87860889fa082d62dcc24382467d59c8031f6e99d2ed9f3dbddaa7d535e
-basefile.exe   180b7fc8f57462f6bac3404ecab061a8d79914c7a3e9a12c238bd3449e72d049
-```
-
-These commands were tested against the project's dump and reproduced both
-release inputs exactly. Its XEX metadata reports Title ID `545407EE`, Media ID
-`0F213645`, version `0.0.0.1`, and **All Regions**. That does not establish
-compatibility with every USA/Canadian/international disc revision; the generated
-hashes are the decisive check for this release.
-
-If the hashes differ, report the hashes and the Title ID, Media ID, and version
-shown by `.\xextool.exe -l default.xex`. Do not post
-the game files or the full tool output, which includes unrelated key fields.
-If the game closes after launch, also attach the newest
-`build_native/run/desktop-*/runtime.log`. A different result can indicate a
-different revision, a modified dump, or a preparation problem.
+The game checks the supported revision automatically at launch; no manual hash
+check is needed. If it reports `default.xex differs from the supported AOT revision`,
+your dump uses a different revision or a modified executable. Include your disc
+revision and the newest `build_native/run/desktop-*/runtime.log` when reporting
+the problem. Do not post game files.
 
 ## Build from source
 
 **1. Game files** — from your own dumped copy, fill in `Darkness/`:
 
-Use **Preparing the game files** above to generate the two required images.
+Use the original extracted dump; no decrypted executable or raw image is needed.
 
 ```
 Darkness/
-  _uncrypted.xex            # decrypted executable
-  basefile.exe              # raw extracted image used by analysis/tests
-  default.xex
+  default.xex               # original encrypted executable
   Content/  Content_Eng/ .../ ExtraContent/
   System/                   # engine shaders and system data
 ```
@@ -114,7 +177,8 @@ Darkness patches automatically. Existing checkouts from the old setup instructio
 are supported too. The first build needs an internet connection.
 
 You'll need 64-bit Windows, Git, Visual Studio 2022 with the **ClangCL** toolset,
-CMake 3.24+, Python 3.11+, and ~15 GB free. Output lands in
+CMake 3.24+, Python 3.11+, MSYS2 MinGW64 build tools at `C:\msys64`, LLVM at
+`C:\Program Files\LLVM`, and ~15 GB free. Output lands in
 `build_native/Release/`.
 
 The XMA audio build also requires MSYS2 at `C:\msys64` with MinGW64 GCC and
@@ -123,11 +187,14 @@ The XMA audio build also requires MSYS2 at `C:\msys64` with MinGW64 GCC and
 If MSYS2 is installed elsewhere, set `MSYS2_ROOT` before building, e.g.
 `$env:MSYS2_ROOT = 'D:\msys64'`.
 
-**3. Play** — double-click `Launch.cmd`:
+**3. Play** — double-click a launcher:
 
 | Command | What it does |
 |---|---|
 | `Launch.cmd` | Play with sound |
+| `LaunchWithSettings.cmd` | Choose settings and language, then play with sound |
+| `LaunchWithUpdates.cmd` | Check for updates, then play with sound |
+| `LaunchStallProfiler.cmd` | Play with sound and record runtime stalls in the runtime log |
 | `Launch.cmd mute` | Play muted |
 | `Launch.cmd preview` | Engine preview build (muted by default) |
 | `Launch.cmd stutter` | Play with sound while recording slow-frame timings |
@@ -136,15 +203,48 @@ If MSYS2 is installed elsewhere, set `MSYS2_ROOT` before building, e.g.
 
 Extra arguments reach the game untouched, e.g. `Launch.cmd play --fps 120`.
 
-Click the game window to capture the mouse (**F1** controls guide, **F2**
-toggle capture, **Esc** release).
+Downloaded releases supply `LaunchStallProfiler.cmd` and `LaunchShadowCapture.cmd`
+in a separate optional **diagnostic-launchers ZIP**. Extract it into the installed
+game folder, beside `Launch.cmd`. These launchers are also in source checkouts.
+
+For runtime hitch diagnostics, use `LaunchStallProfiler.cmd`, reproduce the hitch,
+then close the game. The newest `build_native/run/desktop-*/runtime.log` includes
+`[STALL]` reports for frames over 16.67 ms and runtime/HLE calls over 2 ms,
+`[WAIT]` details, and the largest slow-frame contributors. The launcher uses
+your saved game settings. Profiling is disabled by default; set
+`DARKRECOMP_STALL_PROFILE=1` to enable it for another launch, or use
+`tools/run_native.py --stall-profile` for a bounded development run. Build with
+`-DDARK_STALL_PROFILER=OFF` to exclude the profiler completely.
+
+The mouse captures automatically when keyboard/mouse gameplay starts or resumes
+after a menu. Click to recapture after a manual release or Alt-Tab (**F1** controls
+guide, **F2** toggle capture, **Esc** release).
 
 ## Docs
 
 - [CONTROLS.md](CONTROLS.md) — every binding, launcher option, and setting
 - [RENDERING.md](RENDERING.md) — how the renderer and frame pacing work
+- [STEAM_DECK.md](STEAM_DECK.md) — Proton setup, validation scope and diagnostics
 
 ## Updating a downloaded release
+
+Run **LaunchWithUpdates.cmd** to build and install the latest official `main`
+commit before playing. It requires the build tools listed above and a complete
+supported game dump. The updater retains a separate source/build copy outside
+your installation, tests the build, and verifies the resulting package and files
+with SHA-256 hashes before installing. Close the game first. Recovery copies and
+build logs are kept in the folder printed by the updater. Network failures still
+let you play the installed version; build failures stop the update and leave the
+previous program files available through **Launch.cmd**.
+
+To install only published releases with no compiler, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\update_release.ps1
+```
+
+When updating from v0.1.5, extract the new ZIP once to install the new launcher;
+the older updater does not recognize the added Russian menu files.
 
 Close the game, extract the new Windows ZIP into your existing game folder,
 and replace the included program files. Keep **Darkness/**, **saves/**, and
@@ -153,7 +253,10 @@ You do not need to rebuild.
 
 ## Updating a source build
 
-Pull the latest version and run the build again:
+**LaunchWithUpdates.cmd** also updates source checkouts. The checkout must be
+clean and able to fast-forward to official `main`; it preserves local commits
+and refuses divergent histories. It rebuilds and tests the selected commit before
+marking the installed program current. Alternatively, pull and build manually:
 
 ```powershell
 git pull --ff-only
@@ -171,13 +274,16 @@ commands install the missing generator patches and regenerate the output.
 Maintainers can build, test, and package a Windows ZIP with:
 
 ```powershell
-python tools/package_release.py --version v0.1.1
+python tools/package_release.py --version v0.1.7
 ```
 
 Run from a clean, committed checkout with the build prerequisites installed.
-The ZIP and SHA-256 checksum land in `build_native/releases/`. The packager
-includes the launcher, runtime dependencies, notices, and audio-library source;
-game dumps, saves, settings, build tools, and diagnostic logs are excluded.
+The Windows ZIP, optional diagnostic-launchers ZIP, and their SHA-256 checksums
+land in `build_native/releases/`. The Windows ZIP includes the normal launchers,
+runtime dependencies, notices, and audio-library source. Diagnostic launchers
+are only in the separate ZIP, with instructions for extracting it beside
+`Launch.cmd`. Game dumps, saves, settings, build tools, and diagnostic logs
+are excluded from both packages.
 
 ## Tests
 
@@ -205,3 +311,5 @@ ctest --test-dir build_native -C Release --output-on-failure
 GPLv3 — see [COPYING](COPYING), matching the upstream
 [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp) /
 [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) toolchain this port builds on.
+
+Development includes assistance from OpenAI Codex.

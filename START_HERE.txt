@@ -4,14 +4,13 @@ THE DARKNESS RECOMP - START HERE
    Open the extracted folder. Do not run the game from inside the ZIP.
 
 2. Copy your own Xbox 360 game dump into the Darkness folder.
-   If _uncrypted.xex or basefile.exe is missing, generate them using the
-   PREPARING THE TWO MISSING FILES steps below. This is normal for a disc dump.
+   Only the original extracted files are needed. No XexTool preparation is needed.
    The finished folder should look like this:
 
      Launch.cmd
+     LaunchWithSettings.cmd
+     LaunchWithUpdates.cmd
      Darkness\
-       _uncrypted.xex
-       basefile.exe
        default.xex
        Content\
        System\
@@ -20,78 +19,91 @@ THE DARKNESS RECOMP - START HERE
        Release\
          DarkRecomp.exe
          DarkRecompPreview.exe
+         DarkRecompSettings.exe
          ...leave all the other included files here
 
    Put the game files directly inside Darkness, not Darkness\Darkness.
    Game files are not included. An ISO alone will not work: use the extracted
-   dump, including its decrypted _uncrypted.xex and basefile.exe images.
-   The release supports the same game revision used to build it. Renaming an
-   ISO or default.xex does not create the required decrypted images.
+   dump, including its original default.xex. The game decodes it in memory.
+   This build recognizes the original supported disc executable and the Russian
+   localization from issue #37. Keep each executable with its matching game files.
+   For the Russian dump, choose English (or System default on Russian Windows);
+   its translated assets use the game's English content slot.
 
 3. Double-click Launch.cmd. That's it - no build or developer tools needed.
+   To choose settings and language before playing, use LaunchWithSettings.cmd.
+
+   For Steam on Windows, add build_native\Release\DarkRecomp.exe as a Non-Steam
+   Game. Set Start In to this extracted folder and leave Launch Options empty.
+   Sound and normal gameplay are enabled by default. For an existing shortcut
+   to Launch.cmd or DarkRecompPreview.exe, edit its Properties to target
+   DarkRecomp.exe and remove --sound. The shortcut helper preserves existing
+   entries, so this change must be made manually.
 
 Windows 10/11, 64-bit, with a Direct3D 11-capable graphics device is required.
 The audio and Visual C++ runtime files are included. Keep them with the game.
 
-PREPARING THE TWO MISSING FILES
-You need your own default.xex and xorloser's XexTool (v6.3 was tested).
-XexTool is a separate preparation tool and is not included in the release.
-basefile.exe is an extracted Xbox 360 memory image, not a Windows program.
-
-1. Put xextool.exe beside default.xex inside the Darkness folder.
-2. Open that folder in File Explorer. Type powershell into the address bar
-   and press Enter. Run these commands one at a time:
-
-   .\xextool.exe -e u -c u -o _uncrypted.xex default.xex
-   .\xextool.exe -b basefile.exe default.xex
-
-3. Confirm both commands report success. Keep default.xex and both new files
-   in Darkness, then run Launch.cmd from the parent folder.
-
-These commands preserve default.xex. Keep the -o option on the first command.
-Do not rename default.xex or apply region/devkit patches. Back up any existing
-generated files before regenerating them.
-
-CHECKING YOUR GAME VERSION (v0.1.1)
-Run this in the same PowerShell window:
-
-   Get-FileHash .\_uncrypted.xex, .\basefile.exe -Algorithm SHA256 | Format-List
-
-Expected SHA-256 values (uppercase/lowercase does not matter):
-_uncrypted.xex:
-  a7ccd87860889fa082d62dcc24382467d59c8031f6e99d2ed9f3dbddaa7d535e
-basefile.exe:
-  180b7fc8f57462f6bac3404ecab061a8d79914c7a3e9a12c238bd3449e72d049
-
-The tested dump reports Title ID 545407EE, Media ID 0F213645, version 0.0.0.1,
-and All Regions. USA/Canada/international labels alone do not prove a match.
-The generated hashes must match this release. If they differ, report the
-hashes and the Title ID, Media ID, and version shown by:
-
-   .\xextool.exe -l default.xex
-
-Share only those fields, not the game files or the full tool output. Different
-hashes can mean a different revision, modified files, or a preparation problem.
+Linux from Windows: with Ubuntu configured in WSL2, double-click SetupLinux.cmd,
+then PlayLinux.cmd. Setup installs the tested Proton tools and copies the game
+into Linux storage. Rerun SetupLinux.cmd to update without replacing Linux saves.
+See STEAM_DECK.md for prerequisites, options and the verified test scope.
+Steam Deck gameplay and performance are not verified. The opening Linux scene
+rendered, but camera movement and tutorial completion were not confirmed.
+This release checks the supported The Darkness revision automatically at launch.
+Other Xbox games and updated executables need their own port; changing a hash
+will not add support.
 
 CONTROLS
 Click inside the game to use the mouse. Press F1 for the controls guide.
 F2 toggles mouse capture. Escape pauses and releases the mouse.
+Click menu choices with the released cursor. Remap gameplay keys, Alt and
+mouse buttons (including M4/M5) in Options > Controls > Keyboard bindings.
+Exit Game is in the main/pause menu.
 Alt+Enter switches fullscreen/windowed. Controllers are supported.
-Change graphics options in the game's Options > Video Settings menu.
+Change graphics options and language in Options > Video Settings, or use
+LaunchWithSettings.cmd before starting the game. Both save to the same settings
+file. In-game language changes take effect after restarting.
 
 UPDATING AN OLDER RELEASE
+Use LaunchWithUpdates.cmd to check GitHub before playing. It automatically
+rebuilds the latest main-branch commit, verifies the resulting program files,
+and keeps your game files, saves, achievements and settings. Commit updates need
+Git, Python 3.11+, CMake, and Visual Studio 2022 with C++ and Clang tools.
+The audio build also needs MSYS2 MinGW64 build tools at C:\msys64 and LLVM
+at C:\Program Files\LLVM (including llvm-lib.exe).
+Downloaded installs keep a separate source/build copy with your own dump;
+allow disk space for that copy and build outputs. Close the game before updating.
+The first build can take several minutes. If the network is unavailable, you can
+still play the installed version. The updater prints its recovery folder.
+Source checkouts must be clean and fast-forwardable; it preserves local edits.
+
+To update from v0.1.5 or earlier, extract this complete ZIP once. Older updater
+versions do not accept the newly added Russian-menu files.
+Use Launch.cmd to play without compiling. To continue checking only packaged
+releases, run:
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\update_release.ps1
+
 Close the game. Extract the new Windows ZIP into your existing game folder
 and replace the included program files. Keep your Darkness folder, saves
 folder, and DarkRecomp.settings.ini. They contain your game, progress, and
 settings, and are not supplied or overwritten by this release.
 
 IF IT DOESN'T START
-- Extract the whole ZIP. Keep Launch.cmd and build_native together.
+- Extract the whole ZIP. Keep the launchers and build_native together.
 - If the launcher lists missing files, check step 2 above.
+- If the game reports "default.xex differs from the supported AOT revision",
+  your dump uses a different revision or a modified executable. Include your
+  disc revision and the runtime.log below when reporting it. Do not post game files.
 - If Windows reports a missing DLL, extract the whole release again.
 - If the game closes after launch, look in build_native\run for the newest
   desktop-* folder and its runtime.log. Include that log when reporting the
   problem at https://github.com/portingpete/The-Darkness-Recomp/issues.
+- Diagnostic launchers are supplied in the separate diagnostic-launchers ZIP.
+  Extract that optional ZIP beside Launch.cmd when troubleshooting.
+- To diagnose a hitch, use its LaunchStallProfiler.cmd, reproduce the slowdown,
+  and close the game. The newest desktop-*\runtime.log contains [STALL] and
+  [WAIT] timing reports plus the largest slow-frame contributors. It uses your
+  saved settings, and profiling is disabled again on an ordinary launch.
 
 More controls and launcher options: CONTROLS.md
 Downloads: https://github.com/portingpete/The-Darkness-Recomp/releases

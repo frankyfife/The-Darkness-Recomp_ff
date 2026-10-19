@@ -13,8 +13,19 @@ remains 720. Video Settings now offers 360p, 480p, 720p, 1080p, 1440p and
 2160p. A 3440x1440 display can render at 3440x1440 when 1440p is selected;
 a 3840x2160 display can render at 3840x2160 when 2160p is selected. Dimensions
 are capped at 4096 pixels wide and 2160 high, preserving aspect when the width
-limit is reached and rounding to even guest dimensions. Internal resolution
-changes apply on restart.
+limit is reached and rounding to four-pixel guest viewport boundaries. Internal
+resolution changes apply on restart.
+
+After enabling **F6 resolution shortcut** in the F5 developer panel, F6 switches
+native rasterization between 720p and 1440p during play when the
+startup guest buffer is 720 pixels high. It retains the guest dimensions and
+aspect, waits for a completed frame, and migrates retained color, depth,
+stencil and resolved texture contents before committing the new targets.
+Shader and geometry caches remain warm; pending exposure queries keep their
+original normalization scale. The selected height saves automatically. A
+short status message shows the actual dimensions; unsupported launch modes
+or capped aspects show an unavailable message instead. Menu resolution changes
+retain their restart behavior.
 
 The PC renderer scales render targets, viewports and copied regions together
 by an integer factor of one, two or three. It rasterizes geometry at the selected
@@ -32,6 +43,24 @@ resolved-texture sampling and exposure histogram normalization.
 new edge coverage inside logical pixels and retains it through resolve/present.
 Startup captures at 3440x1440 and 3840x2160 also exercise the original game.
 
+Shadow projectors retain the original Xenon fractional comparison filter and its
+three-texel box footprint. At native scales two and three, resolved shadow atlases
+contribute every physical depth texel covered by that box, with fractional weights
+at its edges. Sampling only the logical texel centers discarded additional caster
+coverage and caused moving shadows to shimmer despite higher-resolution maps.
+Unscaled atlases and CPU textures retain the original sixteen comparisons and
+normalization by nine. Depths are compared before their results are blended,
+preserving shadow softness, reversed depth, texture addressing and border depths.
+The original caster bias is retained. GPU contracts sweep fractional vertical,
+horizontal, diagonal and corner edges at scales one, two and three on hardware
+and WARP, including rasterized caster coverage inside logical texels and switches
+between resolved atlases and CPU textures.
+
+A 2560x1440 in-game Jackie monologue capture exercises this projector. The
+earlier fractional-filter repair removed coverage quantization to 1/16. Native
+atlas integration also uses the distinct caster depths and partial coverage that
+the logical-center filter skipped.
+
 The original selected display mode retains its logical resolution identifiers
 while its allocation extents change before buffer creation. The engine then
 uses those dimensions for both the perspective projection and CPU visibility
@@ -40,12 +69,54 @@ Full-screen videos retain their source aspect, and the front-end menu retains
 its 16:9 content width. The journal and gameplay HUD keep their original
 height-based layout.
 
+The full-screen movie painter's original black background covers the entire
+display, including ultrawide pillars after the intro crash. Its separate video
+draw retains the fitted menu matrix. The temporary background transform uses
+the exact original canvas and restores the fitted matrix before the movie and
+following controls, preserving embedded videos and other menu draws.
+
+Authored white intro, character-name and credit text fits its 853x480 canvas
+uniformly on displays narrower than 16:9, keeping it centered and inside the
+viewport. The original font renderer adds an alpha-matched black shadow while
+retaining each glyph's authored position. This adjustment is scoped to the
+original heading and title/credits painters; their fades, pictures and other HUD text retain
+their existing layout.
+
+Dialogue subtitle rendering retains the original glyph geometry, wrapping,
+clipping, colors, fades and outline passes. At higher pixel densities, an owned
+atlas rasterizes system Arial outlines through DirectWrite with grayscale
+antialiasing. Each glyph fits its original ink rectangle within the unchanged
+normalized UV cell; font metrics and the 50%..200% Subtitle Size setting remain
+independent of raster quality. The original bitmap is retained at native 720p
+and 100% size, and for unsupported glyphs or unavailable font/raster resources.
+The scalable typeface follows the original proportions but its letter shapes
+can differ from the shipped fonts.
+
+Only the nine verified subtitle string callers tag their draws. Deferred native
+outline copies retain that tag through the original VB manager's frame generation
+and allocation lifetime. Font metadata binds to the actual owned upload generation
+for the Text or Darkness atlas, including both modern color and legacy alpha
+uploads. Texture ID reuse cannot attach old glyph metadata to a new image.
+Because the native atlas uploads lazily, verified subtitle producers refresh
+registration around their draw; unchanged font/image pairs retain the cached atlas.
+Raster density uses factors two, four or eight according to render height and
+subtitle size. The generated atlas cache has a 64 MiB budget; shipped image limits
+remain unchanged. Russian byte-coded fonts use the verified CP1251 content slot.
+
 Alt+Enter toggles borderless fullscreen. Window resizing recreates only the
 swapchain views, depth buffer and output readback resource, retaining the device,
 world textures and internal scene buffers. Presentation fits the existing scene
 without cropping or stretching. Restart to change the internal aspect ratio;
 `--width W --height H` selects an explicit aspect and window size. See
 [CONTROLS.md](CONTROLS.md) for launcher and input options.
+
+Tentacle menus retain the original gray fade, destination-alpha mask and
+radial/additive lighting, including the warm floating glow around the tentacles.
+`GUIFadeToWhite` uses unboosted source RGB as the fade's backdrop while keeping the
+original fade timer and alpha arithmetic. Scaled color-cube copies use point
+sampling to prevent pink contamination while the original color lookup keeps its
+interpolation. Hardware and WARP contracts cover source color, the gray glow,
+the reveal mask and retained light extraction.
 
 Options > Video Settings uses the original CubeMenu and CubeButton classes.
 `tools/compile_video_menu.py` builds private `CubeWnd.pc.xcr` and
@@ -68,7 +139,7 @@ hooks change the setting; the original menu retains focus,
 navigation and text rendering. ALWAYSPAINT refreshes the current value through
 the original CStr and menu text path. No host controls, popup, or F3 panel is used.
 
-Changes automatically save brightness, gamma, FOV, bloom, motion blur, antialiasing, VSync, frame cap, render height and display
+Changes automatically save brightness, FOV, bloom, motion blur, antialiasing, VSync, frame cap, render height and display
 mode to an adjacent staged INI copy, then replace the configuration while
 preserving other keys. Save failures appear in the native row labels. Frame cap,
 VSync and fullscreen apply between completed render frames. Internal height
@@ -82,14 +153,48 @@ The portable INI stores `BrightnessPercent=50..200`; absent or invalid values
 recover to 100 without changing Gamma or other preferences. Changes apply
 immediately, and repeated presents do not accumulate the adjustment.
 
-Gamma follows Brightness, with 0.50..1.50 in 0.05 steps and
-1.00 as the neutral default. Lower values darken the image. The portable INI
-stores `GammaPercent=50..150`; absent or invalid values recover to 100.
-The presentation shader applies `pow(rgb, 100 / GammaPercent)` after optional
-FXAA, preserving alpha, black borders and the owned scene. Neutral brightness
-and gamma retain the exact previous output and direct-copy path. Changes apply
-immediately; repeated presents never compound the correction. Ten compact rows and their
-help text fit the original twenty-cell menu grid.
+Gamma follows Brightness using the shipped `CubeOptionButton` and
+`CubeOptionMeter`, bound to `OPTG\\VIDEO_GAMMA` with 12 steps. The original
+`CubeMenu_VideoSettings` class applies calibration; leaving Options and choosing
+Yes saves `VID_GAMMA` in the game profile. The original normalized default is
+0.5; its calibration exponent is `1 + (0.5 - VID_GAMMA) * 0.75`.
+The former PC `GammaPercent` INI key is ignored and preserved as legacy data.
+
+The native renderer observes completed original gamma tables at the Xbox PM4
+emitters, retaining their channel order and frame ordering. `VdGetCurrentDisplayGamma`
+returns the HDTV transfer type and power expected by the original D3D helpers.
+The 128-segment PWL table consumes rounded 10-bit RGB; the 256-entry table uses
+rounded 8-bit indices. Guest frontbuffer format54 and the live preview retain
+10-bit storage. Calibration runs once on source texels before output scaling
+and optional FXAA, with PC Brightness applied afterward. The raw scene stays
+owned separately, so repeated presentation does not accumulate calibration.
+Diagnostic BMP captures include the original display calibration, before
+optional PC Brightness/FXAA/output fitting. Eleven PC settings and the original
+Gamma control fit the original twenty-cell menu grid.
+
+Color grading retains the original 18-by-18-by-18 color cube, stored as a
+324x18 lookup texture, at every render resolution. At two-times and three-times
+rasterization, each table texel occupies a repeated block of physical pixels.
+The final composite now interpolates between the original table entries with
+their original weights. The append stage also retains its authored linear
+filter instead of inheriting the point filter used for spatial table copies.
+This corrects the resolution-dependent grading and banding reported in
+[issue #25](https://github.com/portingpete/The-Darkness-Recomp/issues/25).
+
+The correction applies to recognized resolved color tables with supported
+base-level linear sampling. Scene resolution, render-target formats, exposure
+and the user's gamma preference retain their existing behavior. Hardware and
+WARP contracts check all color-table stages and the original copy/append/gamma
+chain at scales 1/2/3, including the retail 16-bit table with exponent scaling,
+black and near-black colors, fractional interpolation, and renderer-state
+changes. A scale-1 result is checked against an independent trilinear oracle;
+the higher scales then agree within one 8-bit output level.
+
+Live Consite captures at neutral presentation gamma show the 1440p hand and
+metal color bands disappearing. The 720p, 1080p and 2160p outputs were also
+inspected, along with the dark Other World sewer scene at 1440p. These live
+checks confirm the visible resolution fix; animation and noise make them
+unsuitable for pixel-equivalence comparisons.
 
 Darkness Vision uses the original `WClientMod_DV5_0` and `WClientMod_DV5_1`
 programs, including their base, radial-add and radial-multiply variants. Missing
@@ -102,9 +207,30 @@ writes remain enabled with an ALWAYS comparison in that first stage, matching
 the original state, so the second stage cannot overwrite the gold glow.
 GPU contracts cover both stages, all variants, atlas coordinates, nonuniform
 gold edge glow, the two-stage depth mask, intensity and near/far fades, and
-far-depth discard at scales 1/2/3 on hardware and WARP. The original noise maps in stage-0 slots 2 and 4
+far-depth discard at scales 1/2/3 on hardware and WARP. The original noise maps
+in stage-0 slots 2 and 4
 can be recovered after a missed or evicted CPU texture upload. Scene, depth
 and effect-atlas inputs still come from their GPU resolves.
+
+Other World uses the original `WClientMod_OW1_1` grain pass and
+`WClientMod_OW1_2` scene composite. Missing native translations left a
+half-size scene view exposed in the upper-left corner of the sewers.
+Both programs now retain the Xenon floating-depth reconstruction, world-space
+noise, distance fade and scene-minus-grain composition. Only the grain pass's
+authored noise in slot 1 is recovered from CPU memory; scene, depth and mask
+inputs retain their GPU resolves. Hardware and WARP contracts cover full-screen
+composition, separate atlas coordinates, subtraction and alpha, noise and
+distance fades at scales 1/2/3. A 3440x1440 sewer replay reproduced the duplicate
+before the fix and showed one full-screen view afterward.
+
+`--shadow-capture <new directory>` enables two on-demand F8 captures at complete
+render-frame boundaries. Each retains the screenshot, ordered commands and
+owned draws. Projector evidence includes the resolved atlas and scene depth,
+with depth/stencil and target alpha before and after its draw. Captures leave
+subsequent rendering unchanged; the hardware/WARP contracts compare inspected
+and ordinary frames. Screenshot I/O failures are logged while gameplay continues,
+and existing captures are never overwritten. The preview contract covers failed
+writes, continued rendering, recovery and overwrite protection.
 
 Antialiasing offers Off (default) and FXAA, stored as `Antialiasing=0` or `1`.
 Missing or invalid values default to Off. Changes apply at the next presentation
@@ -123,6 +249,29 @@ also clears the glow bit. Existing shader permutations preserve exposure and
 color mapping. Velocity generation, radial Darkness effects and the original
 shader assets remain intact. The original captured draw metadata is unchanged;
 the selected shader's reflected texture mask controls its actual bindings.
+
+At 1440p and 4K, bloom retains the original 720p sampling footprint. The
+sixteen-tap `XRUtil_ShrinkTexture8` filter and seventeen-tap
+`XREngine_GaussClamped` filter sample a cached logical-size floating-point
+view of resolved color data, averaging every 2x2 or 3x3 physical pixel block.
+Their output is evaluated at logical pixel centers, and Final5 filters its
+bloom input on that same grid. Original weights, offsets, atlas clamps,
+exposure and fetch exponents remain intact. This prevents gaps between taps
+from dropping small highlights or producing patterned halos. Each resolve
+invalidates the logical view; resolution changes discard it. Helper draws
+are excluded from exposure histogram queries. CPU images, point samplers,
+scene detail and the sharp component of the damage effect keep their existing
+sampling. Hardware and WARP bloom contracts cover fine-light phases and
+independent filter oracles at 720p, 1440p and 4K.
+
+Lamp coronas also use the original flare visibility callback. Its Xbox query
+fallback supplied a nearly zero count to the native game, suppressing the
+flare before bloom. The native renderer now measures the original colorless,
+depth-tested patch asynchronously and feeds completed logical pixel counts
+back to the callback. Flare IDs have separate result owners from exposure
+histograms; pending measurements retain the last completion, including zero.
+Tests verify visible, partial and hidden patches, unchanged scene color/depth,
+and ordered completion at every supported rendering scale.
 
 The FOV preference remains portable;
 `--fov` overrides it for the current run. Values are horizontal degrees at
@@ -182,15 +331,31 @@ buffering, the same scenario (`stutter-diag3-20260915-115058`) holds 120 FPS
 with p99 under 9.2ms and no report-linked hitches. `[ReportCost]` logs only
 totals over 10ms, so steady runs stay quiet while regressions resurface.
 
-Parked: skipping the tone-map copy and re-present of an unchanged image while
-the engine produces nothing (plus a 2ms yield to loader threads) was
-implemented and audited — arming only after a confirmed `S_OK` present, with
-new queue parts, settings saves, resizes, fullscreen toggles and test captures
-all resuming normal display — but reverted unvalidated when the session's
-display went fully occluded (`presentOccluded` on every present), which also
-disarms the skip by design. To retry: restore the `displayCurrent`/`idleSkip`
-logic in `native_main.cpp`, run the visible 150s route, and expect fewer
-stale presents during load walls with identical `worldFPS`.
+The display reuses an unchanged completed image after a confirmed `S_OK`
+present. New queue parts, settings changes, repaint/show/activation events and
+resizes invalidate that reuse. Occlusion and other present statuses keep the
+normal retry path active. The existing queue wait still wakes on new engine
+work; the fast path adds no sleep or simulation delay. `[DisplayReuse]` reports
+skipped copies/presents, and accepted-frame metrics still count only newly
+rendered frames. `DisplayReuseContract` checks real GPU output with a quiescent
+producer, repaint, resize, partial frames, gamma/brightness and FXAA changes;
+hidden-window checks model acceptance separately from actual DXGI statuses.
+
+Completed authored texture uploads are prepared on the display thread during
+loading, between complete render frames. A queue of at most 4,096 weak image
+references avoids extending the lifetime of evicted CPU snapshots. Each loop
+examines at most 64 entries and stops after 4 MiB or 1 ms of preparation. The
+first image can exceed these thresholds because a device call cannot be
+preempted. Preloading uses spare GPU-cache capacity; unused prepared images
+receive the lowest eviction priority until a draw samples them.
+
+Complete authored mip chains initialize all texture faces and levels through
+one immutable D3D11 texture creation. Sparse resident chains and generated mips
+retain their existing upload paths. Hardware and WARP contracts check exact
+authored pixels, all 24 cubemap subresources, mip selection, binding preservation,
+cache pressure and upload reuse. `[TexturePreload]` reports preparation time,
+backlog, expired entries and failures. Routine APC completions in alertable
+audio waits share the bounded startup trace instead of logging every refill.
 
 Small deadline overruns retain the existing pacing schedule to avoid accumulating
 timing drift. A delay of at least one additional frame period resets the schedule
@@ -233,6 +398,40 @@ follow the active input source; see `CONTROLS.md` for the switching behavior.
 
 ## Rendering changes
 
+- Uploaded world geometry retains vertex count and skinning extrema instead
+  of a second expanded CPU vertex array. GPU bytes, immutable packed ownership,
+  upload budgets and index validation are unchanged. Metadata takes 68 bytes
+  per cached geometry instead of 240 bytes per vertex. Present index streams
+  are scanned together with SSE2, preserving the previous extrema on equal
+  values; unskinned meshes need no full scan. Explicit inspection reconstructs
+  just its three selected vertices from the immutable packed source.
+  `WorldVertexMetadataContract` compares the former algorithm across supported
+  formats, signed zeros and subnormals, and checks diagnostic subset failures.
+- Position-only immediate meshes with at least 128 vertices copy directly to
+  their final owned storage, avoiding a temporary allocation and interleave
+  pass. Other captures retain the original stream-copy order. SSE2 checks raw float exponent
+  bits without byte swaps or floating arithmetic; packed fields remain exempt
+  and scalar tails read only complete words. The existing bounded retention
+  cache still compares complete metadata and owned bytes. Scene contracts check
+  exact bytes, hash collisions, eviction, snapshot lifetime, changed/retained
+  sources, sparse/all-stream layouts, finite edge cases and nonfinite values in
+  vector lanes and tails.
+- Compiled world vertex and fragment shaders use a content-keyed disk cache.
+  Keys include the complete source and wrappers, entry/profile, compiler flags,
+  macros and the exact compiler DLL. Cached bytes retain driver creation and
+  fragment reflection checks. Invalid, corrupt or unavailable entries fall
+  back to compilation; successful compilation atomically repairs old entries.
+  Vertex cache hits reuse the validated shader object. `[RenderShaderCache]` reports
+  fragment hits, misses and initialization time. The hardware/WARP cache
+  contracts cover identity, reflection, corruption, truncation and failed writes.
+- Native audio submission reuses sixteen PCM slots and a fixed diagnostic
+  snapshot, eliminating steady-state vector allocations. SSSE3 byte shuffles
+  convert planar big-endian samples to interleaved host order without floating
+  arithmetic; the baseline CPU build keeps scalar conversion. Audio contracts
+  compare IEEE bits, alignment and protected-page boundaries, then exercise
+  queue saturation, completion, errors, registration and teardown on XAudio2.
+  Optional `AudioPcmBenchmark --benchmark` times conversion and preparation;
+  these operation timings do not establish a gameplay FPS improvement.
 - Draw-object recycling transfers empty snapshots in batches of 32 between
   the producer and consumer. Up to eight rendering threads receive a private
   reserve; additional threads use the synchronized shared pool directly.
@@ -299,10 +498,27 @@ follow the active input source; see `CONTROLS.md` for the switching behavior.
   every original material pass and its order.
 - Read fragment constants from the original completed device upload, including
   the shader's intentional unused NaN values during the zero-blur GUI fade.
+  Retain up to 64 vectors so lit blood/decal programs can use their original
+  lighting and projector constants beyond vector 15.
+- Translate the original water, projected-mark, lit-decal and world-video
+  fragment programs. Water retains authored normal/fog maps alongside GPU
+  reflection/refraction inputs; decals retain plane clipping, lighting,
+  projection and alpha. Video snapshots retain raw big-endian V,U chroma;
+  native sampling converts it to logical U,V without changing immutable frame
+  generations. Hardware/WARP tests exercise their rendered
+  output at 1x, 2x and 3x resolution; capture tests call the original binders.
+- Retain each original decoded triangle-list index chunk until its matching
+  indexed draw, then copy it into the owned render queue. Invalid or mismatched
+  draws consume the pending chunk so later draws cannot reuse stale indices.
 - Follow the original resource's primary/alternate texture selection, including
   inline texture objects and readiness checks.
 - Follow completed sampler filtering, addressing, LOD and anisotropy settings.
-  Generate native mip chains from decoded base images to reduce texture aliasing.
+  The texture-filtering menu applies explicit 2x/4x/8x/16x selections to eligible
+  owned 2D surface images, overriding their authored anisotropy. Original
+  preserves the captured game setting, which already requests 16x on many world
+  textures. Point/mixed/base-only sampling, cubemaps, resolved textures, video,
+  GUI and postprocess filters retain their original behavior. Generate native
+  mip chains from decoded base images to reduce texture aliasing.
 - Capture and retain only texture slots declared by the original fragment
   permutation. Depth and texture-free passes skip texture work. Shader creation
   checks that this conservative mask includes every compiled texture binding;

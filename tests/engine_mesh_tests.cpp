@@ -2,6 +2,7 @@
 #include "renderer/engine/texture_upload.h"
 #include "renderer/engine/texture_mip_layout.h"
 #include "renderer/engine/render_trace.h"
+#include "renderer/engine/decoded_geometry.h"
 #include "renderer/engine/world_mesh.h"
 #include "renderer/d3d11/engine_preview.h"
 #include "renderer/d3d11/display_context_d3d11.h"
@@ -20,19 +21,152 @@ using namespace DarkRecomp;
 using namespace DarkRecomp::Native;
 extern "C" PPC_FUNC(__imp__sub_8225F320);
 extern "C" PPC_FUNC(__imp__sub_82864F20);
+extern "C" PPC_FUNC(__imp__sub_822478C0);
+extern "C" PPC_FUNC(__imp__sub_8223AFE8);
+extern "C" PPC_FUNC(__imp__sub_8224DAE0);
 static void require(bool result, const char* reason) { if (!result) throw std::runtime_error(reason); }
+static void testSubtitleContextLifetime() {
+    auto* base = reinterpret_cast<uint8_t*>(uintptr_t(0x1000));
+    constexpr uint32_t manager = 0x2000, draw = 0x3000;
+    retireQueuedPromptContexts();
+    struct Cleanup { ~Cleanup() { retireQueuedPromptContexts(); } } cleanup;
+    require(!currentSubtitleRenderContext(), "Subtitle scope leaked into the test entry");
+    {
+        ScopedSubtitleRenderContext subtitle(true);
+        require(currentSubtitleRenderContext(), "Subtitle producer scope was not enabled");
+        {
+            ScopedSubtitleRenderContext unrelated(false);
+            require(!currentSubtitleRenderContext(), "Nested unrelated text inherited subtitle ownership");
+        }
+        require(currentSubtitleRenderContext(), "Nested text failed to restore subtitle ownership");
+        require(std::async(std::launch::async, [] { return currentSubtitleRenderContext(); }).get() == false,
+                "Subtitle ownership crossed producer threads");
+    }
+    require(!currentSubtitleRenderContext(), "Subtitle ownership survived its producer scope");
+    recordQueuedSubtitleContext(base, manager, draw, true, 1);
+    require(!queuedSubtitleContext(base, manager, draw, 1), "Unknown manager accepted subtitle ownership");
+    resetQueuedPromptContexts(base, manager);
+    const auto generation = queuedPromptGeneration(base, manager);
+    require(generation != 0, "Subtitle manager frame has no generation");
+    recordQueuedSubtitleContext(base, manager, draw, true, generation);
+    require(queuedSubtitleContext(base, manager, draw, generation), "Deferred subtitle lost producer ownership");
+    recordQueuedPromptContext(base, manager, draw, PromptRenderContext::Menu, generation);
+    require(queuedSubtitleContext(base, manager, draw, generation), "Menu icon context cleared subtitle ownership");
+    recordQueuedSubtitleContext(base, manager, draw, false, generation);
+    require(!queuedSubtitleContext(base, manager, draw, generation), "Unrelated re-enqueue inherited subtitle ownership");
+    recordQueuedSubtitleContext(base, manager, draw, true, generation);
+    forgetQueuedPromptContext(base, manager, draw, generation);
+    require(!queuedSubtitleContext(base, manager, draw, generation), "Reallocated VB retained subtitle ownership");
+    recordQueuedSubtitleContext(base, manager, draw, true, generation);
+    resetQueuedPromptContexts(base, manager);
+    const auto next = queuedPromptGeneration(base, manager);
+    require(next != generation && !queuedSubtitleContext(base, manager, draw, next),
+            "Reused manager frame retained subtitle ownership");
+    recordQueuedSubtitleContext(base, manager, draw, true, generation);
+    require(!queuedSubtitleContext(base, manager, draw, next), "Stale producer changed a new manager frame");
+    for (unsigned i = 0; i < 4096; ++i)
+        recordQueuedSubtitleContext(base, manager, 0x4000 + i * 4, true, next);
+    recordQueuedSubtitleContext(base, manager, 0x10000, true, next);
+    require(!queuedSubtitleContext(base, manager, 0x10000, next), "Subtitle metadata overflow marked an unknown VB");
+    recordQueuedSubtitleContext(base, manager, 0x4000, false, next);
+    require(!queuedSubtitleContext(base, manager, 0x4000, next), "Overflow prevented unrelated VB metadata clearing");
+    retireQueuedPromptContexts(base, manager);
+    require(!queuedSubtitleContext(base, manager, 0x4004, next), "Retired manager retained subtitle ownership");
+}
+static void testDecodedDrawRequest() {
+    DecodedDrawRequest request;
+    constexpr uint32_t caller = 0x8225E200;
+    auto consume = [&](uint32_t lr=0x8225E200, uint32_t primitive=4, uint32_t baseVertex=0,
+                       uint32_t firstIndex=0, uint32_t count=6) {
+        return request.consume(lr,primitive,baseVertex,firstIndex,count);
+    };
+    request.record(0x10000,8192,6,0);
+    require(consume()==0x10000 && consume()==0,"First decoded chunk was lost or reused");
+    request.record(0x20000,8192,3,24);
+    require(consume(caller,4,0,12,3)==0x20000 && consume(caller,4,0,12,3)==0,
+            "Second decoded chunk lost its index offset or was reused");
+
+    // Each incorrect draw consumes the pending chunk. No later matching draw
+    // may accidentally submit indices from a different original draw.
+    auto wrong = [&](uint32_t lr,uint32_t primitive,uint32_t baseVertex,uint32_t firstIndex,uint32_t count) {
+        request.record(0x30000,8192,6,12);
+        require(!consume(lr,primitive,baseVertex,firstIndex,count),"Mismatched decoder draw accepted");
+        require(!consume(caller,4,0,6,6),"Mismatched decoder draw left stale chunk");
+    };
+    wrong(0x8225DD38,4,0,6,6);
+    wrong(caller,3,0,6,6);
+    wrong(caller,4,1,6,6);
+    wrong(caller,4,0,5,6);
+    wrong(caller,4,0,6,3);
+
+    auto invalid = [&](uint32_t indices,uint32_t capacity,uint32_t produced,uint32_t byteOffset) {
+        request.record(0x40000,8192,6,0);
+        request.record(indices,capacity,produced,byteOffset);
+        require(!consume(),"Invalid or empty decoder chunk retained stale indices");
+    };
+    invalid(0,8192,6,0);
+    invalid(0x10000,0,6,0);
+    invalid(0x10000,8193,6,0);
+    invalid(0x10000,8192,0,0);
+    invalid(0x10000,3,6,0);
+    invalid(0x10000,8192,4,0);
+    invalid(0x10000,8192,6,1);
+    invalid(0xFFFFFFFE,8192,3,0);
+    request.record(0xFFFFFFFA,3,3,0);
+    require(consume(caller,4,0,0,3)==0xFFFFFFFA,
+            "Decoded index span ending at the guest address limit was rejected");
+}
 static void put16(uint8_t* base, uint32_t address, uint16_t v) { base[address]=uint8_t(v>>8); base[address+1]=uint8_t(v); }
 static void put32(uint8_t* base, uint32_t address, uint32_t v) {
     base[address]=uint8_t(v>>24); base[address+1]=uint8_t(v>>16); base[address+2]=uint8_t(v>>8); base[address+3]=uint8_t(v);
 }
 static void putFloat(uint8_t* base, uint32_t address, float f) { put32(base,address,std::bit_cast<uint32_t>(f)); }
+static void testTexture1555(Memory& memory) {
+    auto* base=memory.base();const auto storage=memory.allocate(65536),header=memory.allocate(4096);
+    require(storage && header,"1555 decode fixture allocation failed");
+    const std::array<uint8_t,32> normalized{{0,8,16,25,33,41,49,58,66,74,82,90,99,107,115,123,
+        132,140,148,156,165,173,181,189,197,206,214,222,230,239,247,255}};
+    const std::array<std::array<unsigned,4>,4> selectors{{{0,1,2,3},{2,1,0,3},{5,4,1,0},{3,2,5,4}}};
+    unsigned comparisons=0;
+    for(bool tiled:{false,true})for(unsigned endian=0;endian<4;++endian)for(const auto& selected:selectors) {
+        uint32_t swizzle=0;for(unsigned c=0;c<4;++c)swizzle|=selected[c]<<(1+c*3);
+        const uint32_t fetch[]{2u|(1u<<22)|(tiled?0x80000000u:0),storage|3u|(endian<<6),
+            3u|(7u<<13),swizzle,0,0x200u};
+        for(unsigned i=0;i<6;++i)put32(base,header+28+i*4,fetch[i]);
+        TextureMipLayout layout;require(!getTextureMipLayout(fetch,0,0,layout),"1555 fixture layout rejected");
+        const unsigned swap=endian==1?1:endian==2?3:endian==3?2:0;
+        std::memset(base+storage,0xcd,65536);
+        std::vector<uint8_t> expected;
+        for(unsigned y=0;y<8;++y)for(unsigned x=0;x<4;++x) {
+            const unsigned red=x+y*4,green=31-red,blue=(red*7)&31,alpha=red&1;
+            const uint16_t packed=uint16_t(red|(green<<5)|(blue<<10)|(alpha<<15));
+            const uint32_t offset=tiled?worldTextureTiledOffset(x,y,layout.pitchBlocks,2):
+                y*layout.rowPitchBytes+x*2;
+            for(unsigned lane=0;lane<2;++lane)
+                base[layout.allocationAddress+layout.surfaceOffsetBytes+((offset+lane)^swap)]=uint8_t(packed>>(lane*8));
+            const std::array<uint8_t,6> rgba{normalized[red],normalized[green],normalized[blue],uint8_t(alpha?255:0),0,255};
+            for(unsigned c:selected)expected.push_back(rgba[c]);
+        }
+        ColorImage decoded;
+        require(!decodeWorldTextureImage(base,header,decoded) && decoded.valid() && decoded.sourceCodec==3 &&
+                decoded.width==4 && decoded.height==8 && decoded.pixels==expected,
+                "1555 pixels, endian conversion or component selectors differ from independent UNORM values");
+        comparisons+=32;
+    }
+    require(memory.release(storage) && memory.release(header),"1555 fixture cleanup failed");
+    std::printf("Texture1555: %u independently expected pixels across linear/tiled layouts, all endian modes and selectors.\n",comparisons);
+}
 static void nearByte(uint32_t pixel, unsigned channel, int expected) {
     require(std::abs(int((pixel>>(channel*8))&255)-expected)<=1, "Native triangle pixel does not match alpha/color projection contract");
 }
 #include "preview_antialiasing_tests.h"
 #include "preview_clear_state_tests.h"
 #include "preview_video_upload_tests.h"
+#include "world_video_capture_tests.h"
+#include "world_source_recovery_tests.h"
+#include "world_decal_capture_tests.h"
 #include "prompt_icon_tests.h"
+#include "prompt_render_tests.h"
 #include "preview_output_tests.h"
 #include "preview_shadow_capture_tests.h"
 // Synthetic source provider called by the actual original 82256008 refresh.
@@ -325,6 +459,10 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
     put32(base,attributes+108,0xFFFFFFFF); put32(base,attributes+116,0xFFFFFFFF);
     base[attributes+144]=2; base[attributes+145]=1;
     for(unsigned i=0;i<3;++i) put32(base,colors+i*4,0xFFFFFFFF);
+    uint64_t unavailableFlare=73;
+    previewBeginFlare(0);previewEndFlare();previewEndFlare();
+    require(!previewReadFlare(0,unavailableFlare) && unavailableFlare==73,
+            "Disabled preview fabricated a flare visibility count");
     enableEnginePreview();
     auto finish=[] {
         std::vector<SimpleMesh> frame;
@@ -334,6 +472,10 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
         require(!takePreviewFrame(repeated),"Completed frame was delivered twice");
         return frame;
     };
+    // Engine preview alone cannot measure visibility before world capture.
+    previewBeginFlare(0);previewEndFlare();
+    require(finish().empty() && !previewReadFlare(0,unavailableFlare) && unavailableFlare==73,
+            "Flare query queued without an active world renderer");
     auto draw=[&] { previewObserveTriangles(base,indices,1); };
     auto count=[&](size_t expected,const char* why) { draw(); require(finish().size()==expected,why); };
     auto upload=[&](uint16_t endpoint) {
@@ -660,6 +802,16 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
     put32(base,device+6024,0xFFFFFFFF);
     require(snapshotWorldDraw(base,world,validated) && std::bit_cast<uint32_t>(validated.fragmentConstants[0][2])==0xFFFFFFFF,
             "Original shader-data NaN was changed or caused the whole GUI draw to be dropped");
+    // Projected lit decals upload up to 34 constants; retain values beyond
+    // the old 16-vector limit, and reject bank overflow before reading it.
+    put32(base,program+16,34);
+    for(unsigned vector=0;vector<34;++vector)for(unsigned lane=0;lane<4;++lane)
+        putFloat(base,device+6016+vector*16+lane*4,float(vector*4+lane));
+    require(snapshotWorldDraw(base,world,validated) && validated.fragmentConstants[33]==EngineVector{132,133,134,135},
+            "Projected decal constants beyond vector15 were omitted");
+    put32(base,program+16,65);
+    require(!snapshotWorldDraw(base,world,validated),"Fragment constant bank overflow was accepted");
+    put32(base,program+16,1);
     put32(base,attributes,0);
     // Complete the original device binding after selecting each fixture
     // resource. Editing a wrapper alone does not rebind an unchanged ID.
@@ -676,6 +828,9 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
         guest.r3.u64=device;guest.r4.u64=slot;guest.r5.u64=object;guest.r6.u64=uint64_t(1)<<(31-slot);
         __imp__sub_82864F20(guest,base);
     };
+    testWorldVideoCapture(memory,threadContext,world,device,program,name,bindTexture,finish);
+    testWorldSourceRecovery(memory,world,device,program,name,bindTexture,finish);
+    testWorldDecalCapture(memory,threadContext,device,bindTexture,finish);
     textureHeader(primary,0x01000000);textureHeader(alternate,0x02000000);
     put32(base,resource+84,primary);put32(base,resource+164,alternate);
     put32(base,resource+172,0x10000000);
@@ -850,7 +1005,8 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
         std::memcpy(base+device+1152,oldSampler.data(),oldSampler.size());
         std::puts("TextureCacheResidency: guarded leading mips, four selected header forms, sampler changes and immutable completed generations passed.");
     }
-    // DV5 mixes GPU-produced scene/depth/atlas inputs with CPU-owned noise.
+    // DV5 and Other World mix GPU-produced scene/depth/atlas inputs with
+    // CPU-owned noise.
     // Recover a missed or evicted noise upload without decoding stale backing
     // memory for the GPU inputs. All six stand-ins are deliberately decodable,
     // so an overbroad recovery whitelist makes the excluded slots observable.
@@ -892,33 +1048,38 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
                     "Darkness noise fixture does not independently decode to its expected pixels");
             bindTexture(slot,objects[slot]);previewPrepareTexture(ids[slot]);
         }
-        std::strcpy(reinterpret_cast<char*>(base+name),"WClientMod_DV5_0");
-        auto captureNoise=[&](unsigned flags) {
+        auto captureNoisePass=[&](const char* fragment,unsigned flags,unsigned textureMask,unsigned cpuMask) {
+            std::strcpy(reinterpret_cast<char*>(base+name),fragment);
             put32(base,program+16,flags<<8);
             previewObserveWorld(base,world);const auto commands=finish();
             require(commands.size()==1 && commands[0].world &&
-                    commands[0].world->fragmentName=="WClientMod_DV5_0" && commands[0].world->fragmentFlags==flags &&
-                    commands[0].world->textureMask==(flags?0x37u:0x17u),"Darkness noise capture lost its original pass");
+                    commands[0].world->fragmentName==fragment && commands[0].world->fragmentFlags==flags &&
+                    commands[0].world->textureMask==textureMask,"Darkness noise capture lost its original pass");
             const auto& captured=commands[0].world;
-            for(unsigned slot:{0u,1u,3u,5u})
-                require(!captured->textures[slot],"Darkness noise recovery decoded a GPU-only or unused slot");
-            for(unsigned slot:{0u,1u,2u,4u,5u})if(captured->textureMask&(1u<<slot))
-                require(captured->textureObjects[slot].object==objects[slot] && captured->textureIds[slot]==ids[slot],
-                        "Darkness noise recovery changed a completed texture binding");
-            for(unsigned slot:{2u,4u})
-                require(captured->textures[slot] && captured->textures[slot]->valid() &&
-                        captured->textures[slot]->width==4 && captured->textures[slot]->height==4 &&
-                        captured->textures[slot]->pixels==expected[slot],
-                        "Darkness noise cache miss did not recover the nonuniform source pixels");
+            for(unsigned slot=0;slot<6;++slot) {
+                if(textureMask&(1u<<slot))
+                    require(captured->textureObjects[slot].object==objects[slot] && captured->textureIds[slot]==ids[slot],
+                            "Darkness noise recovery changed a completed texture binding");
+                if(cpuMask&(1u<<slot))
+                    require(captured->textures[slot] && captured->textures[slot]->valid() &&
+                            captured->textures[slot]->width==4 && captured->textures[slot]->height==4 &&
+                            captured->textures[slot]->pixels==expected[slot],
+                            "Darkness noise cache miss did not recover the nonuniform source pixels");
+                else require(!captured->textures[slot],"Darkness noise recovery decoded a GPU-only or unused slot");
+            }
             return captured;
+        };
+        auto captureNoise=[&](unsigned flags) {
+            return captureNoisePass("WClientMod_DV5_0",flags,flags?0x37u:0x17u,0x14);
+        };
+        struct ProtectNoise {
+            uint8_t* address;DWORD old{};
+            explicit ProtectNoise(uint8_t* p):address(p){require(VirtualProtect(address,65536,PAGE_NOACCESS,&old)!=0,"Darkness noise cache guard failed");}
+            ~ProtectNoise(){DWORD ignored{};VirtualProtect(address,65536,old,&ignored);}
         };
         const auto recovered=captureNoise(0);
         {
-            struct ProtectNoise {
-                uint8_t* address;DWORD old{};
-                explicit ProtectNoise(uint8_t* p):address(p){require(VirtualProtect(address,65536,PAGE_NOACCESS,&old)!=0,"Darkness noise cache guard failed");}
-                ~ProtectNoise(){DWORD ignored{};VirtualProtect(address,65536,old,&ignored);}
-            } protectNoise(base+storage);
+            ProtectNoise protectNoise(base+storage);
             for(unsigned flags:{1u,2u}) {
                 const auto reused=captureNoise(flags);
                 require(reused->textures[2]==recovered->textures[2] && reused->textures[4]==recovered->textures[4],
@@ -936,12 +1097,28 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
         for(unsigned slot:{2u,4u})
             require(refreshed->textures[slot]!=recovered->textures[slot] && recovered->textures[slot]->pixels==oldNoise[slot],
                     "Darkness noise recovery mutated a retained generation after cache invalidation");
+        // The Other World passes use different slot roles than DV5. Evict
+        // all prior entries so readable fake GPU backing cannot hide a broad
+        // recovery whitelist, then keep the recovered noise generation alive.
+        for(auto id:ids)previewPrepareTexture(id);
+        captureNoisePass("WClientMod_OW1_2",0,0x3,0);
+        const auto otherWorld=captureNoisePass("WClientMod_OW1_1",0,0x7,0x2);
+        {
+            ProtectNoise protectNoise(base+storage);
+            const auto reused=captureNoisePass("WClientMod_OW1_1",0,0x7,0x2);
+            require(reused->textures[1]==otherWorld->textures[1],
+                    "Other World grain redecoded an unchanged noise cache entry");
+        }
+        previewPrepareTexture(ids[1]);
+        captureNoisePass("WClientMod_OW1_2",0,0x3,0);
+        require(otherWorld->textures[1]->pixels==expected[1],
+                "Other World composite invalidation mutated retained noise pixels");
         for(unsigned slot=0;slot<6;++slot) {previewPrepareTexture(ids[slot]);bindTexture(slot,oldObjects[slot]);}
         put32(base,context+17964,oldTable);put32(base,program+16,oldProgramFlags);
         std::memcpy(base+attributes,oldAttributes.data(),oldAttributes.size());
         std::memcpy(base+device+1152,oldSamplers.data(),oldSamplers.size());
         std::memcpy(base+name,oldName.data(),oldName.size());
-        std::puts("DarknessNoiseCapture: nonuniform slot2/4 recovery, guarded cache reuse, immutable refresh and GPU-slot exclusions passed.");
+        std::puts("DarknessNoiseCapture: DV5 slot2/4 and OW1 slot1 recovery, guarded cache reuse, immutable refresh and GPU-slot exclusions passed.");
     }
     // Direct82256008 bypasses initial-upload publication. Updating pixels in
     // the same allocation must evict the old CPU image even if every descriptor
@@ -1170,6 +1347,55 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
     require(previewReadHistogram(0,measured) && measured==1152,"New pending query erased the prior completed histogram");
     pendingQuery[0].worldQuery->result->samples.store(0);
     require(previewReadHistogram(0,measured) && measured==0,"Measured zero was mistaken for an unavailable histogram");
+    // Flare ID0 and exposure bin0 are separate completion owners. Preserve
+    // ordered begin/draw/end commands and the previous result until the GPU
+    // publishes a newer count, including a genuine fully occluded zero.
+    measured=91;require(!previewReadFlare(0,measured) && measured==91,
+        "Unavailable flare query fabricated a completed count");
+    previewBeginFlare(0);previewObserveWorld(base,world);previewEndFlare();auto flare=finish();
+    require(flare.size()==3 && flare[0].worldQueryBegin && flare[0].worldQuery && flare[1].world &&
+        flare[2].worldQuery==flare[0].worldQuery && !flare[2].worldQueryBegin &&
+        flare[0].worldQuery->result!=queried[0].worldQuery->result,
+        "Flare query lost draw ordering, ownership or histogram isolation");
+    flare[0].worldQuery->result->samples.store(64,std::memory_order_release);
+    require(previewReadFlare(0,measured) && measured==64,"Flare completion did not reach the producer");
+    require(previewReadHistogram(0,measured) && measured==0,"Flare completion replaced an exposure bin");
+    previewBeginFlare(0);previewEndFlare();auto nextFlare=finish();
+    require(nextFlare.size()==2 && nextFlare[0].worldQuery!=flare[0].worldQuery &&
+        nextFlare[0].worldQuery->result==flare[0].worldQuery->result &&
+        nextFlare[1].worldQuery==nextFlare[0].worldQuery && !nextFlare[1].worldQueryBegin &&
+        previewReadFlare(0,measured) && measured==64,
+        "Pending flare query erased a prior completion or reused its command owner");
+    nextFlare[0].worldQuery->result->samples.store(0,std::memory_order_release);
+    require(previewReadFlare(0,measured) && measured==0,"Measured zero was treated as an unavailable flare query");
+    std::weak_ptr<WorldQuery> retiredFlare=flare[0].worldQuery;
+    std::weak_ptr<WorldQueryResult> completedFlare=flare[0].worldQuery->result;
+    flare.clear();nextFlare.clear();
+    require(retiredFlare.expired() && !completedFlare.expired() && previewReadFlare(0,measured) && measured==0,
+        "Retiring query commands discarded the ID's latest completed visibility");
+    previewBeginFlare(1);previewEndFlare();auto otherFlare=finish();
+    require(otherFlare.size()==2 && otherFlare[0].worldQuery->result!=completedFlare.lock(),
+        "Distinct flare IDs shared a completion owner");
+    otherFlare[0].worldQuery->result->samples.store(27,std::memory_order_release);
+    require(previewReadFlare(1,measured) && measured==27 && previewReadFlare(0,measured) && measured==0,
+        "Distinct flare completion changed an older ID's visibility");
+    previewBeginFlare(65535);previewBeginFlare(2);previewBeginHistogram(1);
+    previewEndFlare();previewEndFlare();previewEndHistogram();auto lastFlare=finish();
+    require(lastFlare.size()==2 && lastFlare[0].worldQuery && lastFlare[0].worldQueryBegin &&
+        lastFlare[1].worldQuery==lastFlare[0].worldQuery && !lastFlare[1].worldQueryBegin,
+        "Valid maximum flare ID or nested/unmatched query handling changed");
+    lastFlare[0].worldQuery->result->samples.store(13,std::memory_order_release);
+    measured=88;require(!previewReadFlare(2,measured) && measured==88 && !previewReadHistogram(1,measured) && measured==88,
+        "Nested query request created a completion owner");
+    require(previewReadFlare(65535,measured) && measured==13,"Maximum u16 flare ID was rejected");
+    previewBeginHistogram(1);previewBeginFlare(2);previewEndFlare();previewEndHistogram();auto isolatedHistogram=finish();
+    require(isolatedHistogram.size()==2 && isolatedHistogram[0].worldQueryBegin &&
+        isolatedHistogram[1].worldQuery==isolatedHistogram[0].worldQuery && !isolatedHistogram[1].worldQueryBegin &&
+        !previewReadFlare(2,measured),"Flare query nested inside an exposure measurement");
+    previewBeginFlare(65536);previewEndFlare();measured=88;
+    require(finish().empty() && !previewReadFlare(65536,measured) && measured==88,
+        "Out-of-range flare ID escaped its bounded completion map");
+    std::puts("PreviewFlareQueries: ordered owned commands, distinct IDs, exposure isolation, prior completion, zero and bounded/no-active handling passed.");
     // A full logical frame exceeds the former 4096-command cap. Cross part
     // boundaries with depth/fixed draws, clears, resolves and a live query.
     const auto destination=device+15000;
@@ -1281,6 +1507,8 @@ static void testPreviewBridge(Memory& memory, PPCContext& threadContext, EngineP
 int main(int argc, char** argv) {
     HWND window=nullptr;
     try {
+        testDecodedDrawRequest();
+        testSubtitleContextLifetime();
         require(argc==2,"Game directory required for original AOT decoder comparison");
         // Match the executable's initialization, including linking the
         // strong engine observers out of DarkRuntime's static archive.
@@ -1293,6 +1521,7 @@ int main(int argc, char** argv) {
         owner.load(argv[1]);
         PPCContext ctx{};
         owner.initThread(ctx);
+        testTexture1555(owner);
         auto* base=owner.base();
         std::array<uint8_t,32> memoryProbe{};
         require(!copyRenderMemory(base,0xFFFFFFFFull,memoryProbe.data(),2) &&
@@ -1387,12 +1616,12 @@ int main(int argc, char** argv) {
         plane(videoFrame+12,2,2,4,1,0x2000,0x18001,8);
         plane(videoFrame+60,1,1,4,2,0x20000,0x19001,4);
         const uint8_t lumaRows[]={16,235,77,77,81,145,66,66}; std::memcpy(base+0x18001,lumaRows,8);
-        base[0x19001]=90; base[0x19002]=240;
+        base[0x19001]=240; base[0x19002]=90;
         VideoFrame decodedVideo;
         require(!decodeVideoFrame(base,videoFrame,decodedVideo) && decodedVideo.luma==std::vector<uint8_t>({16,235,81,145}) &&
-                decodedVideo.chroma==std::vector<uint8_t>({90,240}),"Original Y/UV plane pitch or ordering changed");
+                decodedVideo.chroma==std::vector<uint8_t>({240,90}),"Original Y/VU plane pitch or ordering changed");
         put32(base,videoFrame+60+20,2); put32(base,videoFrame+60+12,8);
-        require(decodeVideoFrame(base,videoFrame,decodedVideo)!=nullptr && decodedVideo.chroma[1]==240,"Chroma size mismatch accepted");
+        require(decodeVideoFrame(base,videoFrame,decodedVideo)!=nullptr && decodedVideo.chroma[1]==90,"Chroma size mismatch accepted");
         put32(base,videoFrame+60+20,1); put32(base,videoFrame+60+12,4);
         put32(base,videoFrame+12+8,0xFFFFFFFE);
         require(decodeVideoFrame(base,videoFrame,decodedVideo)!=nullptr,"Wrapped video pixel span accepted");
@@ -1424,17 +1653,75 @@ int main(int argc, char** argv) {
             require(renderer.readPixel(32,32)==0xFF000000,"Zero-alpha original texture produced visible geometry");
 
             videoMesh.projection=mesh.projection;
-            auto movie=std::make_shared<VideoFrame>(); movie->width=movie->height=2;
-            movie->luma={81,81,81,81}; movie->chroma={240,90}; videoMesh.video=movie;
+            // Establish the raw-memory boundary, not just a hand-authored
+            // renderer input. TopCow frame252's saved 131072-byte Y/VU
+            // prefixes match FFmpeg exactly; interpreting them as U,V has
+            // chroma MAE30.386. No game pixels are part of this fixture.
+            auto decodedMovie=[&](uint8_t y,uint8_t v,uint8_t u) {
+                std::memset(base+videoFrame,0,12);
+                plane(videoFrame+12,2,2,4,1,0x2000,0x18001,8);
+                plane(videoFrame+60,1,1,4,2,0x20000,0x19001,4);
+                const uint8_t rows[]{y,y,77,77,y,y,66,66};
+                const uint8_t vu[]{v,u,99,99};
+                std::memcpy(base+0x18001,rows,sizeof(rows));
+                std::memcpy(base+0x19001,vu,sizeof(vu));
+                auto copied=std::make_shared<VideoFrame>();
+                require(!decodeVideoFrame(base,videoFrame,*copied) &&
+                        copied->luma==std::vector<uint8_t>({y,y,y,y}) &&
+                        copied->chroma==std::vector<uint8_t>({v,u}),
+                        "Raw BE A8L8 V,U frame lost its pitch, order or owned pixels");
+                std::memset(base+0x18001,0,sizeof(rows));
+                std::memset(base+0x19001,0,sizeof(vu));
+                return copied;
+            };
+            auto movie=decodedMovie(81,240,90); videoMesh.video=movie;
             renderer.render({videoMesh}); pixel=renderer.readPixel(32,32);
-            // BE A8L8 stores V before U. Original ARB uses UV-0.5 and alpha zero.
+            // Decode captured V,U into logical U,V for the original ARB
+            // conversion, preserving its UV-0.5 coefficients and zero alpha.
             nearByte(pixel,0,254); nearByte(pixel,1,0); nearByte(pixel,2,0); nearByte(pixel,3,0);
-            movie=std::make_shared<VideoFrame>(*movie); movie->chroma={90,240}; videoMesh.video=movie;
+            movie=decodedMovie(41,110,240); videoMesh.video=movie;
             renderer.render({videoMesh}); pixel=renderer.readPixel(32,32);
-            nearByte(pixel,0,16); nearByte(pixel,1,62); nearByte(pixel,2,255); nearByte(pixel,3,0);
-            movie=std::make_shared<VideoFrame>(*movie); movie->luma={235,235,235,235}; movie->chroma={128,128}; videoMesh.video=movie;
+            nearByte(pixel,0,0); nearByte(pixel,1,0); nearByte(pixel,2,255); nearByte(pixel,3,0);
+            movie=decodedMovie(145,34,54); videoMesh.video=movie;
+            renderer.render({videoMesh}); pixel=renderer.readPixel(32,32);
+            nearByte(pixel,0,0); nearByte(pixel,1,255); nearByte(pixel,2,1); nearByte(pixel,3,0);
+            movie=decodedMovie(235,128,128); videoMesh.video=movie;
             renderer.render({videoMesh}); pixel=renderer.readPixel(32,32);
             nearByte(pixel,0,255); nearByte(pixel,1,254); nearByte(pixel,2,255); nearByte(pixel,3,0);
+            // Real boundary sample, independently decoded with FFmpeg from
+            // logo_topcow.wmv frame252 at x228,y36. Source SHA256:
+            // dd98bde8adfb674941b796d1890644e57eb6700cd60427800ed303edfe6c9cb7.
+            // The raw bytes were captured after8279DDC0 in
+            // boot-20260907-145945-758421.render/000122-video*; its entire
+            // 131072-byte Y and VU prefixes match the source decode exactly.
+            // This region has uniform 6x6 Y and 5x5 UV neighborhoods, so
+            // chroma interpolation cannot obscure the byte-order oracle.
+            const uint8_t capturedRows[]{112,112,77,77,112,112,66,66};
+            const uint8_t capturedVU[]{206,88,99,99};
+            std::memcpy(base+0x18001,capturedRows,sizeof(capturedRows));
+            std::memcpy(base+0x19001,capturedVU,sizeof(capturedVU));
+            auto capturedMovie=std::make_shared<VideoFrame>();
+            require(!decodeVideoFrame(base,videoFrame,*capturedMovie) &&
+                    capturedMovie->luma==std::vector<uint8_t>({112,112,112,112}) &&
+                    capturedMovie->chroma==std::vector<uint8_t>({206,88}),
+                    "Captured TopCow CImage frame changed raw V,U ordering");
+            std::memset(base+0x18001,0,sizeof(capturedRows));
+            std::memset(base+0x19001,0,sizeof(capturedVU));
+            const uint8_t ffmpegRGB[]{235,62,30};
+            SimpleMesh capturedMesh=videoMesh;capturedMesh.video=capturedMovie;
+            for(unsigned cell=0;cell<4;++cell) {
+                for(auto& vertex:capturedMesh.vertices) {
+                    vertex.uv[0]=float(cell%2)*.5f+.25f;
+                    vertex.uv[1]=float(cell/2)*.5f+.25f;
+                }
+                renderer.render({capturedMesh});const auto actual=renderer.readPixel(32,32);
+                // The original shader's coefficients differ slightly from
+                // FFmpeg's integer BT.601 conversion; a swap differs by tens.
+                for(unsigned channel=0;channel<3;++channel)
+                    require(std::abs(int((actual>>(channel*8))&255)-int(ffmpegRGB[channel]))<=3,
+                            "Raw captured video rendered with swapped U/V against source RGB");
+                nearByte(actual,3,0);
+            }
             testPreviewVideoUploads(renderer,display,videoMesh);
             mesh.texture=atlas; renderer.render({mesh}); pixel=renderer.readPixel(32,32);
             nearByte(pixel,0,128); nearByte(pixel,1,64); nearByte(pixel,2,32); nearByte(pixel,3,255);
@@ -1443,6 +1730,7 @@ int main(int argc, char** argv) {
             testPreviewShadowCaptureFailure(renderer);
             testPreviewBridge(owner,ctx,renderer);
             testPromptIconPreview(renderer,"framerate-stability-20260909/prompts-preview.bmp");
+            testPromptRenderIntegration(display.GetDevice(),display.GetContext(),display.GetSwapChain());
             testPreviewOutputResize(renderer,display);
             renderer.render({videoMesh}); nearByte(renderer.readPixel(32,32),3,0);
             renderer.render({mesh}); pixel=renderer.readPixel(32,32);

@@ -1,19 +1,33 @@
-#include <fstream>
 #include <intrin.h>
 #include "runtime/native/runtime.h"
+#include "runtime/native/stall_profiler.h"
 #include "runtime/native/audio_driver.h"
 #include "runtime/native/input.h"
 #include "native_mouse.h"
+#include "native_shutdown.h"
+#include "native_launch_paths.h"
+#include "resource.h"
+#include "developer_tools_window.h"
+#include "achievements_window.h"
+#include "developer_resolution_shortcut.h"
+#include "keyboard_settings.h"
+#include "mouse_settings.h"
+#include "runtime/native/keyboard_menu.h"
 #include "display_options.h"
 #include "display_window.h"
 #include "display_settings.h"
 #include "runtime/native/display_mode.h"
 #include "runtime/native/fov_settings.h"
+#include "runtime/native/language_settings.h"
 #include "runtime/native/video_settings_menu.h"
+#include "runtime/native/menu_pointer.h"
+#include "runtime/native/developer_tools.h"
 #include "test_input_parser.h"
 #include "frame_metrics.h"
 #include "renderer/engine/engine_performance.h"
 #include "frame_pacer.h"
+#include "display_reuse.h"
+#include "resolution_status.h"
 #include "thread_policy.h"
 #include "renderer/engine/scene_work.h"
 #include "cpu_sampler.h"
@@ -31,8 +45,14 @@
 
 using namespace DarkRecomp::Native;
 static NativeMouseWindow* mouseWindow = nullptr;
+static DeveloperToolsWindow* developerToolsWindow = nullptr;
+static AchievementsWindow* achievementsWindow = nullptr;
 static bool displayResizePending = false;
 static bool fullscreenTogglePending = false;
+static DeveloperResolutionShortcut resolutionShortcut;
+// The owned renderer target survives flip-discard presents. Once DXGI accepts
+// its display copy, keep that image until rendering or display state changes.
+static NativeDisplayReuse displayReuse;
 // Flush buffered logs on a fatal Windows exception before WER terminates the
 // process; buffered logging keeps per-write disk latency off hot threads.
 static LONG WINAPI DarkFlushLogsOnFatalException(PEXCEPTION_POINTERS) {
@@ -40,7 +60,7 @@ static LONG WINAPI DarkFlushLogsOnFatalException(PEXCEPTION_POINTERS) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static void finishAudioEvidence() {
-    // ExitProcess bypasses object destruction. For an opt-in recording, use
+    // Process termination bypasses object destruction. For an opt-in recording, use
     // the driver's existing cancellation/join path before exiting so the tap
     // and trace writers persist partial captures as well as completed ones.
     if (GetEnvironmentVariableW(L"DARKRECOMP_AUDIO_TAP", nullptr, 0) ||
@@ -53,7 +73,22 @@ static void printAudioHealth() {
         audio.queuedBuffers,audio.queuedFrames,unsigned(audio.playbackStarted),audio.starvationPasses,
         audio.starvationBytes,audio.engineGlitches,audio.maxCallbackMicros,unsigned(audio.workerMmcss),audio.deviceErrors);
 }
+static bool takeProfiledNativeMessage(MSG& message) noexcept {
+    // PeekMessage can synchronously deliver sent window messages even when
+    // it returns no queued message. Attribute that work separately from input.
+    StallProfiler::Scope profile(StallProfiler::Section::Other, "native PeekMessage");
+    return takeNativeMessage(message);
+}
 static LRESULT CALLBACK NativeWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    StallProfiler::Scope callback(StallProfiler::Section::Other, "NativeWindowProc",
+        0, 0, message, "win32-message");
+    {
+        StallProfiler::Scope input(StallProfiler::Section::Other, "NativeWindowProc input",
+            0, 0, message, "win32-message");
+        if (nativeInput().windowMessage(window, message, wParam, lParam))
+            return message == WM_XBUTTONDOWN || message == WM_XBUTTONUP ? TRUE : 0;
+    }
+    if (resolutionShortcut.handle(message, wParam, lParam)) return 0;
     if (message == WM_GETMINMAXINFO) {
         RECT minimum{0, 0, 320, 180};
         AdjustWindowRect(&minimum, WS_OVERLAPPEDWINDOW, FALSE);
@@ -66,10 +101,21 @@ static LRESULT CALLBACK NativeWindowProc(HWND window, UINT message, WPARAM wPara
         return 0;
     }
     if (message == WM_SIZE && wParam != SIZE_MINIMIZED) displayResizePending = true;
-    nativeInput().windowMessage(window, message, wParam, lParam);
-    if (mouseWindow && mouseWindow->message(message, wParam, lParam)) return 0;
+    if (message == WM_PAINT || message == WM_SIZE || message == WM_DISPLAYCHANGE ||
+        message == WM_SHOWWINDOW || message == WM_ACTIVATEAPP)
+        displayReuse.invalidate();
+    // The modeless panel keeps rendering/engine updates running, but game
+    // input and mouse capture stay suspended even if the owner gets focus.
+    if (mouseWindow && (!developerToolsWindow || !developerToolsWindow->isOpen()) &&
+        (!achievementsWindow || !achievementsWindow->isOpen())) {
+        StallProfiler::Scope mouse(StallProfiler::Section::Other, "NativeWindowProc mouse",
+            0, 0, message, "win32-message");
+        if (mouseWindow->message(message, wParam, lParam)) return 0;
+    }
     if (message == WM_CLOSE) { DestroyWindow(window); return 0; }
     if (message == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    StallProfiler::Scope defaultProc(StallProfiler::Section::Other, "native DefWindowProc",
+        0, 0, message, "win32-message");
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
@@ -88,6 +134,10 @@ int wmain(int argc, wchar_t** argv) {
         setvbuf(stderr, nullptr, _IOFBF, 65536);
     }
     SetUnhandledExceptionFilter(DarkFlushLogsOnFatalException);
+    StallProfiler::initializeFromEnvironment();
+    struct StallProfilerLifetime {
+        ~StallProfilerLifetime() { StallProfiler::shutdown(); }
+    } stallProfilerLifetime;
 #if DARK_NATIVE_SSSE3
     int cpuFeatures[4]{};__cpuid(cpuFeatures,1);
     if(!(cpuFeatures[2]&(1<<9))) {
@@ -95,13 +145,14 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 #endif
-    std::filesystem::path gameDir = L"Darkness";
-    uint32_t timeout = 30000;
+    std::filesystem::path gameDir;
+    bool overrideGameDirectory = false;
+    uint32_t timeout = 0;
     unsigned targetFps = 60;
     bool rendererSmoke = false;
     std::filesystem::path rendererTrace;
     bool manualShadowCapture=false;
-    bool enginePreview = false;
+    bool enginePreview = true;
     bool muted = false;
     bool sampleEngine=false,sampleWorkers=false;
     unsigned sceneWorkers=0;
@@ -112,11 +163,18 @@ int wmain(int argc, wchar_t** argv) {
     uint32_t windowWidth = 0, windowHeight = 0, renderHeight = 720;
     float commandLineFov = 0;
     bool overrideFov = false;
+    float commandLineMouseSensitivity = kDefaultMouseSensitivity;
+    bool overrideMouseSensitivity = false;
+    GameLanguage commandLineLanguage = GameLanguage::System;
+    bool overrideLanguage = false;
     bool overrideFps = false, overrideFullscreen = false, overrideRenderHeight = false;
     bool overrideVsync = false, verticalSync = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
-        if (arg == L"--game-dir" && i + 1 < argc) gameDir = argv[++i];
+        if (arg == L"--game-dir" && i + 1 < argc) {
+            gameDir = argv[++i];
+            overrideGameDirectory = true;
+        }
         else if (arg == L"--timeout-ms" && i + 1 < argc) timeout = wcstoul(argv[++i], nullptr, 10);
         else if (arg == L"--fps" && i + 1 < argc) {
             const wchar_t* text = argv[++i];
@@ -145,11 +203,18 @@ int wmain(int argc, wchar_t** argv) {
         else if (arg == L"--test-start") testStart=true;
         else if (arg == L"--test-skip-intros") testSkipIntros=true;
         else if (arg == L"--engine-preview") enginePreview = true;
+        else if (arg == L"--no-engine-preview") enginePreview = false;
         else if (arg == L"--mute") muted = true;
         else if (arg == L"--fullscreen") { fullscreen = true; overrideFullscreen = true; }
         else if (arg == L"--windowed") { fullscreen = false; overrideFullscreen = true; }
         else if (arg == L"--vsync") { verticalSync = true; overrideVsync = true; }
         else if (arg == L"--no-vsync") { verticalSync = false; overrideVsync = true; }
+        else if (arg == L"--language" && i + 1 < argc) {
+            if (!parseGameLanguage(argv[++i], commandLineLanguage)) {
+                fputs("Language must be auto, en, de, fr, es or it.\n", stderr); return 1;
+            }
+            overrideLanguage = true;
+        }
         else if (arg == L"--fov" && i + 1 < argc) {
             if (!DarkRecomp::parseFieldOfView(argv[++i], commandLineFov)) {
                 fputs("FOV must be 0 (Original) or 60 through 120 horizontal degrees at 16:9.\n", stderr); return 1;
@@ -164,17 +229,22 @@ int wmain(int argc, wchar_t** argv) {
             else { renderHeight = value; overrideRenderHeight = true; }
         }
         else if (arg == L"--mouse-sensitivity" && i + 1 < argc) {
+            const wchar_t* text = argv[++i];
             wchar_t* end = nullptr;
-            const float value = float(wcstod(argv[++i], &end));
-            if (!end || *end || !nativeInput().setMouseSensitivity(value)) {
+            const float value = float(wcstod(text, &end));
+            if (!end || end == text || *end || !isValidMouseSensitivity(value)) {
                 fputs("Mouse sensitivity must be between 0.1 and 10.\n", stderr); return 1;
             }
+            commandLineMouseSensitivity = value;
+            overrideMouseSensitivity = true;
         }
         else if (arg == L"--preview-frame" && i + 1 < argc) previewFrame = argv[++i];
         else {
-            fputs("Usage: DarkRecomp --game-dir <directory> [--timeout-ms 30000 (0 disables deadline)] [--renderer-smoke] [--trace-renderer <new directory>] [--engine-preview] [--mute] [--fps 60 (default; 0 uncapped)] [--profile-engine] [--sample-engine] [--mouse-sensitivity 1.0] [--preview-frame <new BMP path>] [--test-input <file>] [--test-start] [--test-skip-intros]\n", stderr);
-            fputs("  --test-input file lines (max 64, own-process diagnostics only): numeric '<key> [<holdMs 1..10000>]' (bare menu keys hold 250ms, I/J/K/L hold 2000ms; gameplay keys WASD/E/R/F/X/Z/C/Q/G/1-4/Tab/Back/Shift/Ctrl plus arrows/Space/Return/Esc/IJKL); 'mouse <dx> <dy>' (+/-10000, held 2000ms); 'capture' screenshots; '0' inspects; an invalid line blocks later commands until that line is fixed.\n", stderr);
-            fputs("  Display: --fullscreen or --windowed; --width W --height H selects window/aspect size; --render-height H controls internal resolution (180..2160, default 720). Alt+Enter toggles borderless fullscreen.\n", stderr);
+            fputs("Usage: DarkRecomp [--game-dir <directory>] [--timeout-ms N (default 0, no deadline)] [--renderer-smoke] [--trace-renderer <new directory>] [--engine-preview | --no-engine-preview] [--mute] [--fps 60 (default; 0 uncapped)] [--profile-engine] [--sample-engine] [--mouse-sensitivity 1.0] [--language auto|en|de|fr|es|it] [--preview-frame <new BMP path>] [--test-input <file>] [--test-start] [--test-skip-intros]\n", stderr);
+            fputs("  Starts with gameplay rendering and sound. Without --game-dir, finds Darkness beside the installed EXE or its parent folders.\n", stderr);
+            fputs("  --test-input file lines (max 64, own-process diagnostics only): numeric '<key> [<holdMs 1..10000>]' (bare menu keys hold 250ms, I/J/K/L hold 2000ms; gameplay keys WASD/E/R/F/X/Z/C/Q/G/1-4/Tab/Back/Shift/Ctrl plus arrows/Space/Return/Esc/IJKL; 116=F5 panel,117=gated F6); 'mouse <dx> <dy>' (+/-10000, held 2000ms); 'capture' game screenshots; '0' inspects; 'dev open|close|status|defaults', 'dev mission <ID>', 'dev speed <preset>', 'dev invincible|noclip|resolution on|off', 'dev darkness unlock|max', 'dev capture <absolute BMP path>'; an invalid line blocks later commands until that line is fixed.\n", stderr);
+            fputs("  Complete each --test-input command with a newline; an owned worker reads at 250ms intervals and publishes after two matching reads. Dispatch checks every 250ms (normally about 750ms total latency). Maximum file size: 256KiB.\n", stderr);
+            fputs("  Display: --fullscreen or --windowed; --width W --height H selects window/aspect size; --render-height H controls internal resolution (180..2160, default 720). Alt+Enter toggles borderless fullscreen; enable the F6 resolution shortcut in the F5 developer panel to switch live 720p/1440p when started with a 720-high guest mode (disabled by default).\n", stderr);
             fputs("  Options > Video Settings contains native PC graphics controls. Saved settings apply unless explicitly overridden. --vsync / --no-vsync overrides vertical sync; --fov 0 (Original) or 60..120 overrides horizontal FOV at 16:9 for this run.\n", stderr);
             fputs("  --trace-frame-hitches records bounded slow-frame stage timings without enabling per-draw profiling or instruction sampling.\n", stderr);
             fputs("  --sample-renderer samples only active rendering on this game's display thread; opt-in diagnostics add overhead.\n", stderr);
@@ -190,7 +260,16 @@ int wmain(int argc, wchar_t** argv) {
     }
     puts("DarkRecomp native Windows AOT runtime - development build, gameplay incomplete");
     try {
+        if (!overrideGameDirectory) {
+            wchar_t executable[32768]{};
+            const DWORD length = GetModuleFileNameW(nullptr, executable, DWORD(std::size(executable)));
+            if (!length || length >= std::size(executable))
+                throw std::runtime_error("Cannot locate DarkRecomp.exe; specify --game-dir <directory>.");
+            gameDir = DarkRecomp::findInstalledGameDirectory(executable);
+        }
         const auto settingsPath = std::filesystem::absolute(gameDir).parent_path() / L"DarkRecomp.settings.ini";
+        initializeGameLanguageSetting(loadGameLanguage(settingsPath));
+        if (overrideLanguage) overrideGameLanguageForRun(commandLineLanguage);
         setFieldOfViewSetting(overrideFov ? commandLineFov : DarkRecomp::loadFieldOfView(settingsPath));
         auto activeGraphics = DarkRecomp::loadGraphicsSettings(settingsPath);
         if (overrideFps) activeGraphics.frameRateLimit = targetFps;
@@ -199,6 +278,13 @@ int wmain(int argc, wchar_t** argv) {
         if (overrideVsync) activeGraphics.verticalSync = verticalSync;
         setGraphicsSettings(activeGraphics);
         initializeVideoSettingsMenu();
+        initializeMenuPointer();
+        nativeInput().setKeyboardBindings(DarkRecomp::loadKeyboardBindings(settingsPath));
+        nativeInput().setMouseSensitivity(overrideMouseSensitivity ? commandLineMouseSensitivity
+                                                                 : DarkRecomp::loadMouseSensitivity(settingsPath));
+        std::printf("[MouseSettings] Sensitivity=%.6g source=%s\n", double(nativeInput().mouseSensitivity()),
+                    overrideMouseSensitivity ? "command-line" : "saved");
+        initializeDeveloperTools();
         targetFps = activeGraphics.frameRateLimit;
         fullscreen = activeGraphics.fullscreen;
         renderHeight = activeGraphics.renderHeight;
@@ -230,8 +316,9 @@ int wmain(int argc, wchar_t** argv) {
             printPreviewCounters();
             printContext(ctx);
             finishAudioEvidence();
+            StallProfiler::shutdown();
             fflush(nullptr);
-            ExitProcess(5);
+            terminateNativeProcess(5);
         }).detach();
 
         SetProcessDPIAware();
@@ -243,12 +330,18 @@ int wmain(int argc, wchar_t** argv) {
             requestedSize = {uint32_t(monitor.rcMonitor.right - monitor.rcMonitor.left),
                              uint32_t(monitor.rcMonitor.bottom - monitor.rcMonitor.top)};
         }
-        WNDCLASSW windowClass{};
+        WNDCLASSEXW windowClass{sizeof(windowClass)};
         windowClass.lpfnWndProc = NativeWindowProc;
         windowClass.hInstance = GetModuleHandleW(nullptr);
+        windowClass.hIcon = static_cast<HICON>(LoadImageW(windowClass.hInstance,
+            MAKEINTRESOURCEW(IDI_DARKRECOMP), IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED));
+        windowClass.hIconSm = static_cast<HICON>(LoadImageW(windowClass.hInstance,
+            MAKEINTRESOURCEW(IDI_DARKRECOMP), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
         windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         windowClass.lpszClassName = L"DarkRecompNativeWindow";
-        RegisterClassW(&windowClass);
+        RegisterClassExW(&windowClass);
         NativeDisplaySize restoredSize = requestedSize;
         if (fullscreen) {
             const float scale = (std::min)({1.f, 1280.f / requestedSize.width, 720.f / requestedSize.height});
@@ -265,12 +358,18 @@ int wmain(int argc, wchar_t** argv) {
         if (fullscreen) displayWindow.toggleFullscreen();
         nativeInput().attachWindow(window);
         nativeInput().windowMessage(window, WM_ACTIVATEAPP, GetForegroundWindow() == window, 0);
-        struct ClearMouseWindow { ~ClearMouseWindow() { mouseWindow = nullptr; } } clearMouseWindow;
+        struct ClearMouseWindow { ~ClearMouseWindow() { mouseWindow = nullptr; developerToolsWindow = nullptr; achievementsWindow = nullptr; } };
         NativeMouseWindow mouse(window); mouseWindow = &mouse;
+        NativeResolutionStatus resolutionStatus(window);
         if (!mouse.registered()) throw std::runtime_error("Cannot register native raw mouse input");
-        puts("[Input] Native Win32 keyboard/raw mouse ready. Click to capture, Esc releases, F1 controls. WASD=move; E=use; R=reload; captured Space=jump; menu Space=confirm/skip.");
+        DeveloperToolsWindow developerTools(window, mouse, [](bool enabled) {
+            resolutionShortcut.setEnabled(enabled);
+        }); developerToolsWindow = &developerTools;
+        AchievementsWindow achievements(window, mouse); achievementsWindow = &achievements;
+        ClearMouseWindow clearMouseWindow;
+        puts("[Input] Native Win32 keyboard/raw mouse ready. Keyboard/mouse gameplay captures automatically after menus; click to recapture after manual release/Alt-Tab. Esc releases, F1 controls, F5 developer tools; optional F6 720p/1440p shortcut starts disabled. WASD=move; E=use; R=reload; captured Space=jump; menu Space=confirm/skip.");
         if (!testInputPath.empty())
-            puts("[InputTest] Opt-in script active: '<key> [<holdMs 1..10000>]' (bare menu 250ms, I/J/K/L 2000ms), 'mouse <dx> <dy>', 'capture', '0' inspect; an invalid line blocks later commands until fixed; release lines report poll/nonneutral/change deltas.");
+            puts("[InputTest] Opt-in script active: '<key> [<holdMs 1..10000>]' (bare menu 250ms, I/J/K/L 2000ms; 116=F5 panel,117=gated F6), 'mouse <dx> <dy>', 'capture', '0' inspect; 'dev open|close|status|defaults', 'dev mission <ID>', 'dev speed <preset>', 'dev invincible|noclip|resolution on|off', 'dev darkness unlock|max', 'dev capture <absolute BMP path>'; an invalid line blocks later commands until fixed; release lines report poll/nonneutral/change deltas.");
 
         DarkRecomp::CDisplayContextD3D11 display;
         RECT actualClient{}; GetClientRect(window, &actualClient);
@@ -280,9 +379,11 @@ int wmain(int argc, wchar_t** argv) {
             requestedSize = {uint32_t(actualClient.right), uint32_t(actualClient.bottom)};
         const auto renderSize = renderSizeForDisplay(requestedSize, renderHeight);
         const auto resolutionScale = nativeResolutionScale(renderSize);
+        mouse.setRenderHeight(renderSize.height);
         if (!setNativeVideoMode(renderSize.width / resolutionScale, renderSize.height / resolutionScale))
             throw std::runtime_error("Requested render aspect or size is unsupported");
         display.Init(window, uint32_t(actualClient.right), uint32_t(actualClient.bottom));
+        setMenuPointerDisplay(renderSize.width, renderSize.height, uint32_t(actualClient.right), uint32_t(actualClient.bottom));
         displayResizePending = false;
         std::printf("[Display] output=%ldx%ld render=%ux%u aspect=%.6f fullscreen=%u scale=%u guest=%ux%u\n",
                     actualClient.right, actualClient.bottom, renderSize.width, renderSize.height,
@@ -320,7 +421,7 @@ int wmain(int argc, wchar_t** argv) {
         std::unique_ptr<DarkRecomp::EnginePreviewD3D11> preview;
         if (enginePreview) {
             preview = std::make_unique<DarkRecomp::EnginePreviewD3D11>(display.GetDevice(), display.GetContext(), display.GetSwapChain(),
-                                                                    renderSize.width, renderSize.height, resolutionScale);
+                                                                    renderSize.width, renderSize.height, resolutionScale,true);
             preview->setDiagnostics(!rendererTrace.empty() && !manualShadowCapture);
             setPreviewTextureBudget(preview->textureBudget());
             setPreviewFrameBackpressure(true,true);
@@ -341,6 +442,13 @@ int wmain(int argc, wchar_t** argv) {
         unsigned testInputInvalidLogs=0;
         size_t liveInputCount=0,captureInputCount=0;
         ULONGLONG inputCaptureAt=0,nextInputRead=0;bool liveKey=false;
+        NativeTestInputFileReader testInputReader(testInputPath,
+            [](const std::filesystem::path& path, HANDLE stop) {
+                StallProfiler::Scope read(StallProfiler::Section::FileIO, "native diagnostic script background read");
+                return NativeTestInputFileReader::readFile(path, stop);
+            });
+        if (!testInputPath.empty())
+            std::puts("[InputTest] script reads run on an owned worker; complete newline commands publish after two matching reads (250ms polling plus 250ms dispatch, normally about 750ms total latency).");
         bool testMouse=false;LONG testMouseX=0,testMouseY=0;
         InputCounters testMouseBase{};
         ULONGLONG testMouseUntil=0,nextMouseSample=0;
@@ -369,13 +477,16 @@ int wmain(int argc, wchar_t** argv) {
             fprintf(stderr, "[STOP] Guest execution ended with status %d.\n", guestStatus);
             // Worker threads still own guest memory. A failed main entry must
             // use process teardown before the address space destructor runs.
-            if (guestStatus) { fflush(nullptr); ExitProcess(guestStatus); }
+            if (guestStatus) { StallProfiler::shutdown(); fflush(nullptr); terminateNativeProcess(guestStatus); }
             PostMessageW(window, WM_CLOSE, 0, 0);
         });
 
         NativeCpuSampler sampler(guest.native_handle(),sampleEngine,sampleWorkers,sampleRendererCpu);
         MSG message{};
         FrameMetrics performance;
+        uint64_t unchangedDisplaySkips = 0;
+        uint64_t texturePreloadPrepared=0,texturePreloadBytes=0,texturePreloadFailures=0;
+        double texturePreloadMs=0,texturePreloadMaxMs=0;
         FrameOutlierTrace outlier;
         // Stage-boundary clocks work independently of per-draw profiling and
         // instruction sampling, so normal launches can diagnose slow frames.
@@ -388,13 +499,36 @@ int wmain(int argc, wchar_t** argv) {
             unsigned(sampleWorkers), unsigned(sampleRendererCpu), unsigned(!previewFrame.empty()));
         std::printf("[Performance] Native frame target=%u; engine frames are counted independently of presentation.\n", targetFps);
         std::puts("[PerformanceDefinition] version=3 frameTimestamp=Present-return frameCount=new-engine-frame-and-S_OK worldCount=accepted-world-frame presents=all-calls-presentOk-presentOccluded-presentFailed-presentOther rendered=all-rendered-frames renderedFPS=rendered-per-second renderCPUms=accepted-render-only intervals=completed-accepted-frame-returns-not-scanout lastAcceptedAgeMs=since-last-accepted-or-since-start intervalSamples=completed-interval-count haveAcceptedFrame=any-accepted-yet historicalFrameTimestamp=render-completion");
+        // Keep one root scope for the display run so message/input work and
+        // other loop logic appear in frame totals between the child scopes.
+        StallProfiler::Scope stallDisplay(StallProfiler::Section::Other, "native display loop");
+        StallProfiler::frameBoundary("display");
         while (message.message != WM_QUIT) {
             FrameMetrics::Clock::time_point loopTop{}, afterPump{}, takeEnd{}, renderEnd{}, postEnd{}, pacerEnd{};
             if (outlierOn) {
                 loopTop = FrameMetrics::now();
                 outlier.onLoopTop(loopTop);
             }
-            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            {
+            StallProfiler::Scope drain(StallProfiler::Section::Other, "native message drain");
+            while (takeProfiledNativeMessage(message)) {
+                StallProfiler::Scope dispatch(StallProfiler::Section::Other, "native message handling",
+                    0, 0, message.message, "win32-message");
+                if (keyboardMenuInputBlocked() && message.hwnd == window &&
+                    (message.message == WM_KEYDOWN || message.message == WM_KEYUP ||
+                     message.message == WM_SYSKEYDOWN || message.message == WM_SYSKEYUP)) {
+                    DispatchMessageW(&message);
+                    continue;
+                }
+                if (achievements.isOpen() && message.message == WM_KEYDOWN && message.wParam == VK_F5) {
+                    if (!(message.lParam & (LPARAM(1) << 30))) {
+                        achievements.close();
+                        developerTools.toggle();
+                    }
+                    continue;
+                }
+                if (achievements.handleMessage(message)) continue;
+                if (developerTools.handleMessage(message)) continue;
                 if(manualShadowCapture && message.hwnd==window && message.message==WM_KEYDOWN &&
                    message.wParam==VK_F8 && !(message.lParam&(LPARAM(1)<<30))) {
                     if(preview && !shadowCapturePending && !shadowCaptureActive && shadowCaptureCount<2) {
@@ -406,10 +540,82 @@ int wmain(int argc, wchar_t** argv) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
+            }
             if (message.message == WM_QUIT) break;
+            {
+                StallProfiler::Scope update(StallProfiler::Section::Other, "native achievements update");
+                if (!developerTools.isOpen() && !keyboardMenuInputBlocked()) achievements.update();
+            }
+            {
+                StallProfiler::Scope capture(StallProfiler::Section::Other, "native mouse capture update");
+                mouse.updateGameplayCapture(!developerTools.isOpen() && !achievements.isOpen());
+            }
+            KeyboardMenuSaveRequest keyboardSave;
+            {
+            StallProfiler::Scope requests(StallProfiler::Section::Other, "native input settings requests");
+            if (takeMouseSensitivitySaveRequest()) {
+                StallProfiler::Scope save(StallProfiler::Section::FileIO, "native mouse sensitivity save");
+                const auto value = nativeInput().mouseSensitivity();
+                const bool saved = DarkRecomp::saveMouseSensitivity(settingsPath, value);
+                reportMouseSensitivitySave(saved);
+                std::printf("[MouseSettings] Sensitivity=%.6g save=%u\n", double(value), unsigned(saved));
+            }
+            if (takeKeyboardMenuSaveRequest(keyboardSave)) {
+                StallProfiler::Scope save(StallProfiler::Section::FileIO, "native keyboard bindings save");
+                const bool saved = DarkRecomp::saveKeyboardBindings(settingsPath, keyboardSave.bindings) &&
+                                   nativeInput().setKeyboardBindings(keyboardSave.bindings);
+                reportKeyboardMenuSave(keyboardSave.id, saved);
+                std::printf("[KeyboardMenu] Save id=%llu success=%u\n", keyboardSave.id, unsigned(saved));
+            }
+            }
+            if (takeExitGameRequest()) {
+                std::puts("[Menu] Exit Game confirmed; closing native display.");
+                PostMessageW(window, WM_CLOSE, 0, 0);
+                continue;
+            }
+            {
+                StallProfiler::Scope status(StallProfiler::Section::Other, "native resolution status update");
+                resolutionStatus.update();
+            }
             try {
+                StallProfiler::Scope settings(StallProfiler::Section::Other, "native display settings and resize");
                 const bool frameOpen=preview && preview->frameInProgress();
                 if (!frameOpen) {
+                    if (resolutionShortcut.takeToggle()) {
+                        const auto guestMode = nativeVideoMode();
+                        if (!preview || guestMode.height != 720) {
+                            resolutionStatus.show(L"F6 is unavailable at this launch resolution/aspect.");
+                            std::printf("[ResolutionHotkey] unavailable guest=%ux%u; select a 720-high guest mode at startup.\n",
+                                guestMode.width, guestMode.height);
+                        } else {
+                            const auto nextScale = preview->renderHeight() == 720 ? 2u : 1u;
+                            const auto width = guestMode.width * nextScale;
+                            const auto height = guestMode.height * nextScale;
+                            const auto resizeStarted = FrameMetrics::now();
+                            bool resized = false;
+                            try {
+                                StallProfiler::Scope resize(StallProfiler::Section::Rendering, "native render target resize");
+                                preview->resizeRenderTarget(width, height, nextScale);
+                                resized = true;
+                            } catch (const std::exception& resolutionError) {
+                                displayReuse.invalidate();
+                                resolutionStatus.show(L"Resolution switch failed; the previous resolution is retained.");
+                                std::fprintf(stderr,"[ResolutionHotkey] failed: %s\n",resolutionError.what());
+                            }
+                            if (resized) {
+                                displayReuse.invalidate();
+                                auto updated = graphicsSettings(); updated.renderHeight = height;
+                                setGraphicsSettings(updated); requestDisplaySettingsSave();
+                                mouse.setRenderHeight(height);
+                                RECT pointerClient{}; GetClientRect(window, &pointerClient);
+                                setMenuPointerDisplay(width, height, uint32_t(pointerClient.right), uint32_t(pointerClient.bottom));
+                                resolutionStatus.show(L"Render resolution: " + std::to_wstring(width) + L" x " +
+                                    std::to_wstring(height) + L" (F6 to switch)");
+                                std::printf("[ResolutionHotkey] applied render=%ux%u scale=%u guest=%ux%u elapsedMs=%.3f\n",
+                                    width, height, nextScale, guestMode.width, guestMode.height, FrameMetrics::ms(resizeStarted));
+                            }
+                        }
+                    }
                     if (fullscreenTogglePending) {
                         fullscreenTogglePending = false;
                         auto selected = graphicsSettings();
@@ -418,38 +624,52 @@ int wmain(int argc, wchar_t** argv) {
                         requestDisplaySettingsSave();
                     }
                     if (takeDisplaySettingsSaveRequest()) {
-                        const bool saved = DarkRecomp::saveDisplaySettings(settingsPath, fieldOfViewSetting(), graphicsSettings());
+                        StallProfiler::Scope save(StallProfiler::Section::FileIO, "native display settings save");
+                        displayReuse.invalidate();
+                        const bool saved = DarkRecomp::saveDisplaySettings(settingsPath, fieldOfViewSetting(), graphicsSettings(),
+                                                                          gameLanguageSetting());
                         reportDisplaySettingsSave(saved);
-                        if (!saved) std::fputs("[Display] Could not save video settings.\n", stderr);
+                        if (!saved) std::fputs("[Settings] Could not save display/language settings.\n", stderr);
                     }
                     const auto selected = graphicsSettings();
+                    if (selected != activeGraphics) displayReuse.invalidate();
                     if (selected.frameRateLimit != activeGraphics.frameRateLimit)
                         framePacer.setFrameRate(selected.frameRateLimit);
                     if (selected.fullscreen != displayWindow.fullscreen()) {
-                        mouse.release(); displayWindow.toggleFullscreen();
+                        StallProfiler::Scope fullscreen(StallProfiler::Section::Other, "native fullscreen toggle");
+                        mouse.suspend(); displayWindow.toggleFullscreen();
                     }
-                    // Internal targets and their aspect are fixed at startup.
-                    // A saved render-height change is applied on the next run.
+                    // Menu resolution changes still apply at startup. F6 only
+                    // changes integer raster scale while retaining guest layout.
                     activeGraphics = selected;
                 }
                 if (displayResizePending && !frameOpen && !IsIconic(window)) {
+                    StallProfiler::Scope resize(StallProfiler::Section::Rendering, "native display target resize");
                     displayResizePending = false;
+                    displayReuse.invalidate();
                     RECT size{}; GetClientRect(window, &size);
                     if (size.right > 0 && size.bottom > 0) {
                         if (preview) preview->releaseDisplayTarget();
                         display.Resize(uint32_t(size.right), uint32_t(size.bottom));
+                        setMenuPointerDisplay(preview ? preview->renderWidth() : renderSize.width,
+                            preview ? preview->renderHeight() : renderSize.height, uint32_t(size.right), uint32_t(size.bottom));
                     }
                 }
             } catch (const std::exception& resizeError) {
                 std::                fprintf(stderr, "[Display] Resize failed: %s\n", resizeError.what());
+                StallProfiler::shutdown();
                 fflush(nullptr);
-                ExitProcess(6); // Guest threads still own the address space.
+                terminateNativeProcess(6); // Guest threads still own the address space.
             }
             // Opt-in integration input enters the same native input adapter
             // exercised by InputContract. It sends no input to another process.
             const auto inputNow=GetTickCount64();
+            {
+            StallProfiler::Scope diagnostic(StallProfiler::Section::Other, "native diagnostic input");
             if(testKey && inputNow>=keyRelease) {
-                nativeInput().windowMessage(window,WM_KEYUP,testKey,0);
+                MSG keyMessage{window, WM_KEYUP, WPARAM(testKey), 0};
+                if (!nativeInput().windowMessage(window,WM_KEYUP,testKey,0) &&
+                    !resolutionShortcut.handle(WM_KEYUP, testKey, 0)) developerTools.handleMessage(keyMessage);
                 nativeInput().windowMessage(window,WM_ACTIVATEAPP,GetForegroundWindow()==window,0);
                 const auto released=nativeInput().counters();
                 std::printf("[InputTest] released key=%u elapsed=%llu polls=+%llu nonneutral=+%llu changes=+%llu\n",testKey,inputNow-inputTestEpoch,
@@ -463,11 +683,17 @@ int wmain(int argc, wchar_t** argv) {
                 testKey=VK_SPACE;testKeyHoldMs=kTestInputMenuHoldMs;nextIntroSkip=inputNow+5000;
             }
             if(!testKey && !testMouse && !testInputPath.empty() && inputNow>=nextInputRead) {
-                nextInputRead=inputNow+250;std::ifstream stream(testInputPath);size_t count=0;
-                std::string command;
-                while(std::getline(stream,command)) {
-                    if(++count>64)break;
+                StallProfiler::Scope commands(StallProfiler::Section::Other, "native diagnostic command snapshot and dispatch");
+                nextInputRead=inputNow+250;
+                const auto commandsSnapshot = testInputReader.latest();
+                size_t count=0;
+                if (commandsSnapshot) for (const auto& command : *commandsSnapshot) {
+                    ++count;
                     if(count<=liveInputCount)continue;
+                    // Explicit diagnostic commands take over from automatic
+                    // intro skipping, so synthetic Space cannot activate a
+                    // menu while a live test is navigating it.
+                    if (!command.empty()) testSkipIntros = false;
                     std::istringstream fields(command);
                     if(command.starts_with("mouse ")) {
                         std::string token,extra;LONG dx=0,dy=0;
@@ -488,6 +714,49 @@ int wmain(int argc, wchar_t** argv) {
                             inputCaptureAt=inputNow;inspectNextEngineFrame();if(preview)preview->inspectNextWorldFrame();
                         }
                         break;}
+                    if(command.starts_with("achievements ")) {
+                        std::istringstream words(command);
+                        std::string prefix, action;
+                        words >> prefix >> action;
+                        if (action == "open") developerTools.close();
+                        if (achievements.handleTestCommand(command)) {
+                            liveInputCount=count;
+                            continue;
+                        }
+                    }
+                    if(command.starts_with("dev ")) {
+                        std::istringstream words(command);
+                        std::string prefix, action;
+                        words >> prefix >> action;
+                        if (action == "open") achievements.close();
+                        if (developerTools.handleTestCommand(command)) {
+                            liveInputCount=count;
+                            continue;
+                        }
+                    }
+                    if(command == "keyboard status") {
+                        std::printf("[KeyboardMenu] capture=%u reload=%s status=%s\n", unsigned(keyboardMenuCaptureActive()),
+                            keyboardMenuLabel("darkrecomp.keyboard.bind.10.0").c_str(),
+                            keyboardMenuLabel("darkrecomp.keyboard.status").c_str());
+                        liveInputCount=count;
+                        continue;
+                    }
+                    if(command.starts_with("pointer ") || command.starts_with("click ")) {
+                        std::string token, extra; int x=0,y=0;
+                        RECT pointerClient{}; GetClientRect(window,&pointerClient);
+                        if (!(fields>>token>>x>>y) || (fields>>extra) || x<0 || y<0 ||
+                            x>=pointerClient.right || y>=pointerClient.bottom) break;
+                        nativeInput().windowMessage(window,WM_SETFOCUS,0,0);
+                        const LPARAM point=MAKELPARAM(x,y);
+                        nativeInput().windowMessage(window,WM_MOUSEMOVE,0,point);
+                        if(token=="click") {
+                            nativeInput().windowMessage(window,WM_LBUTTONDOWN,MK_LBUTTON,point);
+                            nativeInput().windowMessage(window,WM_LBUTTONUP,0,point);
+                        }
+                        liveInputCount=count; captureInputCount=count; inputCaptureAt=inputNow+1000;
+                        std::printf("[InputTest] %s x=%d y=%d elapsed=%llu\n",token.c_str(),x,y,inputNow-inputTestEpoch);
+                        break;
+                    }
                     unsigned key=0;ULONGLONG hold=kTestInputMenuHoldMs;
                     if(!parseTestInputKeyLine(command,key,hold)) {
                         if(testInputInvalidLogs<8) {
@@ -512,11 +781,15 @@ int wmain(int argc, wchar_t** argv) {
                 }
             }
             if(testKey && inputNow>=keyRelease) {
-                nativeInput().windowMessage(window,WM_SETFOCUS,0,0);
-                nativeInput().windowMessage(window,WM_KEYDOWN,testKey,0);
+                if (testKey == VK_F5 && achievements.isOpen()) achievements.close();
+                if (testKey != VK_F5) nativeInput().windowMessage(window,WM_SETFOCUS,0,0);
+                MSG keyMessage{window, WM_KEYDOWN, WPARAM(testKey), 0};
+                if (!nativeInput().windowMessage(window,WM_KEYDOWN,testKey,0) &&
+                    !resolutionShortcut.handle(WM_KEYDOWN, testKey, 0)) developerTools.handleMessage(keyMessage);
                 testKeyBase=nativeInput().counters();
                 keyRelease=inputNow+testKeyHoldMs;
                 std::printf("[InputTest] pressed key=%u hold=%llums elapsed=%llu\n",testKey,testKeyHoldMs,inputNow-inputTestEpoch);
+            }
             }
             if (outlierOn) {
                 afterPump = FrameMetrics::now();
@@ -524,11 +797,13 @@ int wmain(int argc, wchar_t** argv) {
             }
             bool frameRendered=false;
             bool frameWorld=false;
+            bool displayCopied=false;
             double frameRenderMs=0;
             if (preview) {
                 try {
                     PreviewFramePart part;
                     if (takePreviewFrame(previewMeshes,8,&part)) {
+                        displayReuse.invalidate();
                         if(part.first) {
                             if(shadowCapturePending) {
                                 shadowCapturePending=false;shadowCaptureActive=++shadowCaptureCount;
@@ -614,12 +889,15 @@ int wmain(int argc, wchar_t** argv) {
                         preview->saveBmp(path);inputCaptureAt=0;
                         std::printf("[InputTest] captured native frame after command %zu\n",captureInputCount);
                     }
-                    if(!preview->frameInProgress())preview->copyToDisplay();
+                    if(displayReuse.shouldCopy(preview->frameInProgress())) {
+                        preview->copyToDisplay();displayCopied=true;
+                    }
                     if (outlierOn) postEnd = FrameMetrics::now();
                 } catch (const std::exception& error) {
                     fprintf(stderr, "[EnginePreview] %s\n", error.what());
+                    StallProfiler::shutdown();
                     fflush(nullptr);
-                    ExitProcess(6);
+                    terminateNativeProcess(6);
                 }
             }
             // Missing an engine frame must not consume another capped frame
@@ -630,16 +908,24 @@ int wmain(int argc, wchar_t** argv) {
                     framePacer.wait();
                 } catch (const std::exception& timerError) {
                     fprintf(stderr, "[Frame] Native frame timer failed: %s\n", timerError.what());
+                    StallProfiler::shutdown();
                     fflush(nullptr);
-                    ExitProcess(6);
+                    terminateNativeProcess(6);
                 }
             }
             if (outlierOn) pacerEnd = FrameMetrics::now();
             if (frameRendered) performance.rendered();
             const auto presentStart = outlierOn ? pacerEnd : FrameMetrics::now();
-            const bool shouldPresent=!preview || !preview->frameInProgress();
+            const bool shouldPresent=!preview || displayCopied;
             const HRESULT presentStatus = shouldPresent ? display.Present(activeGraphics.verticalSync ? 1 : 0) : S_FALSE;
+            // Occlusion and other statuses keep the regular retry path active.
+            // Only an accepted copy can arm the unchanged-image fast path.
+            if(shouldPresent)displayReuse.presented(presentStatus);
+            else if(preview && !preview->frameInProgress())++unchangedDisplaySkips;
             const auto presentEnd = FrameMetrics::now();
+            // A logical frame may span multiple queue polls and streamed parts.
+            // Include all of that time, pacing and the existing Present call.
+            if (frameRendered || !preview) StallProfiler::frameBoundary("display");
             if(shouldPresent)
                 performance.present(presentStatus, std::chrono::duration<double,std::milli>(presentEnd-presentStart).count());
             const bool isAccepted = shouldPresent && frameRendered && presentStatus == S_OK;
@@ -672,6 +958,7 @@ int wmain(int argc, wchar_t** argv) {
             }
             double measuredFps = 0;
             if (performance.report(measuredFps)) {
+                StallProfiler::Scope stallReport(StallProfiler::Section::Other, "native performance report");
                 // A live 150s run showed a metronomic ~73ms tail hitch on the
                 // first accepted frame after each 5s report. Time each step
                 // and log only hitch-sized totals; steady runs stay quiet.
@@ -680,6 +967,15 @@ int wmain(int argc, wchar_t** argv) {
                 mouse.setFrameRate(measuredFps);
                 const auto afterFps = outlierOn ? FrameMetrics::now() : FrameMetrics::Clock::time_point{};
                 if(preview)preview->printPerformance();
+                if(preview)std::printf("[DisplayReuse] unchangedSkips=%llu\n",unchangedDisplaySkips);
+                if(preview) {
+                    const auto preloads=previewTexturePreloadCounters();
+                    std::printf("[TexturePreload] queued=%llu taken=%llu expired=%llu overflow=%llu pending=%zu prepared=%llu sourceMiB=%.2f elapsedMs=%.3f maxLoopMs=%.3f failures=%llu budgetMiB=4 stopAfterMs=1 maxCandidates=64\n",
+                        preloads.queued,preloads.taken,preloads.expired,preloads.overflow,preloads.pending,
+                        texturePreloadPrepared,double(texturePreloadBytes)/(1024*1024),texturePreloadMs,
+                        texturePreloadMaxMs,texturePreloadFailures);
+                    texturePreloadMs=texturePreloadMaxMs=0;
+                }
                 const auto afterPreview = outlierOn ? FrameMetrics::now() : FrameMetrics::Clock::time_point{};
                 printEngineCpuPerformance();
                 const auto afterEngine = outlierOn ? FrameMetrics::now() : FrameMetrics::Clock::time_point{};
@@ -706,13 +1002,49 @@ int wmain(int argc, wchar_t** argv) {
                 fprintf(stderr, "[Frame] Native Present failed: 0x%08X\n", unsigned(presentStatus));
                 // The guest still owns live threads. Match the diagnostic
                 // deadline's process teardown rather than unwinding past them.
+                StallProfiler::shutdown();
                 fflush(nullptr);
-                ExitProcess(6);
+                terminateNativeProcess(6);
+            }
+            if(preview && !preview->frameInProgress()) {
+                // Upload immutable authored images while the engine is still
+                // loading/showing its prior frame. This optional work never
+                // refuses a draw or consumes guest memory. Stop after 4 MiB or
+                // 1 ms and inspect at most 64 weak entries. The first image may
+                // exceed either limit: a device call cannot be preempted, and
+                // large textures must still make progress. Existing hitch
+                // tracing accounts for this work in the loop's tail stage.
+                const auto preloadStart=FrameMetrics::now();
+                size_t preloadBytes=0;bool attempted=false;
+                for(unsigned candidate=0;candidate<64;++candidate) {
+                    std::shared_ptr<const DarkRecomp::ColorImage> image;
+                    if(!takePreviewTexturePreload(image))break;
+                    if(image) {
+                        attempted=true;preloadBytes+=image->bytes();
+                        try {
+                            if(preview->preloadImage(image)) {
+                                ++texturePreloadPrepared;texturePreloadBytes+=image->bytes();
+                            }
+                        } catch(const std::exception& preloadError) {
+                            if(++texturePreloadFailures<=4)
+                                std::fprintf(stderr,"[TexturePreload] optional upload failed: %s\n",preloadError.what());
+                        }
+                    }
+                    if(preloadBytes>=4*1024*1024 || FrameMetrics::ms(preloadStart)>=1.0)break;
+                }
+                if(attempted) {
+                    const auto elapsed=FrameMetrics::ms(preloadStart);
+                    texturePreloadMs+=elapsed;texturePreloadMaxMs=(std::max)(texturePreloadMaxMs,elapsed);
+                }
             }
         }
         setPreviewFrameBackpressure(false);
         timerResolution.stop();
+        testInputReader.stop();
         sampler.stop();
+        developerTools.close();
+        achievements.close();
+        endKeyboardMenu();
         mouse.release();
         nativeInput().attachWindow(nullptr);
         printAudioHealth();
@@ -720,11 +1052,12 @@ int wmain(int argc, wchar_t** argv) {
         // native window must also end an interactive run with no deadline,
         // without waiting forever for the original main loop to return.
         finishAudioEvidence();
+        StallProfiler::shutdown();
         fflush(nullptr);
-        ExitProcess(0);
+        terminateNativeProcess(0);
     } catch (const std::exception& error) {
         fprintf(stderr, "[ERROR] %s\n", error.what());
+        StallProfiler::shutdown();
         return 1;
     }
 }
-

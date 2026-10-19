@@ -56,9 +56,13 @@ bridge is disabled.
   outruns the display, only the most recent complete frame is retained.
 - Original `CMWnd_ModTexture_PaintVideo_YUV2RGB` material with two video
   textures, full viewport, identity model-view and ONE/ZERO blending. The
-  original decoder continues through AOT and supplies linear Y and BE A8L8
-  chroma images. Host R8G8 upload preserves raw V,U bytes; the native shader
-  swizzles them into logical U,V. Conversion coefficients and zero output
+  original decoder continues through AOT and supplies linear Y and A8L8
+  chroma images. Captured A8L8 bytes are big-endian V,U, verified against an
+  independent decode of the matching source video frame. The GUI shader swaps
+  the raw host R8G8 pair to logical U,V. World draws use owned L8/A8L8 upload
+  snapshots that expose the original L,L,L,A sampler view as U,U,U,V, with
+  the original YUV fragment program; native fetch format10 also supports
+  recovering resident chroma after cache eviction. Conversion coefficients and zero output
   alpha come from the original ARB fragment source under
   `Darkness/System/Gl/ARB_fragment_program`. Only the observed white uniform
   color state is accepted when no vertex-color stream exists.

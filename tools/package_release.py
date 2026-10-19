@@ -1,4 +1,4 @@
-"""Build, test, and package a Windows release without local game or user data."""
+"""Build and test a Windows release, with diagnostic launchers in a separate ZIP."""
 import argparse
 import hashlib
 import json
@@ -10,11 +10,14 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARIES = (
-    'DarkRecomp.exe', 'DarkRecompPreview.exe',
+    'DarkRecomp.exe', 'DarkRecompPreview.exe', 'DarkRecompSettings.exe',
     'avcodec-darkxma-62.dll', 'avutil-darkxma-60.dll', 'libwinpthread-1.dll',
-    'CubeWnd.pc.xcr', 'GameContext_Create.pc.xdf',
+    'CubeWnd.pc.xcr', 'CubeWnd.pc.ru.xcr', 'CubeWnd.pc.xcr.source.sha256', 'GameContext_Create.pc.xdf',
 )
-DOCUMENTS = ('Launch.cmd', 'START_HERE.txt', 'README.md', 'CONTROLS.md', 'RENDERING.md', 'COPYING')
+DOCUMENTS = ('Launch.cmd', 'LaunchWithSettings.cmd', 'LaunchWithUpdates.cmd', 'Launch.sh', 'SetupLinux.cmd', 'PlayLinux.cmd', 'START_HERE.txt', 'README.md', 'CONTROLS.md', 'RENDERING.md', 'STEAM_DECK.md', 'COPYING',
+             'assets/localization/README.md', 'assets/localization/native_menu_ru.json')
+DIAGNOSTIC_LAUNCHERS = ('LaunchStallProfiler.cmd', 'LaunchShadowCapture.cmd')
+LINUX_SETUP_TOOLS = ('setup_linux.ps1', 'setup_linux.py', 'wsl_graphics.py')
 CRT_REQUIRED = ('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 
 
@@ -35,6 +38,11 @@ def find_crt(root: Path) -> Path:
 
 def collect_files(root: Path, crt: Path) -> dict[str, Path]:
     files = {name: root / name for name in DOCUMENTS}
+    files['tools/update_release.ps1'] = root / 'tools/update_release.ps1'
+    files['tools/update_commits.ps1'] = root / 'tools/update_commits.ps1'
+    files['tools/add_steam_shortcut.py'] = root / 'tools/add_steam_shortcut.py'
+    for name in LINUX_SETUP_TOOLS:
+        files[f'tools/{name}'] = root / 'tools' / name
     for name in BINARIES:
         files[f'build_native/Release/{name}'] = root / 'build_native/Release' / name
     for name in CRT_REQUIRED:
@@ -63,30 +71,93 @@ def package(root: Path, crt: Path, output: Path, version: str, revision: str) ->
     checksum = archive.with_suffix('.zip.sha256')
     if archive.exists() or checksum.exists():
         raise FileExistsError(f'Refusing to overwrite an existing release: {archive}')
+    notices = (
+        'Audio: FFmpeg (LGPL-2.1-or-later), with source, patch, build script,\r\n'
+        'provenance and license notices in audio/. The build script is also\r\n'
+        'available under tools/ at the source revision in RELEASE.json.\r\n'
+        'libwinpthread-1.dll: license in audio/COPYING.winpthreads.\r\n'
+        'Microsoft Visual C++ runtime DLLs: redistributed unmodified from\r\n'
+        'the Visual Studio x64 CRT redistributable directory.\r\n'
+        'The Darkness Recomp: GPLv3; see COPYING and the source in RELEASE.json.\r\n'
+    ).encode('utf-8')
+    # Keep the combined notice at the path understood by older updaters.
+    # Preserve SMAA's attribution and full license alongside the executable.
+    notices += (b'\r\nSMAA 1x: iryoku/smaa, pinned source and lookup tables in '
+                b'third_party/smaa at the source revision in RELEASE.json.\r\n\r\n')
+    notices += (root / 'third_party/smaa/LICENSE.txt').read_bytes()
     manifest = {
         'version': version, 'commit': revision,
         'source': f'https://github.com/portingpete/The-Darkness-Recomp/tree/{revision}',
         'sha256': {name: hashlib.sha256(path.read_bytes()).hexdigest()
                    for name, path in sorted(files.items())},
     }
+    manifest['sha256']['ThirdParty/README.txt'] = hashlib.sha256(notices).hexdigest()
     with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
         for name, path in sorted(files.items()):
-            bundle.write(path, name)
+            if name == 'Launch.sh':
+                # Windows cannot provide Unix executable permissions. Store
+                # them explicitly so Linux unzip can run the launcher.
+                entry = zipfile.ZipInfo.from_file(path, name)
+                entry.create_system = 3
+                entry.external_attr = 0o100755 << 16
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                bundle.writestr(entry, path.read_bytes())
+            else:
+                bundle.write(path, name)
         bundle.writestr('Darkness/PUT_GAME_FILES_HERE.txt',
                         'Copy ALL files and folders from your own extracted Xbox 360 dump here.\r\n'
                         'See START_HERE.txt beside Launch.cmd for the required folder layout.\r\n')
         bundle.writestr('RELEASE.json', json.dumps(manifest, indent=2) + '\n')
-        bundle.writestr('ThirdParty/README.txt',
-                        'Audio: FFmpeg (LGPL-2.1-or-later), with source, patch, build script,\r\n'
-                        'provenance and license notices in audio/. The build script is also\r\n'
-                        'available under tools/ at the source revision in RELEASE.json.\r\n'
-                        'libwinpthread-1.dll: license in audio/COPYING.winpthreads.\r\n'
-                        'Microsoft Visual C++ runtime DLLs: redistributed unmodified from\r\n'
-                        'the Visual Studio x64 CRT redistributable directory.\r\n'
-                        'The Darkness Recomp: GPLv3; see COPYING and the source in RELEASE.json.\r\n')
+        bundle.writestr('ThirdParty/README.txt', notices)
     with zipfile.ZipFile(archive) as bundle:
         if bundle.testzip() is not None:
             raise RuntimeError('Release ZIP verification failed.')
+    checksum.write_text(f'{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n', encoding='utf-8')
+    return archive
+
+
+def package_diagnostics(root: Path, output: Path, version: str, revision: str) -> Path:
+    if not re.fullmatch(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?', version):
+        raise ValueError('Use a release version such as v0.1.1.')
+    files = {name: root / name for name in DIAGNOSTIC_LAUNCHERS}
+    for name, path in files.items():
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError(f'Missing or empty diagnostic launcher: {name} ({path})')
+    archive = output / f'The-Darkness-Recomp-{version}-diagnostic-launchers.zip'
+    checksum = archive.with_suffix('.zip.sha256')
+    if archive.exists() or checksum.exists():
+        raise FileExistsError(f'Refusing to overwrite existing diagnostics: {archive}')
+    instructions = (
+        f'THE DARKNESS RECOMP {version} - OPTIONAL DIAGNOSTIC LAUNCHERS\r\n\r\n'
+        f'Install The-Darkness-Recomp-{version}-windows-x64.zip first.\r\n'
+        'Extract this ZIP into that same folder, beside Launch.cmd.\r\n'
+        'These launchers use the installed game and your saved settings.\r\n'
+        'No game files or runtime binaries are included in this ZIP.\r\n\r\n'
+        'LaunchStallProfiler.cmd: reproduce a hitch, then close the game.\r\n'
+        'The newest build_native/run/desktop-*/runtime.log contains\r\n'
+        '[STALL] and [WAIT] timing reports. Profiling only affects this run.\r\n\r\n'
+        'LaunchShadowCapture.cmd: play with shadow capture enabled.\r\n'
+        'Press F8 during gameplay to capture a frame (up to two captures).\r\n'
+        'Capture files are written under build_native/run.\r\n\r\n'
+        'Use Launch.cmd for ordinary play. Share diagnostic logs when\r\n'
+        'reporting issues; do not upload game files or private saves.\r\n'
+    ).encode('utf-8')
+    manifest = {
+        'version': version, 'commit': revision,
+        'source': f'https://github.com/portingpete/The-Darkness-Recomp/tree/{revision}',
+        'sha256': {name: hashlib.sha256(path.read_bytes()).hexdigest()
+                   for name, path in sorted(files.items())},
+    }
+    manifest['sha256']['DIAGNOSTICS_README.txt'] = hashlib.sha256(instructions).hexdigest()
+    output.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
+        for name, path in sorted(files.items()):
+            bundle.write(path, name)
+        bundle.writestr('DIAGNOSTICS_README.txt', instructions)
+        bundle.writestr('DIAGNOSTICS.json', json.dumps(manifest, indent=2) + '\n')
+    with zipfile.ZipFile(archive) as bundle:
+        if bundle.testzip() is not None:
+            raise RuntimeError('Diagnostic ZIP verification failed.')
     checksum.write_text(f'{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n', encoding='utf-8')
     return archive
 
@@ -113,6 +184,7 @@ def main():
     if current != revision:
         raise RuntimeError('Source revision changed during the build; refusing to package.')
     print(package(ROOT, args.crt_dir or find_crt(ROOT), args.output_dir, args.version, revision))
+    print(package_diagnostics(ROOT, args.output_dir, args.version, revision))
 
 
 if __name__ == '__main__':

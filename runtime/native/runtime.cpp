@@ -1,14 +1,22 @@
+#include "stall_profiler_lock.h"
 #include "runtime.h"
+#include "stall_profiler.h"
 #include "audio_driver.h"
 #include "xma_bridge.h"
 #include "ppc_image_metadata.h"
-#include <bcrypt.h>
+#include "xex_image.h"
+#include "timebase_scale.h"
+#include "achievements.h"
+#include "language_settings.h"
+#include "native_menu_text.h"
 #include <array>
 #include <dbghelp.h>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace DarkRecomp::Native {
@@ -119,7 +127,13 @@ void Memory::writeTimestamp(uint32_t storage, uint32_t millis) {
 }
 void Memory::stopTimestampLocked() {
     timestampStop_.store(true, std::memory_order_relaxed);
-    if (timestampThread_.joinable()) timestampThread_.join();
+    if (timestampThread_.joinable()) {
+        StallProfiler::Scope wait(StallProfiler::Section::Wait, "timestamp-thread-join",
+            currentContext ? currentContext->lastFunction : 0,
+            currentContext ? uint32_t(currentContext->lr) : 0,
+            reinterpret_cast<uintptr_t>(timestampThread_.native_handle()), "host-timestamp-thread");
+        timestampThread_.join();
+    }
 }
 void Memory::stopTimestamp() {
     std::lock_guard lock(mutex_);
@@ -291,14 +305,21 @@ bool Memory::xmaOwned(uint32_t context) {
         (context-xmaPool_) % kXmaContextBytes == 0 && xmaUsed_[(context-xmaPool_)/kXmaContextBytes];
 }
 const char* Memory::xmaDecode(uint32_t context) {
-    std::lock_guard lock(mutex_);
+    StallProfiler::Scope profile(StallProfiler::Section::Audio, "Memory::xmaDecode",
+        currentContext ? currentContext->lastFunction : 0,
+        currentContext ? uint32_t(currentContext->lr) : 0, context, "guest-xma-context");
+    auto lock = StallProfiler::lock(mutex_, "xma-memory-mutex");
     if (!xmaOwned(context))
         return "context is not owned by this address space";
     if (!xmaBridge_) xmaBridge_ = std::make_unique<XmaBridge>();
     return xmaBridge_->decode(*this, context, (context-xmaPool_)/kXmaContextBytes);
 }
 const char* Memory::xmaDecodeBatch(std::span<const uint32_t> contexts, uint32_t& failedContext) {
-    std::lock_guard lock(mutex_);
+    StallProfiler::Scope profile(StallProfiler::Section::Audio, "Memory::xmaDecodeBatch",
+        currentContext ? currentContext->lastFunction : 0,
+        currentContext ? uint32_t(currentContext->lr) : 0,
+        contexts.empty() ? 0 : contexts.front(), "guest-xma-first-context");
+    auto lock = StallProfiler::lock(mutex_, "xma-memory-mutex");
     failedContext = 0;
     if (contexts.empty()) return nullptr;
     if (!xmaOwned(contexts.front())) {
@@ -309,7 +330,10 @@ const char* Memory::xmaDecodeBatch(std::span<const uint32_t> contexts, uint32_t&
     return xmaBridge_->decodeBatch(*this, contexts, failedContext);
 }
 const char* Memory::xmaDecodeRecords(uint32_t records, uint32_t count, uint32_t& failedContext) {
-    std::lock_guard lock(mutex_);
+    StallProfiler::Scope profile(StallProfiler::Section::Audio, "Memory::xmaDecodeRecords",
+        currentContext ? currentContext->lastFunction : 0,
+        currentContext ? uint32_t(currentContext->lr) : 0, records, "guest-xma-records");
+    auto lock = StallProfiler::lock(mutex_, "xma-memory-mutex");
     failedContext = 0;
     if (!count) return nullptr;
     const uint32_t firstContext = read32(records + 64);
@@ -327,34 +351,50 @@ void Memory::xmaReset(uint32_t context) {
         xmaBridge_->reset((context-xmaPool_)/kXmaContextBytes);
 }
 
-static std::string digest(const std::vector<uint8_t>& bytes) {
-    BCRYPT_ALG_HANDLE provider = nullptr;
-    if (BCryptOpenAlgorithmProvider(&provider, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0)
-        throw std::runtime_error("SHA256 provider unavailable");
-    uint8_t result[32];
-    auto status = BCryptHash(provider, nullptr, 0, const_cast<PUCHAR>(bytes.data()), ULONG(bytes.size()), result, sizeof(result));
-    BCryptCloseAlgorithmProvider(provider, 0);
-    if (status < 0) throw std::runtime_error("Cannot verify game image hash");
-    char hex[65] = {};
-    for (int i = 0; i < 32; ++i) sprintf_s(hex + i * 2, 3, "%02x", result[i]);
-    return hex;
-}
 void Memory::load(const std::filesystem::path& gameDir) {
+    StallProfiler::Scope profile(StallProfiler::Section::FileIO, "Memory::load");
     gameDir_ = std::filesystem::weakly_canonical(gameDir);
-    std::ifstream file(gameDir / "basefile.exe", std::ios::binary);
-    if (!file) throw std::runtime_error("Game directory must contain the original basefile.exe memory image");
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), {});
-    if (digest(bytes) != kGameImageSha256) throw std::runtime_error("Game image differs from the image used for AOT generation");
+    std::ifstream file(gameDir / "default.xex", std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error("Game directory must contain the original default.xex");
+    const auto fileSize = file.tellg();
+    if (fileSize < 24 || fileSize > 64 * 1024 * 1024)
+        throw std::runtime_error("Invalid default.xex size");
+    std::vector<uint8_t> original(static_cast<size_t>(fileSize));
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(original.data()), original.size()))
+        throw std::runtime_error("Cannot read default.xex");
+    auto decoded = decodeVerifiedXex(original, kGameRevisions);
+    const auto& bytes = decoded.image;
     if (bytes.size() > PPC_IMAGE_SIZE || !commit(PPC_IMAGE_BASE, PPC_IMAGE_SIZE))
         throw std::runtime_error("Cannot map the game image");
     memcpy(base_ + PPC_IMAGE_BASE, bytes.data(), bytes.size());
-    std::ifstream xexFile(gameDir / "_uncrypted.xex", std::ios::binary);
-    std::vector<uint8_t> xex((std::istreambuf_iterator<char>(xexFile)), {});
-    if (digest(xex) != kGameXexSha256) throw std::runtime_error("XEX differs from the AOT input");
-    headerSize_ = _byteswap_ulong(*reinterpret_cast<const uint32_t*>(xex.data() + 8));
+    const auto& xex = decoded.header;
+    headerSize_ = uint32_t(xex.size());
     if (headerSize_ > xex.size() || headerSize_ > 0x100000 || !commit(xexHeader, headerSize_))
         throw std::runtime_error("Invalid XEX header size");
     memcpy(base_ + xexHeader, xex.data(), headerSize_);
+    // Read achievement metadata from this verified dump's title resource.
+    // Never embed the original game's strings or artwork in the port.
+    std::span<const uint8_t> achievementData;
+    const uint32_t resources = headerField(0x2FF);
+    if (resources && uint64_t(resources) + 4 <= uint64_t(xexHeader) + headerSize_) {
+        const uint32_t tableBytes = read32(resources);
+        if (tableBytes >= 4 && (tableBytes - 4) % 16 == 0 &&
+            uint64_t(resources) + tableBytes <= uint64_t(xexHeader) + headerSize_) {
+            for (uint32_t offset = 4; offset < tableBytes; offset += 16) {
+                const uint32_t record = resources + offset;
+                if (std::memcmp(base_ + record, "545407EE", 8)) continue;
+                const uint32_t address = read32(record + 8), size = read32(record + 12);
+                if (address >= PPC_IMAGE_BASE &&
+                    uint64_t(address) + size <= uint64_t(PPC_IMAGE_BASE) + bytes.size())
+                    achievementData = std::span(bytes).subspan(address - PPC_IMAGE_BASE, size);
+                break;
+            }
+        }
+    }
+    const bool russianRevision = std::string_view(decoded.revisionName).starts_with("Russian localization");
+    initializeNativeMenuText(russianRevision, configuredConsoleLanguage());
+    Achievements::initialize(achievementData, configuredConsoleLanguage(), russianRevision);
     uint32_t tlsHeader = headerField(0x20104);
     if (!tlsHeader || read32(tlsHeader) != 64) throw std::runtime_error("Unsupported XEX TLS slot count");
     uint32_t rawAddress = read32(tlsHeader + 4), size = read32(tlsHeader + 8), rawSize = read32(tlsHeader + 12);
@@ -372,7 +412,12 @@ void Memory::load(const std::filesystem::path& gameDir) {
         PPC_LOOKUP_FUNC(base_, entry->guest) = entry->host;
         ++count;
     }
-    printf("[AOT] Verified game image; mapped %zu native functions.\n", count);
+    wchar_t executable[32768]{};
+    const DWORD executableLength = GetModuleFileNameW(nullptr, executable, DWORD(std::size(executable)));
+    if (executableLength && executableLength < std::size(executable))
+        nativeMenuAssets_ = prepareNativeMenuAssets(gameDir_, std::filesystem::path(executable).parent_path(),
+                                                  russianNativeMenus());
+    printf("[AOT] Verified game image (%s); mapped %zu native functions.\n", decoded.revisionName, count);
 }
 uint32_t Memory::headerField(uint32_t key) const {
     uint32_t count = read32(xexHeader + 20);
@@ -386,6 +431,24 @@ uint32_t Memory::headerField(uint32_t key) const {
         return xexHeader + offset;
     }
     return 0;
+}
+void Memory::enableDeveloperWeaponAssets(PPCContext& ctx, uint8_t* base) {
+    if (base != base_) throw std::runtime_error("invalid weapon resource memory");
+    if (developerWeaponAssets_.load(std::memory_order_acquire)) return;
+    auto assets = std::make_shared<const DeveloperWeaponAssets>(
+        prepareDeveloperWeaponAssets(ctx, base, gameDir_));
+    developerWeaponAssets_.store(std::move(assets), std::memory_order_release);
+}
+std::shared_ptr<const CachedWeaponFile> Memory::developerWeaponFile(const std::filesystem::path& path) const {
+    const auto assets = developerWeaponAssets_.load(std::memory_order_acquire);
+    if (!assets) return {};
+    auto relative = path.lexically_relative(gameDir_).string();
+    for (char& c : relative) {
+        if (c == '/') c = '\\';
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    }
+    const auto found = assets->find(relative);
+    return found == assets->end() ? nullptr : found->second;
 }
 void Memory::initThread(PPCContext& ctx) {
     ctx = PPCContext{};
@@ -500,10 +563,10 @@ LONG exceptionFilter(EXCEPTION_POINTERS* exception) {
     ExitProcess(2);
 }
 uint64_t PPCQueryTimebase() {
-    static const uint64_t frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return uint64_t(f.QuadPart); }();
+    static const DarkRecomp::Native::TimebaseScale<DarkRecomp::Native::kTimebaseFrequency> scale(
+        [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return uint64_t(f.QuadPart); }());
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    return uint64_t(now.QuadPart / frequency) * DarkRecomp::Native::kTimebaseFrequency +
-        (uint64_t(now.QuadPart) % frequency) * DarkRecomp::Native::kTimebaseFrequency / frequency;
+    return scale(uint64_t(now.QuadPart));
 }
 extern "C" float roundevenf(float x) { return std::nearbyintf(x); }
 extern "C" double roundeven(double x) { return std::nearbyint(x); }

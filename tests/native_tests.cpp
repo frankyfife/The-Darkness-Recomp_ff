@@ -2,6 +2,7 @@
 #include "runtime/native/audio_driver.h"
 #include "runtime/native/display_mode.h"
 #include "runtime/native/thread_topology.h"
+#include "runtime/native/objects.h"
 #include "renderer/engine/simple_mesh.h"
 #include "ppc_recomp_shared.h"
 #include <atomic>
@@ -18,6 +19,11 @@ static void check(bool success, const char* message) { if (!success) throw std::
 #include "dispatcher_tests.h"
 #include "xma_bridge_tests.h"
 #include "input_tests.h"
+#include "menu_pointer_guest_tests.h"
+#include "menu_keyboard_guest_tests.h"
+#include "menu_keyboard_status_tests.h"
+#include "language_tests.h"
+#include "revision_glyph_tests.h"
 #include "mouse_look_tests.h"
 #include "native_delay_tests.h"
 #include "native_timed_wait_tests.h"
@@ -37,13 +43,30 @@ static void check(bool success, const char* message) { if (!success) throw std::
 #include "notification_alias_tests.h"
 #include "critical_section_tests.h"
 #include "c_view_tests.h"
+#include "timebase_scale_tests.h"
 #include "object_output_tests.h"
 #include "texture_mip_layout_tests.h"
 #include "texture_upload_tests.h"
 #include "texture_residency_tests.h"
+#include "texture_preload_tests.h"
 #include "native_storage_tests.h"
+#include "achievement_guest_tests.h"
 #include "fov_camera_tests.h"
 #include "video_settings_tests.h"
+#include "developer_tools_tests.h"
+#include "developer_invincibility_tests.h"
+#include "developer_noclip_tests.h"
+#include "developer_darkness_tests.h"
+#include "developer_weapon_assets_tests.h"
+#include "developer_player_lookup_tests.h"
+#include "developer_player_tests.h"
+#include "developer_missions_tests.h"
+#include "developer_update_tests.h"
+#include "screen_fade_tests.h"
+#include "title_text_layout_tests.h"
+#include "title_text_shadow_tests.h"
+#include "title_text_heading_tests.h"
+#include "subtitle_scale_tests.h"
 static PPC_FUNC(threadProbe) {
     uint32_t argument = ctx.r3.u32;
     memory->write32(argument + 24, base[ctx.r13.u32 + 0x10c]);
@@ -269,6 +292,136 @@ static void testInflate(PPCContext& ctx, const char* fixturePath) {
     PPC_LOOKUP_FUNC(base, PPC_CODE_BASE + 4) = freeOriginal;
     puts("Original game decompressor matches independent stored, fixed and dynamic DEFLATE fixtures.");
 }
+static void testWorkerScheduling(PPCContext& ctx, uint32_t scratch) {
+    auto* base = memory->base();
+    check(memory->read32(resourcePoolThreadVtable + 48) == resourcePoolThreadCallback,
+          "Resource pool scheduling fixture does not match the retail callback");
+    check(resourcePoolThreadRole(resourcePoolThreadEntry, resourcePoolThreadVtable, resourcePoolThreadCallback) &&
+          !resourcePoolThreadRole(resourcePoolThreadEntry + 4, resourcePoolThreadVtable, resourcePoolThreadCallback) &&
+          !resourcePoolThreadRole(resourcePoolThreadEntry, resourcePoolThreadVtable + 4, resourcePoolThreadCallback) &&
+          !resourcePoolThreadRole(resourcePoolThreadEntry, resourcePoolThreadVtable, resourcePoolThreadCallback + 4),
+          "Resource pool role accepted a near-match entry, vtable or callback");
+    check(memory->read32(applicationSystemThreadVtable + 48) == applicationSystemThreadCallback &&
+          applicationSystemThreadRole(applicationSystemThreadEntry, applicationSystemThreadVtable, applicationSystemThreadCallback) &&
+          !applicationSystemThreadRole(applicationSystemThreadEntry + 4, applicationSystemThreadVtable, applicationSystemThreadCallback) &&
+          !applicationSystemThreadRole(applicationSystemThreadEntry, applicationSystemThreadVtable + 4, applicationSystemThreadCallback) &&
+          !applicationSystemThreadRole(applicationSystemThreadEntry, applicationSystemThreadVtable, applicationSystemThreadCallback + 4),
+          "Application system scheduling role does not match retail or accepted a near match");
+    const auto original = PPC_LOOKUP_FUNC(base, resourcePoolThreadEntry);
+    PPC_LOOKUP_FUNC(base, resourcePoolThreadEntry) = threadProbe;
+    const auto otherOriginal = PPC_LOOKUP_FUNC(base, PPC_CODE_BASE);
+    PPC_LOOKUP_FUNC(base, PPC_CODE_BASE) = threadProbe;
+    DWORD_PTR allowed = 0, system = 0;
+    check(GetProcessAffinityMask(GetCurrentProcess(), &allowed, &system) && allowed,
+          "Cannot inspect test process affinity");
+    struct Case { uint32_t entry, vtable; bool guarded, resource, application; uint32_t initialMask; };
+    const Case cases[] = {
+        {resourcePoolThreadEntry, resourcePoolThreadVtable, false, true, false, 16},
+        {resourcePoolThreadEntry, resourcePoolThreadVtable + 4, false, false, false, 16},
+        {PPC_CODE_BASE, resourcePoolThreadVtable, false, false, false, 16},
+        {resourcePoolThreadEntry, resourcePoolThreadVtable, true, false, false, 16},
+        {applicationSystemThreadEntry, applicationSystemThreadVtable, false, false, true, 32},
+        {applicationSystemThreadEntry, applicationSystemThreadVtable + 4, false, false, false, 32},
+        {PPC_CODE_BASE, applicationSystemThreadVtable, false, false, false, 32},
+        {applicationSystemThreadEntry, applicationSystemThreadVtable, true, false, false, 32},
+        {resourcePoolThreadEntry, 0x82060FB4, false, false, false, 16}, // Retail file-I/O worker.
+    };
+    for (const auto fixture : cases) {
+        const uint32_t allocatedBefore = memory->allocatedBytes();
+        const uint32_t argument = memory->allocate(4096, 4096);
+        check(argument != 0, "Resource pool argument allocation failed");
+        memset(base + argument, 0, 4096);
+        memory->write32(argument, fixture.vtable);
+        DWORD savedProtection = 0;
+        if (fixture.guarded)
+            check(VirtualProtect(base + argument, 4096, PAGE_READWRITE | PAGE_GUARD, &savedProtection),
+                  "Cannot guard resource pool classification fixture");
+        ctx.r3.u64 = scratch; ctx.r4.u64 = 0x20000; ctx.r5.u64 = scratch + 4;
+        ctx.r6.u64 = 0; ctx.r7.u64 = fixture.entry; ctx.r8.u64 = argument;
+        ctx.r9.u64 = (fixture.initialMask << 24) | 1;
+        __imp__ExCreateThread(ctx, base);
+        check(ctx.r3.u32 == 0, "Resource policy test thread creation failed");
+        if (fixture.guarded) {
+            MEMORY_BASIC_INFORMATION protection{};
+            check(VirtualQuery(base + argument, &protection, sizeof(protection)) &&
+                  (protection.Protect & PAGE_GUARD), "Resource role classification consumed a guest PAGE_GUARD");
+            DWORD ignored = 0;
+            check(VirtualProtect(base + argument, 4096, savedProtection, &ignored),
+                  "Cannot restore guarded classification fixture");
+        }
+        const uint32_t handle = memory->read32(scratch);
+        auto native = object(handle);
+        check(native && native->resourcePoolWorker == fixture.resource &&
+              native->applicationSystemWorker == fixture.application &&
+              native->threadEntry == fixture.entry && native->threadArgument == argument,
+              "Resource thread role or immutable creation metadata is wrong");
+        ctx.r3.u64 = handle; ctx.r4.u64 = 0x80000000; ctx.r5.u64 = scratch + 28;
+        __imp__ObReferenceObjectByHandle(ctx, base);
+        check(ctx.r3.u32 == 0, "Cannot reference resource policy worker");
+        const uint32_t threadObject = memory->read32(scratch + 28);
+        const uint32_t processorByte = threadObject - Memory::threadObjectOffset + 0x10c;
+        check(base[processorByte] == (fixture.initialMask == 32 ? 5 : 4),
+              "Worker creation changed its guest PCR identity");
+        const int priority = fixture.initialMask == 32 ? 0 : 1;
+        ctx.r3.u64 = threadObject; ctx.r4.s64 = priority;
+        __imp__KeSetBasePriorityThread(ctx, base);
+        check(ctx.r3.s32 == 0 && GetThreadPriority(native->handle) == priority,
+              "Resource policy priority fixture failed");
+        // Mutating the argument after creation must not reclassify the worker.
+        const bool qualified = fixture.resource || fixture.application;
+        memory->write32(argument, qualified ? 0 : resourcePoolThreadVtable);
+        uint32_t previous = fixture.initialMask;
+        for (const uint32_t guestMask : {4u, 8u, 6u, 32u}) {
+            ctx.r3.u64 = threadObject; ctx.r4.u64 = guestMask; ctx.r5.u64 = scratch + 32;
+            __imp__KeSetAffinityThread(ctx, base);
+            const uint8_t processor = guestMask == 4 ? 2 : guestMask == 8 ? 3 : guestMask == 32 ? 5 : 1;
+            check(ctx.r3.u32 == 0 && memory->read32(scratch + 32) == previous &&
+                  native->affinity == guestMask && base[processorByte] == processor,
+                  "Resource scheduling changed guest old-mask or PCR semantics");
+            GROUP_AFFINITY actual{};
+            check(GetThreadGroupAffinity(native->handle, &actual), "Cannot inspect resource worker affinity");
+            const DWORD_PTR expected = qualified ? allowed : nativeGuestAffinity(guestMask, allowed, actual.Group);
+            check(actual.Mask == expected && native->priority == priority &&
+                  GetThreadPriority(native->handle) == priority,
+                  "Resource scheduling repinned a qualified worker, broadened another worker, or changed priority");
+            previous = guestMask;
+        }
+        memory->write32(scratch + 32, 0xDEADBEEF);
+        ctx.r3.u64 = threadObject; ctx.r4.u64 = 64; ctx.r5.u64 = scratch + 32;
+        __imp__KeSetAffinityThread(ctx, base);
+        check(ctx.r3.u32 == 0xC000000D && memory->read32(scratch + 32) == 0xDEADBEEF &&
+              native->affinity == 32 && base[processorByte] == 5,
+              "Rejected resource affinity changed guest state");
+        const uint32_t finalMask = fixture.initialMask == 32 ? 32 : 4;
+        const uint8_t finalProcessor = fixture.initialMask == 32 ? 5 : 2;
+        ctx.r3.u64 = threadObject; ctx.r4.u64 = finalMask; ctx.r5.u64 = 0;
+        __imp__KeSetAffinityThread(ctx, base);
+        check(ctx.r3.u32 == 0 && native->affinity == finalMask && base[processorByte] == finalProcessor,
+              "Resource affinity rejected an optional old-mask output");
+        ctx.r3.u64 = threadObject; __imp__ObDereferenceObject(ctx, base);
+        ctx.r3.u64 = handle; ctx.r4.u64 = scratch + 8;
+        __imp__NtResumeThread(ctx, base);
+        check(ctx.r3.u32 == 0 && memory->read32(scratch + 8) == 1, "Resource worker resume count is wrong");
+        *reinterpret_cast<uint64_t*>(base + scratch + 64) = _byteswap_uint64(uint64_t(-50000000ll));
+        ctx.r3.u64 = handle; ctx.r4.u64 = 0; ctx.r5.u64 = 0; ctx.r6.u64 = scratch + 64;
+        __imp__NtWaitForSingleObjectEx(ctx, base);
+        check(ctx.r3.u32 == 0 && memory->read32(argument + 24) == finalProcessor &&
+              memory->read32(argument + 8) == 0 && memory->read32(argument + 20) == 0,
+              "Resource worker execution changed guest PCR, TLS or exit behavior");
+        ctx.r3.u64 = 47; __imp__KeTlsGetValue(ctx, base);
+        check(ctx.r3.u32 == 0x12345678 && base[ctx.r13.u32 + 0x10c] == 0,
+              "Resource worker scheduling changed the main guest identity");
+        ctx.r3.u64 = handle; __imp__NtClose(ctx, base);
+        native.reset();
+        memory->release(argument);
+        check(memory->allocatedBytes() == allocatedBefore, "Resource policy fixture leaked guest memory");
+    }
+    PPC_LOOKUP_FUNC(base, PPC_CODE_BASE) = otherOriginal;
+    PPC_LOOKUP_FUNC(base, resourcePoolThreadEntry) = original;
+    check(memory->read32(resourcePoolThreadVtable + 48) == resourcePoolThreadCallback &&
+          memory->read32(applicationSystemThreadVtable + 48) == applicationSystemThreadCallback,
+          "Resource policy fixture altered the retail vtable");
+}
 static void testSynchronization(PPCContext& ctx, uint32_t scratch) {
     {
         std::vector<HostProcessor> topology;
@@ -370,6 +523,7 @@ static void testSynchronization(PPCContext& ctx, uint32_t scratch) {
     check(exitQuery(thread, scratch + 24) == 0, "Closed thread handle still resolves");
     check(memory->allocatedBytes() == allocatedBefore, "Closed and terminated thread leaked its guest allocation");
     PPC_LOOKUP_FUNC(base, probeAddress) = original;
+    testWorkerScheduling(ctx, scratch);
 }
 static void testVsnprintf(PPCContext& ctx) {
     auto* base = memory->base();
@@ -1400,7 +1554,7 @@ static void testFiles(PPCContext& ctx, uint32_t scratch) {
     };
     check(open("game:\\..\\CMakeLists.txt") == 0xc0000033, "File path escaped its guest mount");
     check(open("game:\\__native_test_missing_file__") == 0xc0000034, "Missing file did not return its native status");
-    check(open("game:\\basefile.exe") == 0, "Original image could not be opened through the guest file ABI");
+    check(open("game:\\default.xex") == 0, "Original image could not be opened through the guest file ABI");
     uint32_t file = memory->read32(scratch + 80);
     // This title's SDK passes ShareAccess in r7 and OpenOptions in r8.
     // Original callers at 0x828A8B88 and 0x828A9C0C set both registers.
@@ -1431,7 +1585,7 @@ static void testFiles(PPCContext& ctx, uint32_t scratch) {
     __imp__NtQueryInformationFile(ctx, base);
     check(ctx.r3.u32 == 0, "File size query failed");
     uint64_t size = _byteswap_uint64(*reinterpret_cast<uint64_t*>(base + scratch + 136));
-    check(size == std::filesystem::file_size(memory->gameDirectory() / "basefile.exe"), "File size endian translation failed");
+    check(size == std::filesystem::file_size(memory->gameDirectory() / "default.xex"), "File size endian translation failed");
     auto read = [&](uint64_t offset) {
         *reinterpret_cast<uint64_t*>(base + scratch + 48) = _byteswap_uint64(offset);
         ctx.r3.u64 = file; ctx.r4.u64 = 0; ctx.r5.u64 = 0; ctx.r6.u64 = 0;
@@ -1441,7 +1595,7 @@ static void testFiles(PPCContext& ctx, uint32_t scratch) {
     };
     check(read(0) == 0 && memory->read32(scratch + 68) == 32, "Native file read failed");
     char expected[32];
-    std::ifstream actual(memory->gameDirectory() / "basefile.exe", std::ios::binary);
+    std::ifstream actual(memory->gameDirectory() / "default.xex", std::ios::binary);
     actual.read(expected, sizeof(expected));
     check(memcmp(expected, base + scratch + 512, sizeof(expected)) == 0, "File read changed the original bytes");
     auto original = PPC_LOOKUP_FUNC(base, PPC_CODE_BASE);
@@ -1486,14 +1640,12 @@ static void testFiles(PPCContext& ctx, uint32_t scratch) {
     __imp__NtCreateFile(ctx, base);
     check(ctx.r3.u32 == 0, "Archive could not be opened with game access/options");
     uint32_t archive = memory->read32(scratch + 80);
-    // The native menu replaces this archive beside the executable. Compare
-    // against that host fixture, not the unmodified console asset's size.
-    wchar_t testExecutable[32768]{};
-    const DWORD testExecutableLength = GetModuleFileNameW(nullptr, testExecutable, DWORD(std::size(testExecutable)));
-    check(testExecutableLength && testExecutableLength < std::size(testExecutable),
-          "Could not locate the native archive fixture");
-    uint64_t archiveExpected = uint64_t(std::filesystem::file_size(
-        std::filesystem::path(testExecutable).parent_path() / "GameContext_Create.pc.xdf"));
+    // Localized dumps may use their own cache with just the menu filename
+    // hidden, or retain the original cache when their menu is incompatible.
+    const auto& replacementArchive = memory->nativeMenuAssets().archive;
+    const auto expectedArchive = replacementArchive.empty()
+        ? memory->gameDirectory() / "Content/Xdf/GameContext_Create.XDF" : replacementArchive;
+    uint64_t archiveExpected = uint64_t(std::filesystem::file_size(expectedArchive));
     check(archiveExpected != 0, "Archive fixture is empty");
     uint32_t archiveWrapper = memory->allocate(8);
     check(archiveWrapper != 0, "Archive wrapper allocation failed");
@@ -1516,6 +1668,46 @@ int main(int argc, char** argv) {
         addressSpace.load(argv[1]);
         PPCContext ctx{};
         addressSpace.initThread(ctx);
+        if (argc == 3 && strcmp(argv[2], "--revision-glyphs") == 0) {
+            testRevisionGlyphs(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--russian-revision") == 0) {
+            testRussianRevisionGlyphs(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--screen-fade") == 0) {
+            testScreenFade(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--title-text-layout") == 0) {
+            testTitleTextLayout(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--title-text-shadow") == 0) {
+            testTitleTextShadow(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--title-text-heading") == 0) {
+            testTitleTextHeading(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--subtitle-scale") == 0) {
+            testSubtitleScale(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--developer-tools") == 0) {
+            testDeveloperToolsRequests();
+            testDeveloperInvincibility(ctx);
+            testDeveloperNoclip(ctx);
+            testDeveloperWeaponAssets(ctx);
+            testDeveloperDarkness(ctx);
+            testDeveloperPlayerLookup(ctx);
+            testDeveloperPlayer(ctx);
+            testDeveloperMissions(ctx);
+            testDeveloperUpdate(ctx);
+            return 0;
+        }
         if (argc == 3 && strcmp(argv[2], "--video-settings") == 0) {
             testVideoSettings(ctx);
             return 0;
@@ -1550,6 +1742,14 @@ int main(int argc, char** argv) {
             testFileBuffers(ctx);
             return 0;
         }
+        if (argc == 6 && strcmp(argv[2], "--achievement-worker") == 0) {
+            testAchievementRaceWorker(ctx, argv[3], argv[4], argv[5]);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--achievements") == 0) {
+            testAchievementGuest(ctx);
+            return 0;
+        }
         if (argc == 3 && strcmp(argv[2], "--save-storage") == 0) {
             testNativeStorage(ctx);
             return 0;
@@ -1559,9 +1759,36 @@ int main(int argc, char** argv) {
             testNativeTimedWait(ctx);
             return 0;
         }
+        if (argc == 3 && strcmp(argv[2], "--native-sync") == 0) {
+            ctx.r3.u64 = 47; ctx.r4.u64 = 0x12345678;
+            __imp__KeTlsSetValue(ctx, addressSpace.base());
+            const uint32_t scratch = addressSpace.allocate(4096);
+            check(scratch != 0, "Synchronization fixture allocation failed");
+            memset(addressSpace.base() + scratch, 0, 4096);
+            testSynchronization(ctx, scratch);
+            addressSpace.release(scratch);
+            puts("Native synchronization, guest PCR/TLS, mixer identity and worker scheduling contracts passed.");
+            return 0;
+        }
         if (argc == 3 && strcmp(argv[2], "--input") == 0) {
             testInputContract(ctx);
             testMouseLookContract(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--menu-pointer") == 0) {
+            testMenuPointerGuest(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--keyboard-menu") == 0) {
+            testMenuKeyboardGuest(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--keyboard-status") == 0) {
+            testMenuKeyboardStatus(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--language") == 0) {
+            testConfiguredLanguage(ctx);
             return 0;
         }
         if (argc == 3 && strcmp(argv[2], "--dispatcher") == 0) {
@@ -1619,11 +1846,11 @@ int main(int argc, char** argv) {
                   "Bare-relative null-root query acquired implicit volume");
             check(query("D:\\Content", 0xfffffffd) == 0,
                   "Explicit mounted Content query failed");
-            check(query("\\Device\\CdRom0\\basefile.exe", 0xfffffffd) == 0 &&
+            check(query("\\Device\\CdRom0\\default.xex", 0xfffffffd) == 0 &&
                   query("/dEvIcE/cDrOm0/Content", 0xfffffffd) == 0,
                   "CD-ROM mount lost case-insensitive or slash-normalized lookup");
-            check(query("\\Device\\CdRom0basefile.exe", 0xfffffffd) == 0xc000000e &&
-                  query("\\Device\\CdRom00\\basefile.exe", 0xfffffffd) == 0xc000000e,
+            check(query("\\Device\\CdRom0default.xex", 0xfffffffd) == 0xc000000e &&
+                  query("\\Device\\CdRom00\\default.xex", 0xfffffffd) == 0xc000000e,
                   "Device name prefix was incorrectly accepted as the CD-ROM mount");
             size_t dirLength = strlen("D:\\Content");
             memcpy(resolveBase + scratch + 1024, "D:\\Content", dirLength + 1);
@@ -2033,6 +2260,10 @@ int main(int argc, char** argv) {
             testAudioDriver(ctx, argv[1]);
             return 0;
         }
+        if (argc == 3 && strcmp(argv[2], "--texture-preload") == 0) {
+            testTexturePreloadQueue();
+            return 0;
+        }
         if (argc == 3 && strcmp(argv[2], "--timestamp-bundle") == 0) {
             currentContext = &ctx;
             DarkRecomp::Native::initializeKernel();
@@ -2088,6 +2319,7 @@ int main(int argc, char** argv) {
         ctx.r3.u64 = 0xfeeefeee;
         __imp__KeQueryPerformanceFrequency(ctx, memory->base());
         check(ctx.r3.u64 == 49875000, "Timebase frequency ABI mismatch");
+        testTimebaseScale();
         uint64_t before = PPCQueryTimebase();
         Sleep(10);
         uint64_t elapsed = PPCQueryTimebase() - before;

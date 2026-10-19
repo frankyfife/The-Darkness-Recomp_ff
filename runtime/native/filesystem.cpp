@@ -1,9 +1,13 @@
+#include "stall_profiler_lock.h"
+#include "stall_profiler.h"
 #include "objects.h"
 #include "storage.h"
+#include "file_query_compat.h"
 #include "renderer/engine/engine_performance.h"
 #include <winternl.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -50,7 +54,21 @@ void write64(uint32_t address, uint64_t value) { *reinterpret_cast<uint64_t*>(me
 void ioStatus(uint32_t pointer, uint32_t status, uint32_t bytes) {
     if (pointer) { memory->write32(pointer, status); memory->write32(pointer + 4, bytes); }
 }
-struct PathResult { std::filesystem::path path; bool writable = false; uint32_t status = 0; };
+bool invalidUnbufferedRequest(bool unbuffered, uint32_t length, const LARGE_INTEGER* offset) {
+    // Unbuffered native I/O requires sector-multiple lengths and offsets. All
+    // supported volumes use at least 512-byte sectors; leave stricter device
+    // alignment to ntdll. Wine's regular-file path omits this minimum check.
+    // Zero-length requests, implicit positions and negative native sentinels
+    // retain their native handling. Guest buffer alignment uses bounce buffers.
+    return unbuffered && length && ((length & 511) ||
+        (offset && offset->QuadPart >= 0 && (uint64_t(offset->QuadPart) & 511)));
+}
+struct PathResult {
+    std::filesystem::path path;
+    bool writable = false;
+    uint32_t status = 0;
+    std::shared_ptr<const CachedWeaponFile> cachedWeaponFile;
+};
 PathResult resolve(uint32_t attributes) {
     PathResult result;
     if (!attributes) { result.status = invalidParameter; return result; }
@@ -128,22 +146,30 @@ PathResult resolve(uint32_t attributes) {
     auto pathString = result.path.wstring();
     if (pathString.size() < rootString.size() || _wcsnicmp(pathString.c_str(), rootString.c_str(), rootString.size()) ||
         (pathString.size() > rootString.size() && pathString[rootString.size()] != L'\\')) result.status = nameInvalid;
-    // Startup serves CubeWnd from the XDF read cache before opening loose
-    // files. Both paths must carry the same generated menu. Shipped (often
-    // hardlinked) assets remain untouched.
-    const wchar_t* replacement = nullptr;
+    // The prepared archive preserves the user's localized strings and fonts.
+    // Its menu cache either matches the generated menu or defers to the loose
+    // override. Shipped (often hardlinked) assets remain untouched.
+    const std::filesystem::path* replacement = nullptr;
     if (!result.status && !result.writable) {
         const auto relativePath = result.path.lexically_relative(memory->gameDirectory()).make_preferred();
         if (_wcsicmp(relativePath.c_str(), L"Content\\Gui\\CubeWnd.xcr") == 0)
-            replacement = L"CubeWnd.pc.xcr";
+            replacement = &memory->nativeMenuAssets().menu;
         else if (_wcsicmp(relativePath.c_str(), L"Content\\Xdf\\GameContext_Create.XDF") == 0)
-            replacement = L"GameContext_Create.pc.xdf";
+            replacement = &memory->nativeMenuAssets().archive;
     }
-    if (replacement) {
-        wchar_t executable[32768]{};
-        const auto length = GetModuleFileNameW(nullptr, executable, DWORD(std::size(executable)));
-        if (length && length < std::size(executable))
-            result.path = std::filesystem::path(executable).parent_path() / replacement;
+    if (replacement && !replacement->empty()) {
+        result.path = *replacement;
+        // NtCreateFile consumes NT paths and does not accept Win32's '/' alias.
+        result.path.make_preferred();
+    }
+    if (!result.status && !result.writable) {
+        auto cached = memory->developerWeaponFile(result.path);
+        std::error_code error;
+        if (cached && !std::filesystem::exists(result.path, error) && !error) {
+            result.cachedWeaponFile = std::move(cached);
+            result.path = result.cachedWeaponFile->path;
+            result.path.make_preferred();
+        }
     }
     return result;
 }
@@ -180,6 +206,8 @@ uint32_t create(PPCContext& ctx, uint32_t out, uint32_t access, uint32_t attribu
             auto stored = object(id);
             stored->isFile = true; stored->path = resolved.path; stored->writable = resolved.writable;
             stored->unbuffered = (options & 8) != 0;
+            stored->fileOpenOptions = options;
+            stored->cachedWeaponFile = std::move(resolved.cachedWeaponFile);
             memory->write32(out, id);
         }
     }
@@ -191,6 +219,7 @@ uint32_t create(PPCContext& ctx, uint32_t out, uint32_t access, uint32_t attribu
 }
 }
 PPC_FUNC(__imp__NtCreateFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     const uint64_t optionsAddress = uint64_t(ctx.r1.u32) + 84;
     if (optionsAddress > UINT32_MAX || !fileGuestSpan(uint32_t(optionsAddress), 4, false)) {
         if (fileGuestSpan(ctx.r6.u32, 8, true)) ioStatus(ctx.r6.u32, accessViolation, 0);
@@ -200,10 +229,12 @@ PPC_FUNC(__imp__NtCreateFile) {
                         ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, memory->read32(uint32_t(optionsAddress)));
 }
 PPC_FUNC(__imp__NtOpenFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     // The title's original callers pass ShareAccess and OpenOptions separately.
     ctx.r3.u64 = create(ctx, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 0, 0, ctx.r7.u32, 1, ctx.r8.u32);
 }
 PPC_FUNC(__imp__NtQueryFullAttributesFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     uint32_t attributes = ctx.r3.u32, out = ctx.r4.u32;
     if (!out) { ctx.r3.u64 = invalidParameter; return; }
     if (!fileGuestSpan(out, 56, true)) { ctx.r3.u64 = accessViolation; return; }
@@ -228,6 +259,7 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile) {
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtReadFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     uint32_t ios = ctx.r7.u32;
     if (!ios) { ctx.r3.u64 = invalidParameter; return; }
     if (!fileGuestSpan(ios, 8, true)) { ctx.r3.u64 = accessViolation; return; }
@@ -244,12 +276,40 @@ PPC_FUNC(__imp__NtReadFile) {
         (ctx.r10.u32 && !fileGuestSpan(ctx.r10.u32, 8, false))) {
         ioStatus(ios, accessViolation, 0); ctx.r3.u64 = accessViolation; return;
     }
-    uint32_t apc = ctx.r5.u32, argument = ctx.r6.u32;
-    std::lock_guard lock(file->ioMutex);
-    HANDLE completion = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!completion) { ioStatus(ios, 0xc0000017, 0); ctx.r3.u64 = 0xc0000017; return; }
     LARGE_INTEGER offset{};
     if (ctx.r10.u32) offset.QuadPart = read64(ctx.r10.u32);
+    if (invalidUnbufferedRequest(file->unbuffered, ctx.r9.u32, ctx.r10.u32 ? &offset : nullptr)) {
+        ioStatus(ios, invalidParameter, 0); ctx.r3.u64 = invalidParameter; return;
+    }
+    uint32_t apc = ctx.r5.u32, argument = ctx.r6.u32;
+    auto lock = StallProfiler::lock(file->ioMutex, "file-io-mutex");
+    if (file->cachedWeaponFile && ctx.r9.u32) {
+        // XDF caches contain exact read ranges, sometimes an optimized prefix
+        // of a larger nominal file. Never expose sparse holes as asset bytes.
+        auto position = offset;
+        uint32_t status = 0;
+        if (!ctx.r10.u32 || position.QuadPart == -2) {
+            IO_STATUS_BLOCK positionIo{};
+            using Query = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
+            status = uint32_t(nt<Query>(ctx, "NtQueryInformationFile")(
+                file->handle, &positionIo, &position, sizeof(position), FILE_INFORMATION_CLASS(14)));
+        }
+        const auto size = file->cachedWeaponFile->size;
+        if (int32_t(status) >= 0 && position.QuadPart < 0) status = invalidParameter;
+        if (int32_t(status) >= 0 && uint64_t(position.QuadPart) < size) {
+            const auto count = uint32_t((std::min)(uint64_t(ctx.r9.u32), size - uint64_t(position.QuadPart)));
+            if (!file->cachedWeaponFile->covers(uint64_t(position.QuadPart), count)) {
+                status = 0xc000003e; // STATUS_DATA_ERROR: requested bytes were not cached.
+                std::fprintf(stderr, "[Weapons] Uncached read '%ls' offset=%llu bytes=%u.\n",
+                    file->path.filename().c_str(), uint64_t(position.QuadPart), count);
+            }
+        }
+        if (int32_t(status) < 0) {
+            ioStatus(ios, status, 0); ctx.r3.u64 = status; return;
+        }
+    }
+    HANDLE completion = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!completion) { ioStatus(ios, 0xc0000017, 0); ctx.r3.u64 = 0xc0000017; return; }
     IO_STATUS_BLOCK result{};
     std::unique_ptr<void, decltype(&_aligned_free)> aligned(nullptr, _aligned_free);
     void* destination = base + ctx.r8.u32;
@@ -262,6 +322,8 @@ PPC_FUNC(__imp__NtReadFile) {
     uint32_t status = uint32_t(nt<Read>(ctx, "NtReadFile")(file->handle, completion, nullptr, nullptr, &result,
         destination, ctx.r9.u32, ctx.r10.u32 ? &offset : nullptr, nullptr));
     if (status == pending) {
+        StallProfiler::Scope wait(StallProfiler::Section::Wait, "NtReadFile.completion",
+            ctx.lastFunction, uint32_t(ctx.lr), ctx.r3.u32, "guest-file-handle");
         WaitForSingleObject(completion, INFINITE);
         status = uint32_t(result.Status);
     }
@@ -281,6 +343,7 @@ PPC_FUNC(__imp__NtReadFile) {
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtQueryInformationFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     auto file = object(ctx.r3.u32);
     uint32_t ios = ctx.r4.u32, out = ctx.r5.u32, length = ctx.r6.u32, kind = ctx.r7.u32;
     if (ios && !fileGuestSpan(ios, 8, true)) { ctx.r3.u64 = accessViolation; return; }
@@ -302,6 +365,19 @@ PPC_FUNC(__imp__NtQueryInformationFile) {
     IO_STATUS_BLOCK result{};
     using Query = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
     uint32_t status = uint32_t(nt<Query>(ctx, "NtQueryInformationFile")(file->handle, &result, bytes, size, FILE_INFORMATION_CLASS(kind)));
+    if (status == 0xc0000002 && (kind == 16 || kind == 17)) {
+        // Wine lacks these two classes. Mode is the documented subset of the
+        // successful open options, shared by duplicated guest handles. For
+        // alignment, our unbuffered I/O already uses 4096-aligned bounce
+        // buffers; report that conservative requirement instead of inventing
+        // success for another unsupported class or host error.
+        const uint32_t value = kind == 16 ? file->fileOpenOptions & 0x103e : 4095;
+        std::memcpy(bytes, &value, sizeof(value));
+        result.Status = 0; result.Information = sizeof(value); status = 0;
+    }
+    if (FileTraceEnabled() || int32_t(status) < 0)
+        fprintf(stderr, "[File] information '%ls' class=%u bytes=%llu status=0x%08X\n",
+                file->path.filename().c_str(), kind, uint64_t(result.Information), status);
     if (int32_t(status) >= 0) {
         memset(base + out, 0, size);
         uint32_t qwords = kind == 4 ? 4 : kind == 5 ? 2 : kind == 34 ? 6 : (kind == 6 || kind == 14) ? 1 : 0;
@@ -314,6 +390,7 @@ PPC_FUNC(__imp__NtQueryInformationFile) {
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtSetInformationFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     auto file = object(ctx.r3.u32);
     uint32_t ios = ctx.r4.u32, in = ctx.r5.u32, length = ctx.r6.u32, kind = ctx.r7.u32;
     if (ios && !fileGuestSpan(ios, 8, true)) { ctx.r3.u64 = accessViolation; return; }
@@ -350,7 +427,7 @@ PPC_FUNC(__imp__NtSetInformationFile) {
         }
         memcpy(input, &value, 8);
     }
-    std::lock_guard lock(file->ioMutex);
+    auto lock = StallProfiler::lock(file->ioMutex, "file-io-mutex");
     IO_STATUS_BLOCK result{};
     using Set = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
     uint32_t status = uint32_t(nt<Set>(ctx, "NtSetInformationFile")(file->handle, &result, input, wantLength, FILE_INFORMATION_CLASS(kind)));
@@ -359,6 +436,8 @@ PPC_FUNC(__imp__NtSetInformationFile) {
     // Never return success or pending with a stack IOS escaping: completion
     // must be proven before reporting it.
     if (status == pending) {
+        StallProfiler::Scope wait(StallProfiler::Section::Wait, "NtSetInformationFile.completion",
+            ctx.lastFunction, uint32_t(ctx.lr), ctx.r3.u32, "guest-file-handle");
         DWORD waitResult = WaitForSingleObject(file->handle, INFINITE);
         status = uint32_t(result.Status);
         if (waitResult != WAIT_OBJECT_0 || status == pending)
@@ -367,6 +446,7 @@ PPC_FUNC(__imp__NtSetInformationFile) {
     ioStatus(ios, status, uint32_t(result.Information)); ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtQueryDirectoryFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     uint32_t ios = ctx.r7.u32, out = ctx.r8.u32, length = ctx.r9.u32;
     if (ios && !fileGuestSpan(ios, 8, true)) { ctx.r3.u64 = accessViolation; return; }
     auto file = object(ctx.r3.u32), event = ctx.r4.u32 ? object(ctx.r4.u32) : nullptr;
@@ -392,7 +472,7 @@ PPC_FUNC(__imp__NtQueryDirectoryFile) {
         for (uint32_t i = 0; i < count; ++i) pattern.push_back(base[pointer + i]);
     }
     UNICODE_STRING filter{USHORT(pattern.size() * 2), USHORT(pattern.size() * 2), pattern.data()};
-    std::lock_guard lock(file->ioMutex);
+    auto lock = StallProfiler::lock(file->ioMutex, "file-io-mutex");
     alignas(8) uint8_t native[64 + 65536]{};
     const uint8_t* record = native;
     const bool restart = memory->read32(ctx.r1.u32 + 84) != 0;
@@ -404,10 +484,12 @@ PPC_FUNC(__imp__NtQueryDirectoryFile) {
         IO_STATUS_BLOCK result{};
         using Query = NTSTATUS (NTAPI*)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID,
             ULONG, FILE_INFORMATION_CLASS, BOOLEAN, PUNICODE_STRING, BOOLEAN);
-        status = uint32_t(nt<Query>(ctx, "NtQueryDirectoryFile")(file->handle, completion, nullptr, nullptr,
-            &result, native, sizeof(native), FILE_INFORMATION_CLASS(1), TRUE, pattern.empty() ? nullptr : &filter, restart));
-        if (status == pending) { WaitForSingleObject(completion, INFINITE); status = uint32_t(result.Status); }
-        completed = WaitForSingleObject(completion, 0) == WAIT_OBJECT_0;
+        auto query = nt<Query>(ctx, "NtQueryDirectoryFile");
+        const auto nativeCompletion = queryDirectoryWithCompletion([&](HANDLE event) {
+            return uint32_t(query(file->handle, event, nullptr, nullptr,
+                &result, native, sizeof(native), FILE_INFORMATION_CLASS(1), TRUE, pattern.empty() ? nullptr : &filter, restart));
+        }, file->handle, completion, result);
+        status = nativeCompletion.status; completed = nativeCompletion.completed;
         CloseHandle(completion);
         // A restart supersedes the retained entry, including an empty search.
         // Leave it intact when the restart request itself could not execute.
@@ -437,6 +519,9 @@ PPC_FUNC(__imp__NtQueryDirectoryFile) {
             fprintf(stderr, "[File] directory '%ls': %s\n", file->path.c_str(), utf8.c_str());
     }
     ioStatus(ios, status, written);
+    if (FileTraceEnabled() || int32_t(status) < 0)
+        fprintf(stderr, "[File] directory query '%ls' filter='%ls' class=1 restart=%u length=%u status=0x%08X completed=%u\n",
+                file->path.c_str(), pattern.c_str(), unsigned(restart), length, status, unsigned(completed));
     if (completed) {
         if (ctx.r5.u32 & ~1u) queueGuestApc(ctx, ctx.r5.u32, ctx.r6.u32, ios);
         if (event) SetEvent(event->handle);
@@ -444,6 +529,7 @@ PPC_FUNC(__imp__NtQueryDirectoryFile) {
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtWriteFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     uint32_t ios = ctx.r7.u32;
     if (!ios) { ctx.r3.u64 = invalidParameter; return; }
     if (!fileGuestSpan(ios, 8, true)) { ctx.r3.u64 = accessViolation; return; }
@@ -461,12 +547,15 @@ PPC_FUNC(__imp__NtWriteFile) {
         (ctx.r10.u32 && !fileGuestSpan(ctx.r10.u32, 8, false))) {
         ioStatus(ios, accessViolation, 0); ctx.r3.u64 = accessViolation; return;
     }
-    uint32_t apc = ctx.r5.u32, argument = ctx.r6.u32;
-    std::lock_guard lock(file->ioMutex);
-    HANDLE completion = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!completion) { ioStatus(ios, 0xc0000017, 0); ctx.r3.u64 = 0xc0000017; return; }
     LARGE_INTEGER offset{};
     if (ctx.r10.u32) offset.QuadPart = read64(ctx.r10.u32);
+    if (invalidUnbufferedRequest(file->unbuffered, ctx.r9.u32, ctx.r10.u32 ? &offset : nullptr)) {
+        ioStatus(ios, invalidParameter, 0); ctx.r3.u64 = invalidParameter; return;
+    }
+    uint32_t apc = ctx.r5.u32, argument = ctx.r6.u32;
+    auto lock = StallProfiler::lock(file->ioMutex, "file-io-mutex");
+    HANDLE completion = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!completion) { ioStatus(ios, 0xc0000017, 0); ctx.r3.u64 = 0xc0000017; return; }
     IO_STATUS_BLOCK result{};
     std::unique_ptr<void, decltype(&_aligned_free)> aligned(nullptr, _aligned_free);
     const void* source = base + ctx.r8.u32;
@@ -480,6 +569,8 @@ PPC_FUNC(__imp__NtWriteFile) {
     uint32_t status = uint32_t(nt<Write>(ctx, "NtWriteFile")(file->handle, completion, nullptr, nullptr, &result,
         const_cast<void*>(source), ctx.r9.u32, ctx.r10.u32 ? &offset : nullptr, nullptr));
     if (status == pending) {
+        StallProfiler::Scope wait(StallProfiler::Section::Wait, "NtWriteFile.completion",
+            ctx.lastFunction, uint32_t(ctx.lr), ctx.r3.u32, "guest-file-handle");
         WaitForSingleObject(completion, INFINITE);
         status = uint32_t(result.Status);
     }
@@ -496,12 +587,13 @@ PPC_FUNC(__imp__NtWriteFile) {
     ctx.r3.u64 = status;
 }
 PPC_FUNC(__imp__NtFlushBuffersFile) {
+    StallProfiler::Scope stallProfile(StallProfiler::Section::FileIO, __func__, ctx.lastFunction, uint32_t(ctx.lr));
     auto file = object(ctx.r3.u32);
     uint32_t ios = ctx.r4.u32;
     if (!ios) { ctx.r3.u64 = invalidParameter; return; }
     if (!fileGuestSpan(ios, 8, true)) { ctx.r3.u64 = accessViolation; return; }
     if (!file || !file->isFile) { ioStatus(ios, invalidHandle, 0); ctx.r3.u64 = invalidHandle; return; }
-    std::lock_guard lock(file->ioMutex);
+    auto lock = StallProfiler::lock(file->ioMutex, "file-io-mutex");
     IO_STATUS_BLOCK result{};
     using Flush = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK);
     uint32_t status = uint32_t(nt<Flush>(ctx, "NtFlushBuffersFile")(file->handle, &result));

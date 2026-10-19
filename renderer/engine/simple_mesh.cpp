@@ -1,6 +1,8 @@
 #include "simple_mesh.h"
+#include "display_gamma.h"
 #include "prompt_icons.h"
 #include "texture_mip_layout.h"
+#include "texture_pixel_decode.h"
 #include "engine_performance.h"
 #include "stored_geometry.h"
 #include "engine_texture_constants.h"
@@ -12,6 +14,8 @@
 #include "scene_work.h"
 #include "render_trace.h"
 #include "runtime/native/display_mode.h"
+#include "runtime/native/runtime.h"
+#include "runtime/native/stall_profiler.h"
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
@@ -21,12 +25,32 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace DarkRecomp::Native {
 namespace {
+thread_local PromptRenderContext promptRenderContext = PromptRenderContext::Menu;
+thread_local bool subtitleRenderContext = false;
+struct PromptContextFrame {
+    uint8_t* base = nullptr;
+    uint32_t manager = 0;
+    uint64_t generation = 0;
+    std::unordered_set<uint32_t> gameplayDraws;
+    std::unordered_set<uint32_t> subtitleDraws;
+};
+constexpr size_t promptManagerLimit = 16, promptDrawLimit = 4096;
+std::array<PromptContextFrame, promptManagerLimit> promptContextFrames;
+std::mutex promptContextMutex;
+uint64_t promptContextGeneration = 0;
+PromptContextFrame* findPromptContextFrame(uint8_t* base, uint32_t manager) noexcept {
+    for (auto& frame : promptContextFrames)
+        if (frame.base == base && frame.manager == manager) return &frame;
+    return nullptr;
+}
 bool TextureUploadTraceEnabled() {
     // Per-new-texture success logs cost unbuffered writes during area loads.
     // Failures stay on their bounded paths; gate success spam behind opt-in.
@@ -67,12 +91,37 @@ std::unordered_map<uint32_t, std::shared_ptr<const AlphaImage>> textures;
 std::unordered_map<uint32_t, std::shared_ptr<const ColorImage>> alphaColors;
 struct CachedColor { std::shared_ptr<const ColorImage> image; uint64_t used = 0; uint32_t resource = 0; };
 std::unordered_map<uint32_t, CachedColor> colorTextures;
+// Completed authored images can reach the GPU while loading is still showing
+// a prior frame. Never extend their CPU lifetime solely for this optional work.
+constexpr size_t texturePreloadLimit=4096;
+std::deque<std::weak_ptr<const ColorImage>> texturePreloads;
+PreviewTexturePreloadCounters texturePreloadCounts;
 // The original menu upload working set exceeds64MiB before its model is first
 // drawn. Keep that working set resident; dropping an uploaded map cannot cause
 // the guest to repeat its already-completed upload.
 size_t colorBudget = 256 * 1024 * 1024;
+bool colorBudgetReported = false;
 size_t colorBytes = 0, pendingColorBytes = 0;
 uint64_t colorUse = 0;
+// Called with queueMutex held. Ordinary textures can be reconstructed from
+// resident guest pixels after eviction; verified GUI prompts also carry the
+// selected original button name, which a pixel-only decode cannot recover.
+// Retain that owned generation until explicit invalidation or replacement.
+bool makeColorCacheRoom(size_t bytes) {
+    if (bytes > colorBudget) return false;
+    while (colorBytes > colorBudget - bytes) {
+        auto oldest = colorTextures.end();
+        for (auto it = colorTextures.begin(); it != colorTextures.end(); ++it) {
+            if (it->second.image->promptOrigin) continue;
+            if (oldest == colorTextures.end() || it->second.used < oldest->second.used) oldest = it;
+        }
+        // Keep the cache bounded even if retained prompts fill its budget.
+        if (oldest == colorTextures.end()) return false;
+        colorBytes -= oldest->second.image->bytes();
+        colorTextures.erase(oldest);
+    }
+    return true;
+}
 struct CachedVideo {
     uint32_t owner = 0, frame = 0;
     std::array<uint8_t, 8> timestamp{};
@@ -105,6 +154,11 @@ bool reservePreviewCommand(std::unique_lock<std::mutex>& lock) {
 }
 std::array<std::shared_ptr<WorldQueryResult>,8> histogramResults;
 thread_local std::shared_ptr<WorldQuery> activeHistogram;
+// Original flare instances carry a u16 query ID, including 0xFFFF. Their
+// completed visibility counts must not share the eight exposure bins.
+constexpr unsigned flareQueryMaximumId=65535;
+std::unordered_map<unsigned,std::shared_ptr<WorldQueryResult>> flareResults;
+thread_local std::shared_ptr<WorldQuery> activeFlare;
 // Task-59 bounded pre-capture failure diagnostics: profile-only (--profile-engine),
 // failures-only. Categories mirror previewObserveImmediateWorld bail stages:
 // 0 attr, 1 state, 2 stream, 3 geometry, 4 bindings, 5 device, 6 exception.
@@ -163,6 +217,129 @@ __declspec(noinline) bool equalEngineBytes(const void* expected,const void* inpu
 }
 }
 
+PromptRenderContext currentPromptRenderContext() noexcept { return promptRenderContext; }
+PromptRenderContext setPromptRenderContext(PromptRenderContext context) noexcept {
+    const auto previous = promptRenderContext;
+    promptRenderContext = context == PromptRenderContext::Gameplay ? context : PromptRenderContext::Menu;
+    return previous;
+}
+void resetQueuedPromptContexts(uint8_t* base, uint32_t manager) noexcept {
+    if (!base || !manager || (manager & 3)) return;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        auto* frame = findPromptContextFrame(base, manager);
+        if (!frame) {
+            for (auto& candidate : promptContextFrames)
+                if (!candidate.base) { frame = &candidate; break; }
+        }
+        if (!frame) return;
+        frame->gameplayDraws.clear();
+        frame->subtitleDraws.clear();
+        frame->base = base;
+        frame->manager = manager;
+        frame->generation = promptContextGeneration < UINT64_MAX ? ++promptContextGeneration : 0;
+    } catch (...) {}
+}
+void retireQueuedPromptContexts() noexcept {
+    try {
+        std::lock_guard lock(promptContextMutex);
+        for (auto& frame : promptContextFrames) {
+            frame.gameplayDraws.clear();
+            frame.subtitleDraws.clear();
+            frame.base = nullptr;
+            frame.manager = 0;
+            frame.generation = 0;
+        }
+    } catch (...) {}
+}
+void retireQueuedPromptContexts(uint8_t* base, uint32_t manager) noexcept {
+    if (!base || !manager) return;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        if (auto* frame = findPromptContextFrame(base, manager)) {
+            frame->gameplayDraws.clear();
+            frame->subtitleDraws.clear();
+            frame->base = nullptr;
+            frame->manager = 0;
+            frame->generation = 0;
+        }
+    } catch (...) {}
+}
+uint64_t queuedPromptGeneration(uint8_t* base, uint32_t manager) noexcept {
+    if (!base || !manager) return 0;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        if (const auto* frame = findPromptContextFrame(base, manager)) return frame->generation;
+    } catch (...) {}
+    return 0;
+}
+void forgetQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw) noexcept {
+    forgetQueuedPromptContext(base, manager, draw, queuedPromptGeneration(base, manager));
+}
+void forgetQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, uint64_t generation) noexcept {
+    if (!base || !manager || !draw || !generation) return;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        if (auto* frame = findPromptContextFrame(base, manager); frame && frame->generation == generation) {
+            frame->gameplayDraws.erase(draw);
+            frame->subtitleDraws.erase(draw);
+        }
+    } catch (...) {}
+}
+void recordQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, PromptRenderContext context) noexcept {
+    recordQueuedPromptContext(base, manager, draw, context, queuedPromptGeneration(base, manager));
+}
+void recordQueuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, PromptRenderContext context, uint64_t generation) noexcept {
+    if (!base || !manager || !draw || (draw & 3) || !generation) return;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        if (auto* frame = findPromptContextFrame(base, manager); frame && frame->generation == generation) {
+            // Clear first, including Menu and failed/overflowed replacements.
+            frame->gameplayDraws.erase(draw);
+            if (frame->generation && context == PromptRenderContext::Gameplay && frame->gameplayDraws.size() < promptDrawLimit)
+                frame->gameplayDraws.insert(draw);
+        }
+    } catch (...) {}
+}
+PromptRenderContext queuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw) noexcept {
+    return queuedPromptContext(base, manager, draw, queuedPromptGeneration(base, manager));
+}
+PromptRenderContext queuedPromptContext(uint8_t* base, uint32_t manager, uint32_t draw, uint64_t generation) noexcept {
+    if (!base || !manager || !draw || (draw & 3) || !generation) return PromptRenderContext::Menu;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        if (const auto* frame = findPromptContextFrame(base, manager); frame && frame->generation == generation && frame->gameplayDraws.contains(draw))
+            return PromptRenderContext::Gameplay;
+    } catch (...) {}
+    return PromptRenderContext::Menu;
+}
+
+bool currentSubtitleRenderContext() noexcept { return subtitleRenderContext; }
+bool setSubtitleRenderContext(bool subtitle) noexcept {
+    return std::exchange(subtitleRenderContext, subtitle);
+}
+void recordQueuedSubtitleContext(uint8_t* base, uint32_t manager, uint32_t draw,
+                                 bool subtitle, uint64_t generation) noexcept {
+    if (!base || !manager || !draw || (draw & 3) || !generation) return;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        if (auto* frame = findPromptContextFrame(base, manager); frame && frame->generation == generation) {
+            frame->subtitleDraws.erase(draw);
+            if (subtitle && frame->subtitleDraws.size() < promptDrawLimit)
+                frame->subtitleDraws.insert(draw);
+        }
+    } catch (...) {}
+}
+bool queuedSubtitleContext(uint8_t* base, uint32_t manager, uint32_t draw, uint64_t generation) noexcept {
+    if (!base || !manager || !draw || (draw & 3) || !generation) return false;
+    try {
+        std::lock_guard lock(promptContextMutex);
+        if (const auto* frame = findPromptContextFrame(base, manager);
+            frame && frame->generation == generation) return frame->subtitleDraws.contains(draw);
+    } catch (...) {}
+    return false;
+}
+
 bool copyRenderMemory(uint8_t* base, uint64_t address, void* output, size_t size) {
     if (!base || !output || !address || address >= 0x100000000ull || size > 0x100000000ull-address) return false;
     // The AOT engine shares this process. Avoid a kernel transition for each
@@ -190,7 +367,14 @@ bool equalRenderMemory(uint8_t* base,uint64_t address,const void* expected,size_
 }
 void setPreviewTextureBudget(size_t bytes) {
     std::lock_guard lock(queueMutex);
-    colorBudget=std::clamp(bytes,size_t(256*1024*1024),size_t(2ull*1024*1024*1024));
+    const auto next=std::clamp(bytes,size_t(256*1024*1024),size_t(2ull*1024*1024*1024));
+    if(colorBudgetReported && next==colorBudget)return;
+    const bool shrink=next<colorBudget;
+    colorBudget=next;
+    colorBudgetReported=true;
+    // Ordinary entries can be reconstructed; prompt generations must retain
+    // their original button names even if they alone exceed a reduced budget.
+    if(shrink)makeColorCacheRoom(0);
     std::fprintf(stderr,"[Performance] Native decoded texture cache budgetMiB=%zu\n",colorBudget/(1024*1024));
 }
 
@@ -224,6 +408,7 @@ const char* decodeSimpleMesh(uint8_t* base, uint32_t descriptor, uint32_t indexA
         (colored && !copyRenderMemory(base, u32(header + 52), colors.data(), colors.size())) ||
         !copyRenderMemory(base, indexAddress, indices.data(), indices.size())) return "unreadable geometry stream";
     SimpleMesh decoded;
+    decoded.promptContext = currentPromptRenderContext();
     decoded.vertices.resize(count);
     decoded.indices.resize(triangles * 3);
     for (size_t i = 0; i < decoded.indices.size(); ++i) {
@@ -452,6 +637,18 @@ const char* decodeWorldTextureImage(uint8_t* base,uint32_t object,ColorImage& re
             if(format==2) {
                 decoded.width=width;decoded.height=height;decoded.sourceCodec=2;decoded.pixels.resize(size_t(width)*height*4);
                 for(size_t i=0;i<linear.size();++i) {decoded.pixels[i*4]=linear[i];decoded.pixels[i*4+3]=255;}
+            } else if(format==3) {
+                decoded.width=width;decoded.height=height;decoded.sourceCodec=3;decoded.pixels.resize(size_t(width)*height*4);
+                for(size_t i=0;i<linear.size()/2;++i) {
+                    const auto rgba=decodeTexture1555(linear.data()+i*2);
+                    std::copy(rgba.begin(),rgba.end(),decoded.pixels.begin()+i*4);
+                }
+            } else if(format==10) {
+                decoded.width=width;decoded.height=height;decoded.sourceCodec=10;decoded.pixels.resize(size_t(width)*height*4);
+                for(size_t i=0;i<linear.size()/2;++i) {
+                    decoded.pixels[i*4]=linear[i*2];decoded.pixels[i*4+1]=linear[i*2+1];
+                    decoded.pixels[i*4+3]=255;
+                }
             } else if(format==49) {
                 decoded.width=width;decoded.height=height;decoded.sourceCodec=49;decoded.pixels.resize(size_t(width)*height*4);
                 auto channel=[](const uint8_t* p,std::array<uint8_t,16>& out) {
@@ -558,14 +755,31 @@ void previewPublishTexture(uint32_t id,uint32_t resource,std::shared_ptr<const C
     std::lock_guard lock(queueMutex);
     if(image->bytes()>colorBudget)return;
     if(auto it=colorTextures.find(id);it!=colorTextures.end()) {colorBytes-=it->second.image->bytes();colorTextures.erase(it);}
-    while(colorBytes+image->bytes()>colorBudget && !colorTextures.empty()) {
-        auto oldest=std::min_element(colorTextures.begin(),colorTextures.end(),[](const auto& a,const auto& b){return a.second.used<b.second.used;});
-        colorBytes-=oldest->second.image->bytes();colorTextures.erase(oldest);
-    }
+    if (!makeColorCacheRoom(image->bytes())) return;
     colorBytes+=image->bytes();colorTextures[id]={image,++colorUse,resource};++colorImages;
+    if(image->authoredMips && !image->firstMip) {
+        if(texturePreloads.size()==texturePreloadLimit) {
+            texturePreloads.pop_front();++texturePreloadCounts.overflow;
+        }
+        texturePreloads.emplace_back(image);++texturePreloadCounts.queued;
+    }
     if (TextureUploadTraceEnabled())
         std::fprintf(stderr,"[EngineImageUpload] authored id=%u resource=%08X size=%ux%u faces=%u first=%u levels=%zu bytes=%zu\n",
             id,resource,image->width,image->height,image->faces,image->firstMip,image->mips.size()+1,image->bytes());
+}
+bool takePreviewTexturePreload(std::shared_ptr<const ColorImage>& image) {
+    // A caller's previous selection may own large pixel vectors. Release it
+    // before taking the handoff lock, like the frame consumer's retire path.
+    image.reset();
+    std::lock_guard lock(queueMutex);
+    if(texturePreloads.empty())return false;
+    image=texturePreloads.front().lock();texturePreloads.pop_front();
+    if(image)++texturePreloadCounts.taken;else ++texturePreloadCounts.expired;
+    return true;
+}
+PreviewTexturePreloadCounters previewTexturePreloadCounters() {
+    std::lock_guard lock(queueMutex);
+    auto counters=texturePreloadCounts;counters.pending=texturePreloads.size();return counters;
 }
 std::shared_ptr<const ColorImage> promptReplacementFor(uint32_t textureId,
     const std::shared_ptr<const ColorImage>& image, PromptRenderSource source, PromptRenderContext context) {
@@ -656,11 +870,7 @@ void previewObserveImage(uint8_t* base, uint32_t address, uint32_t id, uint32_t 
         if (auto it = colorTextures.find(id); it != colorTextures.end()) {
             colorBytes -= it->second.image->bytes(); colorTextures.erase(it);
         }
-        while (colorBytes + color->bytes() > colorBudget && !colorTextures.empty()) {
-            auto oldest = std::min_element(colorTextures.begin(), colorTextures.end(),
-                [](const auto& a, const auto& b) { return a.second.used < b.second.used; });
-            colorBytes -= oldest->second.image->bytes(); colorTextures.erase(oldest);
-        }
+        if (!makeColorCacheRoom(color->bytes())) { ++rejectedImages; return; }
         colorBytes += color->bytes(); colorTextures[id] = {color, ++colorUse}; ++colorImages;
         if (TextureUploadTraceEnabled())
             std::printf("[EnginePreview] Copied original color texture id=%u size=%ux%u codec=%u\n",
@@ -674,6 +884,20 @@ void previewObserveImage(uint8_t* base, uint32_t address, uint32_t id, uint32_t 
     if (TextureUploadTraceEnabled())
         std::printf("[EnginePreview] Copied original alpha texture id=%u size=%ux%u\n", id, image->width, image->height);
 }
+std::shared_ptr<const AlphaImage> previewAlphaImageForSubtitleFont(uint32_t id) noexcept {
+    try {
+        std::lock_guard lock(queueMutex);
+        const auto found = textures.find(id);
+        return found == textures.end() ? nullptr : found->second;
+    } catch (...) { return {}; }
+}
+std::shared_ptr<const ColorImage> previewColorImageForSubtitleFont(uint32_t id) noexcept {
+    try {
+        std::lock_guard lock(queueMutex);
+        const auto found = colorTextures.find(id);
+        return found == colorTextures.end() ? nullptr : found->second.image;
+    } catch (...) { return {}; }
+}
 const char* decodeUploadImage(uint8_t* base,uint32_t address,uint32_t pixels,ColorImage& result) {
     uint8_t header[48]{};
     if (!copyRenderMemory(base,address,header,sizeof(header))) return "unreadable upload CImage";
@@ -681,22 +905,23 @@ const char* decodeUploadImage(uint8_t* base,uint32_t address,uint32_t pixels,Col
     if(flags&0x200)return "upload CImage is metadata only";
     const bool alpha=format==0x40000 && u32(header+28)==1 && (flags&0x15800)==0x800;
     const bool luminance=format==0x2000 && u32(header+28)==1 && (flags&0x15800)==0x800;
+    const bool luminanceAlpha=format==0x20000 && u32(header+28)==2 && (flags&0x15800)==0x800;
     const bool dxn=format==0x20000 && u32(header+28)==2 && (flags&0x15000)==0x11000;
     const bool rgb=(format==0x40 || format==0x800) && u32(header+28)==4 && (flags&0x15800)==0x800;
-    if (!alpha && !luminance && !dxn && !rgb) {
+    if (!alpha && !luminance && !luminanceAlpha && !dxn && !rgb) {
         if(uint64_t(u32(header+8))+16!=pixels)return "upload pixels do not identify owned BC stream";
         return decodeColorImage(base,address,result);
     }
     if (u32(header)!=0x82097610 || !width || !height || width>2048 || height>2048) return "invalid upload image layout";
     const uint32_t allocation=u32(header+8),storage=u32(header+12);
     const uint32_t pitch=u32(header+24);
-    if (!dxn && (pitch<uint64_t(width)*(rgb?4:1) || pitch>8192)) return "invalid upload pitch";
+    if (!dxn && (pitch<uint64_t(width)*(rgb?4:luminanceAlpha?2:1) || pitch>8192)) return "invalid upload pitch";
     const size_t bytes=dxn?size_t((width+3)/4)*((height+3)/4)*16:size_t(pitch)*height;
     if (pixels<allocation || uint64_t(pixels)+bytes>uint64_t(allocation)+storage || uint64_t(pixels)+bytes>0x100000000ull)
         return "upload pixels escape owned CImage allocation";
     std::vector<uint8_t> input(bytes);
     if (!copyRenderMemory(base,pixels,input.data(),bytes)) return "unreadable upload pixels";
-    ColorImage image;image.width=width;image.height=height;image.sourceCodec=alpha?0x40000:dxn?49:rgb?format:2;image.pixels.resize(size_t(width)*height*4);
+    ColorImage image;image.width=width;image.height=height;image.sourceCodec=alpha?0x40000:dxn?49:luminanceAlpha?10:rgb?format:2;image.pixels.resize(size_t(width)*height*4);
     if (rgb) {
         // 8226977C/B8 map CImage0x40/0x800 to XDK X8R8G8B8/A8R8G8B8.
         // This observer runs before the temporary 82257E8C word byte-swap;
@@ -709,6 +934,16 @@ const char* decodeUploadImage(uint8_t* base,uint32_t address,uint32_t pixels,Col
         for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x) {
             const size_t i=size_t(y)*width+x;image.pixels[i*4]=image.pixels[i*4+1]=image.pixels[i*4+2]=255;
             image.pixels[i*4+3]=input[size_t(y)*pitch+x];
+        }
+    } else if (luminanceAlpha) {
+        // Original82269810 maps linear CImage0x20000 to A8L8 (fetch10),
+        // distinct from compressed DXN's use of the same CImage format.
+        // Before the original upload's byte swap BE A8L8 stores A,L (V,U).
+        // Preserve its logical sampler view L,L,L,A for the YUV program.
+        for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x) {
+            const auto* in=input.data()+size_t(y)*pitch+x*2;
+            auto* out=image.pixels.data()+(size_t(y)*width+x)*4;
+            out[0]=out[1]=out[2]=in[1];out[3]=in[0];
         }
     } else if (luminance) {
         // 82269700 maps CImage format0x2000 to XDK L8=0x28000102.
@@ -826,6 +1061,7 @@ static bool submitTriangles(uint8_t* base, uint32_t indices, uint32_t triangles)
     mesh.colorTexture = colorTexture;
     mesh.textureId = u16(attributes + 8);
     mesh.opaque = opaqueMaterial;
+    mesh.subtitle = currentSubtitleRenderContext();
     std::unique_lock lock(queueMutex);
     const size_t videoBytes = video ? video->luma.size() + video->chroma.size() : 0;
     auto newColorBytes = colorTexture && std::none_of(pending.begin(), pending.end(),
@@ -850,12 +1086,13 @@ static bool submitTriangles(uint8_t* base, uint32_t indices, uint32_t triangles)
 void previewObserveTriangles(uint8_t* base, uint32_t indices, uint32_t triangles) {
     submitTriangles(base, indices, triangles);
 }
-void previewObserveWorld(uint8_t* base,const StoredDraw& geometry) {
+template<class Geometry>
+static void previewObserveWorldInto(uint8_t* base,Geometry&& geometry) {
     EngineCpuScope profile(EnginePhase::snapshot);
     if (!active) return;
     worldActive=true;
     try {
-        auto draw=captureWorldDraw(base,geometry);
+        auto draw=captureWorldDraw(base,std::forward<Geometry>(geometry));
         if(!draw)return;
         std::unique_lock lock(queueMutex);
         ++pendingCounts.worldDraws;
@@ -863,10 +1100,10 @@ void previewObserveWorld(uint8_t* base,const StoredDraw& geometry) {
         // once, not once per depth/light/fog/material pass. UI vertices are
         // copied per mesh and use a separate budget.
         size_t additionalVertices=0,additionalBytes=0;
-        // The caller and captured draw already own these resources through
+        // The captured draw owns these resources through
         // publication. Accounting needs identities, not extra shared_ptr copies
         // that contend with resource releases on the render thread.
-        const std::array resources{geometry.vertices.get(),geometry.indices.get()};
+        const std::array resources{draw->geometry.vertices.get(),draw->geometry.indices.get()};
         auto measureGeometry=[&] {
             additionalVertices=additionalBytes=0;
             for(size_t i=0;i<resources.size();++i) {
@@ -923,22 +1160,44 @@ void previewObserveWorld(uint8_t* base,const StoredDraw& geometry) {
                 if(draw->material==WorldMaterial::ndsp || draw->material==WorldMaterial::fixed ||
                    draw->fragmentName.starts_with("XRShader_") || draw->fragmentName=="XRUtil_RenderSurface" ||
                    draw->fragmentName=="VBOp_GenEnv2" || draw->fragmentName=="VBOp_Fresnel" ||
+                   draw->fragmentName=="CMWnd_ModTexture_PaintVideo_YUV2RGB" ||
+                   draw->fragmentName=="GUIRGB2Grey" ||
+                   // Water normals and fog maps are authored CPU images.
+                   // Planar reflection0 and scene refraction4 are GPU inputs;
+                   // CubeWater's reflection0 is its authored environment cube.
+                   ((draw->fragmentName=="VBOp_FP20_Water" || draw->fragmentName=="VBOp_FP20_Water2" ||
+                     draw->fragmentName=="VBOp_FP20_CubeWater" || draw->fragmentName=="VBOp_FP20_CubeWater2") &&
+                    (s==1 || s==2 || s==6 || s==7 || (s==0 &&
+                     (draw->fragmentName=="VBOp_FP20_CubeWater" || draw->fragmentName=="VBOp_FP20_CubeWater2")))) ||
+                   // Effect shaders mix authored diffuse/distortion/masks
+                   // with framebuffer/depth resolves. Recover only the former.
+                   (draw->fragmentName=="WModel_FXRenderSurface" && s==1) ||
+                   ((draw->fragmentName=="WModel_FXHeatHazeMask" || draw->fragmentName=="WModel_FXBlackHole") &&
+                    (s==1 || s==2)) ||
+                   // Darkness voice masks/noise are authored CPU images.
+                   // Its scene input at slot0 remains a GPU resolve.
+                   (draw->fragmentName=="XREngine_RadialBlurInvert" && s>=1 && s<=3) ||
                    // CCFuser texture1 is its original 324x18 RGB lookup map.
                    // Reload the source pixels if its CPU cache entry expired.
                    (draw->fragmentName=="XREngine_CCFuser" && s==1) ||
                    // DV5's pulse and perturbation tables are CPU noise images.
                    // Scene/depth/atlas slots0/1/5 remain GPU resolve inputs.
-                   (draw->fragmentName=="WClientMod_DV5_0" && (s==2 || s==4))) {
+                   (draw->fragmentName=="WClientMod_DV5_0" && (s==2 || s==4)) ||
+                   // Other World's grain uses authored noise at slot1; its
+                   // scene0/depth2 and final OW1_2 inputs stay GPU resolves.
+                   (draw->fragmentName=="WClientMod_OW1_1" && s==1)) {
                     auto decoded=std::make_shared<ColorImage>();
                     if(!decodeWorldTextureImage(base,draw->textureObjects[s].object,*decoded,draw->textureObjects[s].firstMip)) {
+                        // Original82256008 fills video storage directly with
+                        // decoder V,U bytes, without the initial upload's
+                        // temporary pair swap. Fetch10 endian/selector decoding
+                        // already exposes the shader's logical U,U,U,V view.
                         if(auto old=colorTextures.find(draw->textureIds[s]);old!=colorTextures.end()) {
                             colorBytes-=old->second.image->bytes();colorTextures.erase(old);
                         }
-                        while(colorBytes+decoded->bytes()>colorBudget && !colorTextures.empty()) {
-                            auto oldest=std::min_element(colorTextures.begin(),colorTextures.end(),[](const auto& a,const auto& b){return a.second.used<b.second.used;});
-                            colorBytes-=oldest->second.image->bytes();colorTextures.erase(oldest);
+                        if (makeColorCacheRoom(decoded->bytes())) {
+                            colorBytes+=decoded->bytes();colorTextures[draw->textureIds[s]]={decoded,++colorUse,draw->textureObjects[s].object};
                         }
-                        colorBytes+=decoded->bytes();colorTextures[draw->textureIds[s]]={decoded,++colorUse,draw->textureObjects[s].object};
                         draw->textures[s]=decoded;++colorImages;
                         if (TextureUploadTraceEnabled())
                             std::fprintf(stderr,"[EngineStreamedTexture] owned id=%u size=%ux%u format=%u\n",draw->textureIds[s],decoded->width,decoded->height,draw->textureObjects[s].format);
@@ -977,9 +1236,16 @@ void previewObserveWorld(uint8_t* base,const StoredDraw& geometry) {
         pendingWorldVertices+=additionalVertices;
         for(size_t i=0;i<imageCount;++i)pendingWorldImages.insert(images[i]);
         pendingWorldImageBytes+=additionalImageBytes;
-        SimpleMesh command;command.world=std::move(draw);pending.push_back(std::move(command));
+        SimpleMesh command;command.promptContext=draw->promptContext;
+        command.world=std::move(draw);pending.push_back(std::move(command));
         ++worldQueued;
     } catch (...) {}
+}
+void previewObserveWorld(uint8_t* base,const StoredDraw& geometry) {
+    previewObserveWorldInto(base,geometry);
+}
+void previewObserveWorld(uint8_t* base,StoredDraw&& geometry) {
+    previewObserveWorldInto(base,std::move(geometry));
 }
 void previewObserveImmediateWorld(uint8_t* base,uint32_t device,uint32_t indices,uint32_t count) {
     if (!active || !worldActive || !device || uint64_t(device)+12456>0x100000000ull) return;
@@ -1027,7 +1293,7 @@ void previewObserveImmediateWorld(uint8_t* base,uint32_t device,uint32_t indices
                 frames.load(std::memory_order_relaxed),GetTickCount64(),smokeTex0,
                 device,indices,count,descriptor,id,
                 geometry.vertices?geometry.vertices->vertexCount:0u,geometry.indexCount,beFlags);
-        previewObserveWorld(base,geometry);
+        previewObserveWorld(base,std::move(geometry));
     } catch (...) { fail(6); }
 }
 void previewObserveClear(uint8_t* base,uint32_t device,uint32_t flags,uint32_t color,float depth,uint32_t stencil,const std::array<int32_t,4>& rectangle) {
@@ -1073,12 +1339,34 @@ void previewObservePresent(uint8_t* base,uint32_t frontbuffer) {
         SimpleMesh command;command.worldPresent=std::move(texture);pending.push_back(std::move(command));
     }catch(...){}
 }
+void previewObserveDisplayGamma(uint8_t* base,uint32_t ramp,bool piecewise) {
+    if(!active)return;
+    try {
+        std::array<uint8_t,1536> bytes{};
+        if(!copyRenderMemory(base,ramp,bytes.data(),bytes.size()))return;
+        DisplayGamma gamma;gamma.piecewise=piecewise;
+        for(unsigned channel=0;channel<3;++channel) {
+            for(unsigned entry=0;entry<(piecewise?128u:256u);++entry) {
+                const auto* value=bytes.data()+channel*512+entry*(piecewise?4:2);
+                gamma.entries[entry*3+channel]={uint32_t(u16(value)),piecewise?uint32_t(u16(value+2)):0u};
+                if(!piecewise)gamma.entries[entry*3+channel][0]&=0xFFC0;
+            }
+        }
+        std::unique_lock lock(queueMutex);
+        static std::shared_ptr<const DisplayGamma> previous;
+        if(previous && *previous==gamma)return;
+        if(liveStreaming())reservePreviewCommand(lock);
+        auto table=std::make_shared<DisplayGamma>(std::move(gamma));
+        SimpleMesh command;command.displayGamma=table;pending.push_back(std::move(command));
+        previous=std::move(table);
+    }catch(...){}
+}
 void setPreviewFrameBackpressure(bool enabled,bool streaming) {
     {std::lock_guard lock(queueMutex);frameBackpressure=enabled;streamLargeFrames=enabled && streaming;}
     if(!enabled)frameConsumed.notify_all();
 }
 void previewBeginHistogram(unsigned bin) {
-    if(!active || !worldActive || bin>=histogramResults.size() || activeHistogram)return;
+    if(!active || !worldActive || bin>=histogramResults.size() || activeHistogram || activeFlare)return;
     std::unique_lock lock(queueMutex);
     if(liveStreaming())reservePreviewCommand(lock);
     auto& result=histogramResults[bin];if(!result)result=std::make_shared<WorldQueryResult>();
@@ -1099,9 +1387,40 @@ bool previewReadHistogram(unsigned bin,uint64_t& samples) {
     if(value==UINT64_MAX)return false;
     samples=value;return true;
 }
+void previewBeginFlare(unsigned id) {
+    if(!active || !worldActive || id>flareQueryMaximumId || activeHistogram || activeFlare)return;
+    std::unique_lock lock(queueMutex);
+    if(liveStreaming())reservePreviewCommand(lock);
+    // The u16 key bounds this lazy map to at most 65536 result owners. Keep
+    // the previous completion while a newer GPU query is still pending.
+    auto& result=flareResults[id];if(!result)result=std::make_shared<WorldQueryResult>();
+    activeFlare=std::make_shared<WorldQuery>();activeFlare->result=result;
+    SimpleMesh command;command.worldQuery=activeFlare;command.worldQueryBegin=true;
+    pending.push_back(std::move(command));
+}
+void previewEndFlare() {
+    if(!activeFlare)return;
+    std::unique_lock lock(queueMutex);
+    if(liveStreaming())reservePreviewCommand(lock);
+    SimpleMesh command;command.worldQuery=std::move(activeFlare);pending.push_back(std::move(command));
+}
+bool previewReadFlare(unsigned id,uint64_t& samples) {
+    std::lock_guard lock(queueMutex);
+    const auto found=flareResults.find(id);
+    if(found==flareResults.end())return false;
+    const auto value=found->second->samples.load(std::memory_order_acquire);
+    if(value==UINT64_MAX)return false;
+    samples=value;return true;
+}
 namespace {
 void publishPreviewPart(std::unique_lock<std::mutex>& lock,bool last) {
-    frameConsumed.wait(lock,[]{return !frameBackpressure || !frameReady;});
+    {
+        const auto* ctx=currentContext;
+        StallProfiler::Scope stallWait(StallProfiler::Section::Wait, "preview frame producer backpressure",
+            ctx ? ctx->lastFunction : 0, ctx ? uint32_t(ctx->lr) : 0,
+            reinterpret_cast<uint64_t>(&frameConsumed), "frameConsumed condition variable");
+        frameConsumed.wait(lock,[]{return !frameBackpressure || !frameReady;});
+    }
     pendingCounts.commands+=pending.size();++pendingCounts.parts;
     for(const auto& command:pending)if(command.world)++pendingCounts.passes[size_t(command.world->material)];
     if(!last)++streamedParts;
@@ -1135,16 +1454,31 @@ void publishPreviewPart(std::unique_lock<std::mutex>& lock,bool last) {
 }
 }
 void previewEndFrame() {
+    StallProfiler::Scope stallRender(StallProfiler::Section::Rendering, "previewEndFrame");
     EngineCpuScope profile(EnginePhase::handoff);
     recordEngineFrameProcessor();
     if (!active) return;
-    std::unique_lock lock(queueMutex);
+    std::unique_lock lock(queueMutex,std::defer_lock);
+    {
+        StallProfiler::Scope stallWait(StallProfiler::Section::Wait, "previewEndFrame queue mutex",
+            0,0,reinterpret_cast<uint64_t>(&queueMutex),"preview queue mutex");
+        lock.lock();
+    }
     publishPreviewPart(lock,true);
 }
 bool takePreviewFrame(std::vector<SimpleMesh>& frame,unsigned waitMilliseconds,PreviewFramePart* part) {
-    std::unique_lock lock(queueMutex);
-    if(waitMilliseconds && !frameReady)
+    StallProfiler::Scope stallRender(StallProfiler::Section::Rendering, "takePreviewFrame");
+    std::unique_lock lock(queueMutex,std::defer_lock);
+    {
+        StallProfiler::Scope stallWait(StallProfiler::Section::Wait, "takePreviewFrame queue mutex",
+            0,0,reinterpret_cast<uint64_t>(&queueMutex),"preview queue mutex");
+        lock.lock();
+    }
+    if(waitMilliseconds && !frameReady) {
+        StallProfiler::Scope stallWait(StallProfiler::Section::Wait, "preview frame consumer wait",
+            0,0,reinterpret_cast<uint64_t>(&frameAvailable),"frameAvailable condition variable");
         frameAvailable.wait_for(lock,std::chrono::milliseconds(waitMilliseconds),[]{return frameReady;});
+    }
     if (!frameReady) return false;
     if(part)*part=readyPart;
     auto completed=std::move(ready);ready.clear();frameReady=false;

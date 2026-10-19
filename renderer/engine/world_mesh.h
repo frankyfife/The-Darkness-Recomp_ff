@@ -79,6 +79,14 @@ struct WorldSurfaceTargets {
         return slot<targets.size()?surfaceBindings[slot].key(targets[slot],slot==4):0;
     }
 };
+// Completed Xenos user-plane state. Coefficients are already transformed by
+// original 82249250 into the guest vertex shader's homogeneous output space.
+struct WorldClipPlanes {
+    uint32_t control=0;
+    std::array<EngineVector,6> planes{};
+    uint32_t enabledMask() const noexcept {return (control&0x10000u)?0u:control&63u;}
+    bool cullOnly() const noexcept {return (control&0x20000u)!=0;}
+};
 struct WorldDraw : WorldSurfaceTargets {
     WorldGeometry geometry;
     WorldVertexOptions options;
@@ -89,12 +97,16 @@ struct WorldDraw : WorldSurfaceTargets {
     std::string fragmentName;
     uint32_t fragmentFlags=0;
     EngineVector depthRange{0,1,0,0};
-    std::array<EngineVector,16> fragmentConstants{};
+    WorldClipPlanes clipPlanes;
+    // Lit projected decals use env[0..33]; retain the complete supported bank.
+    std::array<EngineVector,64> fragmentConstants{};
     std::array<uint16_t,16> textureIds{};
     uint16_t textureMask=0xFFFF; // Conservative original-source usage; manual draws retain all slots.
     std::array<WorldTexture,16> textureObjects{};
     std::array<WorldSampler,16> samplers{};
     std::array<std::shared_ptr<const ColorImage>,16> textures{};
+    PromptRenderContext promptContext = PromptRenderContext::Menu;
+    bool subtitle = false;
 };
 uint16_t worldFragmentTextureMask(std::string_view name,uint32_t flags) noexcept;
 struct WorldResolve : WorldSurfaceTargets {
@@ -107,6 +119,7 @@ struct WorldResolve : WorldSurfaceTargets {
     int exponent=0;
 };
 bool snapshotWorldTexture(uint8_t*,uint32_t object,WorldTexture&) noexcept;
+bool snapshotWorldClipPlanes(uint8_t*,uint32_t device,WorldClipPlanes&) noexcept;
 bool snapshotWorldResolve(uint8_t*,uint32_t device,uint32_t flags,uint32_t rectangle,uint32_t destination,
                           uint32_t offset,uint32_t color,float depth,uint32_t stencil,uint32_t face,uint32_t mip,WorldResolve&) noexcept;
 struct WorldClear : WorldSurfaceTargets {
@@ -160,6 +173,10 @@ bool snapshotImmediateWorldGeometry(uint8_t* base,uint32_t descriptor,uint32_t i
                                     std::shared_ptr<const StoredGeometry> stored,StoredDraw&,
                                     ImmediateCaptureReason* reason=nullptr) noexcept;
 bool prepareWorldVertexProgram(const EngineVertexBindingSnapshot&, WorldVertexOptions&, WorldVertexConstants&) noexcept;
+// Shader identity only. Live preparation separately validates stages, inputs
+// and constant ranges before publishing a draw; initialization uses authored
+// descriptor keys without requiring a live engine constant bank.
+WorldVertexOptions worldVertexOptions(const EngineVertexDescriptor&) noexcept;
 // Failure-only geometry proof for a nonfinite palette tail. When the strict
 // full-palette copy above fails, this validates only the palette rows the
 // actual draw subset reads: address=floor(index*c8.w) for every active
@@ -186,6 +203,8 @@ bool prepareWorldVertexProgramWithGeometry(const EngineVertexBindingSnapshot&, c
 bool snapshotWorldDraw(uint8_t* base, const StoredDraw&, WorldDraw&) noexcept;
 // Populate the final owned allocation directly and publish only after success.
 std::shared_ptr<WorldDraw> captureWorldDraw(uint8_t* base,const StoredDraw&) noexcept;
+// Consume only the geometry references, and only after successful capture.
+std::shared_ptr<WorldDraw> captureWorldDraw(uint8_t* base,StoredDraw&&) noexcept;
 bool snapshotWorldClear(uint8_t* base,uint32_t device,uint32_t flags,uint32_t color,
                         float depth,uint32_t stencil,WorldClear&) noexcept;
 void printWorldCounters();

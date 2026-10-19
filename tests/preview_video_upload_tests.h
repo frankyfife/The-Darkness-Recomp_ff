@@ -164,5 +164,5 @@ static void testPreviewVideoUploads(EnginePreviewD3D11& renderer, CDisplayContex
     pixel = renderVideo(red);
     nearByte(pixel, 0, 254);
     nearByte(pixel, 3, 0);
-    std::puts("PreviewVideoUploads passed: same-size pixel update, texture/view reuse, resize recreate, snapshot restore, disjoint draw order, patterned pitch/VU oracle, malformed reject.");
+    std::puts("PreviewVideoUploads passed: same-size pixel update, texture/view reuse, resize recreate, snapshot restore, disjoint draw order, patterned pitch/UV oracle, malformed reject.");
 }

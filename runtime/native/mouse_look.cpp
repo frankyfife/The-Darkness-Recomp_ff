@@ -1,3 +1,4 @@
+#include "stall_profiler.h"
 #include "mouse_look.h"
 #include "runtime.h"
 #include "ppc_recomp_shared.h"
@@ -38,6 +39,20 @@ struct ScopedMathMode {
     ScopedMathMode() { _mm_setcsr(saved & ~(_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK)); }
     ~ScopedMathMode() { _mm_setcsr(saved); }
 };
+uint32_t playerDialogueState(PPCContext& ctx, uint8_t* base, uint32_t client) {
+    const auto playerId = PPC_LOAD_U32(client + 536); // Original 823ED948; +540 is the camera actor.
+    if (!playerId || playerId > 0xffff || (PPC_LOAD_U32(client + 516) & 0x20)) return 0;
+    // Use the client's original actor lookup, including its predicted-object
+    // chain. Server state and the camera actor can describe a different NPC.
+    auto lookup = ctx;
+    lookup.r3.u64 = client; lookup.r4.u64 = playerId;
+    sub_8249D618(lookup, base); // Both supported client tables' virtual +284.
+    const auto actor = lookup.r3.u32;
+    if (!actor || uint64_t(actor) + 400 > PPC_MEMORY_SIZE) return 0;
+    const auto state = PPC_LOAD_U32(actor + 396);
+    if (!state || uint64_t(state) + 4298 > PPC_MEMORY_SIZE || PPC_LOAD_U32(state + 16) != actor) return 0;
+    return state;
+}
 }
 
 // The original relative-look function has already selected its camera route and
@@ -60,6 +75,7 @@ void ApplyNativeMouseLookMidAsmHook(PPCRegister& client, PPCRegister& stack,
 extern "C" PPC_FUNC(__imp__sub_823FC650);
 extern "C" PPC_FUNC(__imp__sub_823FCF68);
 PPC_FUNC(sub_823FC650) {
+    DarkRecomp::Native::StallProfiler::Scope stallProfile(DarkRecomp::Native::StallProfiler::Section::Guest, __func__, 0x823FC650u, uint32_t(ctx.lr));
     const uint32_t client = ctx.r3.u32, caller = uint32_t(ctx.lr);
     __imp__sub_823FC650(ctx, base);
     // This periodic call is independent of changed XInput packets and of the
@@ -70,6 +86,22 @@ PPC_FUNC(sub_823FC650) {
         uint64_t(client) + 8844 > PPC_MEMORY_SIZE) return;
     const uint32_t vtable = PPC_LOAD_U32(client);
     if (vtable != 0x820807E0 && vtable != 0x82081BF0) return;
+    // Original player OnMessage 821570E8 checks state+4296 (choice count) at
+    // 8215B34C; +4297 is the selected choice. These HUD choices do not open
+    // client+7360. Give their vertical input priority over wheel weapon binds.
+    const auto dialogue = playerDialogueState(ctx, base, client);
+    const auto choiceCount = dialogue ? PPC_LOAD_U8(dialogue + 4296) : 0;
+    DarkRecomp::Native::nativeInput().setGuestMenuActive(PPC_LOAD_U32(client + 7360) != 0, choiceCount != 0);
+    if (probeEnabled()) {
+        const auto selected = dialogue ? PPC_LOAD_U8(dialogue + 4297) : 0;
+        const auto context = (uint64_t(dialogue) << 16) | (uint64_t(choiceCount) << 8) | selected;
+        static thread_local uint64_t previous = ~uint64_t(0);
+        if (context != previous) {
+            previous = context;
+            std::fprintf(stderr, "[MouseDialogue] client=%08X state=%08X choices=%u selected=%u gui=%08X\n",
+                client, dialogue, unsigned(choiceCount), unsigned(selected), PPC_LOAD_U32(client + 7360));
+        }
+    }
     const auto delta = DarkRecomp::Native::nativeInput().consumeMouseLook();
     if (stream.base != base || stream.client != client || stream.epoch != delta.epoch) {
         stream.quantizer.reset();
@@ -85,6 +117,8 @@ PPC_FUNC(sub_823FC650) {
         stream.quantizer.reset();
         return;
     }
+    if (DarkRecomp::Native::nativeInput().completeLoadingMouseCapture() && probeEnabled())
+        std::fprintf(stderr, "[MouseCaptureClientReady] tick=%llu client=%08X\n", GetTickCount64(), client);
     if (!delta.x && !delta.y) return;
     const ScopedMathMode mathMode;
     // The sign of the original vertical sensitivity carries the invert option;

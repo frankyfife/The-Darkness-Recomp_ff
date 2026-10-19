@@ -70,6 +70,8 @@ xenia/
 
 # --- Generated native menu assets staged beside the exe ---
 CubeWnd.pc.xcr
+CubeWnd.pc.ru.xcr
+CubeWnd.pc.xcr.source.sha256
 GameContext_Create.pc.xdf
 
 # --- Local research / scratch dirs ---
@@ -78,6 +80,9 @@ task/
 queue-pacing-*/
 find-fix-*/
 find-fix-path-buffers/
+framerate-stability-*/
+LaunchBeforeColorGradingFix.cmd
+LaunchXboxReference.cmd
 
 # --- Regenerable dev artifacts (rebuild with tools/build_atlas.py) ---
 tools/code_atlas.json

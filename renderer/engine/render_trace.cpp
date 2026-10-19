@@ -1,9 +1,11 @@
 #include "render_trace.h"
+#include "runtime/native/stall_profiler.h"
 #include "engine_performance.h"
 #include "prompt_origin.h"
 #include "simple_mesh.h"
 #include "texture_upload.h"
 #include "stored_geometry.h"
+#include "decoded_geometry.h"
 #include "engine_texture_constants.h"
 #include "engine_vertex_descriptor.h"
 #include "engine_vertex_program.h"
@@ -17,12 +19,15 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <xmmintrin.h>
 
@@ -47,7 +52,10 @@ constexpr uint64_t maxBytes = 16 * 1024 * 1024;
 thread_local DarkRecomp::Native::StoredUpload* preparingGeometry = nullptr;
 using StoredRequest = DarkRecomp::Native::StoredDrawRequest;
 thread_local const StoredRequest* drawingGeometry = nullptr;
+thread_local DarkRecomp::Native::DecodedDrawRequest* drawingDecodedGeometry = nullptr;
 thread_local uint8_t* clearingBase = nullptr;
+struct PromptManagerExecution { uint8_t* base; uint32_t manager; uint64_t generation; };
+thread_local PromptManagerExecution* executingPromptManager = nullptr;
 
 template<class T> struct ScopedPointer {
     T*& slot; T* previous;
@@ -262,7 +270,8 @@ void capture(uint32_t function, uint64_t call, PPCContext& ctx, uint8_t* base) n
         line << "{\"sequence\":" << sequence << ",\"function\":" << function << ",\"call\":" << call
              << ",\"ms\":" << (GetTickCount64() - epoch) << ",\"thread\":" << GetCurrentThreadId()
              << ",\"lr\":" << uint32_t(ctx.lr) << ",\"r3\":" << ctx.r3.u32 << ",\"r4\":" << ctx.r4.u32
-             << ",\"r5\":" << ctx.r5.u32 << ",\"r6\":" << ctx.r6.u32;
+             << ",\"r5\":" << ctx.r5.u32 << ",\"r6\":" << ctx.r6.u32
+             << ",\"promptContext\":" << unsigned(DarkRecomp::Native::currentPromptRenderContext());
         chunk(line, base, "context", renderContext, 18000);
         const uint32_t program = word(base, renderContext + 16896);
         chunk(line, base, "program", program, 20);
@@ -603,7 +612,8 @@ void captureStoredDraw(uint64_t call, uint8_t* base, const StoredRequest& reques
              << ",\"ms\":" << (GetTickCount64() - epoch) << ",\"lr\":" << request.caller
              << ",\"stored_vb_id\":" << request.vertices << ",\"stored_ib_id\":" << request.indices
              << ",\"first_index\":" << request.firstIndex << ",\"triangles\":" << request.triangles
-             << ",\"owned_geometry_matched\":" << (owned ? "true" : "false");
+             << ",\"owned_geometry_matched\":" << (owned ? "true" : "false")
+             << ",\"promptContext\":" << unsigned(DarkRecomp::Native::currentPromptRenderContext());
         chunk(line, base, "context", renderContext, 18000, true);
         const uint32_t program = word(base, renderContext + 16896);
         chunk(line, base, "program", program, 20, true);
@@ -734,7 +744,8 @@ void DarkRecomp::Native::traceOwnedWorldDraw(const WorldDraw& draw,unsigned insp
         };
         out<<"{\"version\":1,\"scope\":"<<std::quoted(effect?"effect-series":"host-frame")<<",\"inspection\":"<<inspection<<",\"draw\":"<<ordinal
            <<",\"material\":"<<unsigned(draw.material)<<",\"program\":"<<std::quoted(draw.fragmentName)
-           <<",\"fragmentFlags\":"<<draw.fragmentFlags<<",\"attributesBE\":";
+           <<",\"fragmentFlags\":"<<draw.fragmentFlags<<",\"promptContext\":"<<unsigned(draw.promptContext)
+           <<",\"attributesBE\":";
         hex(draw.attributes.data(),draw.attributes.size());
         out<<",\"viewport\":";numbers(draw.viewport);out<<",\"targets\":";numbers(draw.targets);
         out<<",\"surfaceBindings\":[";
@@ -746,6 +757,8 @@ void DarkRecomp::Native::traceOwnedWorldDraw(const WorldDraw& draw,unsigned insp
         }
         out<<']';
         out<<",\"depthRangeLEFloat\":";hex(draw.depthRange.data(),sizeof(draw.depthRange));
+        out<<",\"clipControl\":"<<draw.clipPlanes.control<<",\"clipMask\":"<<draw.clipPlanes.enabledMask();
+        out<<",\"clipPlanesLEFloat\":";hex(draw.clipPlanes.planes.data(),sizeof(draw.clipPlanes.planes));
         out<<",\"constantsLEFloat\":";hex(draw.constants.vectors.data(),sizeof(draw.constants.vectors));
         out<<",\"referencesLE32\":";hex(draw.constants.references.data(),sizeof(draw.constants.references));
         out<<",\"fragmentConstantsLEFloat\":";hex(draw.fragmentConstants.data(),sizeof(draw.fragmentConstants));
@@ -1103,14 +1116,170 @@ void DarkRecomp::Native::traceEngineVertexProgram(uint8_t* base, const EngineVer
 #define TRACE_ORIGINAL(address) \
     extern "C" PPC_FUNC(__imp__sub_##address); \
     PPC_FUNC(sub_##address) { \
+        DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_" #address, 0x##address, uint32_t(ctx.lr)); \
         static std::atomic<uint64_t> calls{0}; \
         if (enabled.load(std::memory_order_relaxed)) \
             capture(0x##address, ++calls, ctx, base); \
         __imp__sub_##address(ctx, base); \
     }
 
+// Original 82168B98 is the actor gameplay HUD owner: health/ammo, ordinary
+// use prompts and darkling portal choices (8216A958). Frontend window/menu
+// rendering occurs outside this call. Restore the producer scope on every
+// exit; render consumers use the context captured with their owned draws.
+extern "C" PPC_FUNC(__imp__sub_82168B98);
+PPC_FUNC(sub_82168B98) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82168B98", 0x82168B98, uint32_t(ctx.lr));
+    const DarkRecomp::Native::ScopedPromptRenderContext scope(DarkRecomp::Native::PromptRenderContext::Gameplay);
+    __imp__sub_82168B98(ctx, base);
+}
+
+namespace {
+// Observe the exact queue record already selected by the original guest,
+// without a kernel query, permanent permission cache, or guest write. Keep
+// memcpy out of the SEH function so optimized loads remain under its handler.
+__declspec(noinline) void copyJobBytes(void* output, const void* input, size_t size) {
+    std::memcpy(output, input, size);
+}
+bool jobBytes(uint8_t* base, uint64_t address, void* output, size_t size) {
+    if (!base || !address || address >= 0x100000000ull || size > 0x100000000ull - address) return false;
+    __try {
+        copyJobBytes(output, base + address, size);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+struct ResourceJobSnapshot {
+    uint32_t type = 0, busyByte = 0;
+    uint16_t id = 0, dependency = 0xffff;
+    bool available = false, haveBusyByte = false;
+};
+uint32_t jobWord(const uint8_t* bytes) {
+    uint32_t value;
+    std::memcpy(&value, bytes, sizeof(value));
+    return _byteswap_ulong(value);
+}
+uint16_t jobHalf(const uint8_t* bytes) {
+    return uint16_t(uint16_t(bytes[0]) << 8 | bytes[1]);
+}
+ResourceJobSnapshot resourceJobSnapshot(uint8_t* base, uint32_t job, uint32_t queue = 0) {
+    ResourceJobSnapshot result;
+    uint8_t record[16];
+    if (!jobBytes(base, job, record, sizeof(record))) return result;
+    result.type = jobWord(record);
+    result.dependency = jobHalf(record + 12);
+    result.id = jobHalf(record + 14);
+    result.available = true;
+    uint8_t busyMap[4];
+    if (queue && result.dependency != 0xffff && jobBytes(base, uint64_t(queue) + 12, busyMap, sizeof(busyMap))) {
+        const uint32_t map = jobWord(busyMap);
+        const uint64_t byte = uint64_t(map) + result.dependency;
+        if (map && byte < 0x100000000ull) {
+            result.busyByte = uint32_t(byte);
+            result.haveBusyByte = true;
+        }
+    }
+    return result;
+}
+const char* resourceJobFunction(uint32_t type, bool waiting = false) {
+    switch (type) {
+    case 0x0F3B857A: return waiting ? "resource job dependency owner sub_8222ED88 type=0x0F3B857A" : "resource job execute sub_8222ED88 type=0x0F3B857A";
+    case 0x1BB10D66: return waiting ? "resource job dependency owner sub_8222CFA8 type=0x1BB10D66" : "resource job execute sub_8222CFA8 type=0x1BB10D66";
+    case 0x6C9F0B2B: return waiting ? "resource job dependency owner sub_8222DB00 type=0x6C9F0B2B" : "resource job execute sub_8222DB00 type=0x6C9F0B2B";
+    default: return waiting ? "resource job dependency owner (unknown type)" : "resource job execute sub_82232258 (unknown type)";
+    }
+}
+}
+
+// 8259DE30 begins the original manager frame; 8259CA10 initializes a new
+// 48-byte VB. Neither reused manager nor reused VB addresses inherit context.
+extern "C" PPC_FUNC(__imp__sub_8259DE30);
+PPC_FUNC(sub_8259DE30) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8259DE30", 0x8259DE30, uint32_t(ctx.lr));
+    DarkRecomp::Native::resetQueuedPromptContexts(base, ctx.r3.u32);
+    __imp__sub_8259DE30(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8259C490);
+PPC_FUNC(sub_8259C490) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8259C490", 0x8259C490, uint32_t(ctx.lr));
+    DarkRecomp::Native::retireQueuedPromptContexts(base, ctx.r3.u32);
+    __imp__sub_8259C490(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8259CA10);
+PPC_FUNC(sub_8259CA10) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8259CA10", 0x8259CA10, uint32_t(ctx.lr));
+    const auto manager = ctx.r3.u32;
+    const auto generation = DarkRecomp::Native::queuedPromptGeneration(base, manager);
+    __imp__sub_8259CA10(ctx, base);
+    DarkRecomp::Native::forgetQueuedPromptContext(base, manager, ctx.r3.u32, generation);
+}
+// Observe every original enqueue, including Menu, so a recycled/re-enqueued
+// VB cannot retain a prior HUD owner. The original list may execute repeatedly
+// in one frame, so contexts expire at its frame/allocation boundary.
+extern "C" PPC_FUNC(__imp__sub_8259D098);
+PPC_FUNC(sub_8259D098) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8259D098", 0x8259D098, uint32_t(ctx.lr));
+    const auto manager = ctx.r3.u32, draw = ctx.r4.u32;
+    const auto context = DarkRecomp::Native::currentPromptRenderContext();
+    const auto generation = DarkRecomp::Native::queuedPromptGeneration(base, manager);
+    // Publish metadata before the original publishes its list node.
+    DarkRecomp::Native::recordQueuedPromptContext(base, manager, draw, context, generation);
+    DarkRecomp::Native::recordQueuedSubtitleContext(base, manager, draw,
+        DarkRecomp::Native::currentSubtitleRenderContext(), generation);
+    __imp__sub_8259D098(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8259D3B8);
+PPC_FUNC(sub_8259D3B8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8259D3B8", 0x8259D3B8, uint32_t(ctx.lr));
+    const auto manager = ctx.r3.u32, pointers = ctx.r4.u32, count = ctx.r5.u32;
+    const auto context = DarkRecomp::Native::currentPromptRenderContext();
+    const auto generation = DarkRecomp::Native::queuedPromptGeneration(base, manager);
+    std::vector<uint8_t> draws;
+    auto drawAt = [&](uint32_t i) {
+        const auto* bytes = draws.data() + size_t(i) * 4;
+        return uint32_t(bytes[0]) << 24 | uint32_t(bytes[1]) << 16 | uint32_t(bytes[2]) << 8 | bytes[3];
+    };
+    bool captured = count <= 4096;
+    try {
+        if (captured) {
+            draws.resize(size_t(count) * 4);
+            captured = !count || copyGuest(base, pointers, draws.data(), draws.size());
+        }
+    } catch (...) { captured = false; }
+    if (!captured) DarkRecomp::Native::resetQueuedPromptContexts(base, manager);
+    else for (uint32_t i = 0; i < count; ++i) {
+        DarkRecomp::Native::recordQueuedPromptContext(base, manager, drawAt(i), context, generation);
+        DarkRecomp::Native::recordQueuedSubtitleContext(base, manager, drawAt(i),
+            DarkRecomp::Native::currentSubtitleRenderContext(), generation);
+    }
+    __imp__sub_8259D3B8(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_825A24D0);
+PPC_FUNC(sub_825A24D0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_825A24D0", 0x825A24D0, uint32_t(ctx.lr));
+    PromptManagerExecution execution{base, ctx.r3.u32, DarkRecomp::Native::queuedPromptGeneration(base, ctx.r3.u32)};
+    ScopedPointer<PromptManagerExecution> scope(executingPromptManager, &execution);
+    __imp__sub_825A24D0(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_82299EA0);
+PPC_FUNC(sub_82299EA0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82299EA0", 0x82299EA0, uint32_t(ctx.lr));
+    const auto context = executingPromptManager && executingPromptManager->base == base &&
+        uint32_t(ctx.lr) == 0x825A2E18 ? DarkRecomp::Native::queuedPromptContext(base,
+        executingPromptManager->manager, ctx.r3.u32, executingPromptManager->generation) : DarkRecomp::Native::PromptRenderContext::Menu;
+    const DarkRecomp::Native::ScopedPromptRenderContext scope(context);
+    const bool subtitle = executingPromptManager && executingPromptManager->base == base &&
+        uint32_t(ctx.lr) == 0x825A2E18 && DarkRecomp::Native::queuedSubtitleContext(base,
+        executingPromptManager->manager, ctx.r3.u32, executingPromptManager->generation);
+    const DarkRecomp::Native::ScopedSubtitleRenderContext subtitleScope(subtitle);
+    __imp__sub_82299EA0(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_8225DBC8);
 PPC_FUNC(sub_8225DBC8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8225DBC8", 0x8225DBC8, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::immediate);
     static std::atomic<uint64_t> calls{0};
     if (enabled) capture(0x8225DBC8, ++calls, ctx, base);
@@ -1120,25 +1289,66 @@ PPC_FUNC(sub_8225DBC8) {
 TRACE_ORIGINAL(8225DD40)
 extern "C" PPC_FUNC(__imp__sub_828AC000);
 PPC_FUNC(sub_828AC000) {
+    using DarkRecomp::Native::StallProfiler::Scope;
+    using DarkRecomp::Native::StallProfiler::Section;
+    ResourceJobSnapshot job;
+    std::optional<Scope> owner, dependency;
+    if (DarkRecomp::Native::StallProfiler::enabled() && uint32_t(ctx.lr) == 0x8222CD30) {
+        // 8222CC48 selected this record under its original queue lock. The
+        // 828A7CF0 tailcall changes only r4, preserving the exact r30/r31.
+        job = resourceJobSnapshot(base, ctx.r30.u32, ctx.r31.u32);
+        if (job.available) {
+            owner.emplace(Section::Wait, resourceJobFunction(job.type, true), 0x828AC000,
+                uint32_t(ctx.lr), job.id, "guest resource job ID");
+            if (job.dependency != 0xffff)
+                dependency.emplace(Section::Wait, "resource job dependency wait", 0x828AC000,
+                    uint32_t(ctx.lr), job.dependency, "guest dependency job ID");
+        }
+    }
+    Scope stallCall(Section::Wait, job.haveBusyByte ? "resource job dependency sleep" : "sub_828AC000",
+        0x828AC000, uint32_t(ctx.lr), job.busyByte,
+        job.haveBusyByte ? "guest dependency busy byte" : nullptr);
     // Original SDK Sleep wrapper; keep the wait and full original ABI intact.
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::sleep,ctx.r13.u32==0x7FF00000);
     __imp__sub_828AC000(ctx,base);
 }
-TRACE_ORIGINAL(8225DE78)
+extern "C" PPC_FUNC(__imp__sub_8225DE78);
+PPC_FUNC(sub_8225DE78) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8225DE78", 0x8225DE78, uint32_t(ctx.lr));
+    static std::atomic<uint64_t> calls{0};
+    if(enabled)capture(0x8225DE78,++calls,ctx,base);
+    // Packet fans/strips are expanded by the original into transient triangle
+    // lists. Keep each chunk scoped to this call until its actual indexed draw.
+    DarkRecomp::Native::DecodedDrawRequest request;
+    ScopedPointer<DarkRecomp::Native::DecodedDrawRequest> scope(drawingDecodedGeometry,
+        DarkRecomp::Native::enginePreviewEnabled()?&request:nullptr);
+    __imp__sub_8225DE78(ctx,base);
+}
 extern "C" PPC_FUNC(__imp__sub_8225F320);
 PPC_FUNC(sub_8225F320) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8225F320", 0x8225F320, uint32_t(ctx.lr));
     // Only this caller submits the decoded output as triangle-list indices.
     // The original decoder still handles packet traversal, fans and strips;
     // no packet parsing or guest register changes are done by the preview.
     const bool observe = uint32_t(ctx.lr) == 0x8225E1A0 && DarkRecomp::Native::enginePreviewEnabled();
     const uint32_t indices = ctx.r4.u32, countAddress = ctx.r5.u32;
     const uint32_t capacity = observe ? word(base, countAddress) : 0;
+    // Original 8225DE78 stores the mapped index-buffer byte offset at +84,
+    // then passes half that value as DrawIndexed's first index at 8225E200.
+    uint32_t byteOffset=0;
+    const bool haveOffset=observe && drawingDecodedGeometry && ctx.r1.u32<=0xFFFFFFA8u &&
+        copyGuest(base,ctx.r1.u32+84,&byteOffset,sizeof(byteOffset));
     __imp__sub_8225F320(ctx, base);
-    if (observe)
-        DarkRecomp::Native::previewObserveDecodedTriangles(base, indices, capacity, word(base, countAddress));
+    if (observe) {
+        const auto produced=word(base,countAddress);
+        if(drawingDecodedGeometry)drawingDecodedGeometry->record(indices,haveOffset?capacity:0,
+            produced,_byteswap_ulong(byteOffset));
+        DarkRecomp::Native::previewObserveDecodedTriangles(base,indices,capacity,produced);
+    }
 }
 extern "C" PPC_FUNC(__imp__sub_8225E218);
 PPC_FUNC(sub_8225E218) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8225E218", 0x8225E218, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::stored);
     static std::atomic<uint64_t> calls{0};
     if (enabled) capture(0x8225E218, ++calls, ctx, base);
@@ -1152,6 +1362,7 @@ PPC_FUNC(sub_8225E218) {
 }
 extern "C" PPC_FUNC(__imp__sub_8225E2F0);
 PPC_FUNC(sub_8225E2F0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8225E2F0", 0x8225E2F0, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::stored);
     static std::atomic<uint64_t> calls{0};
     if (enabled) capture(0x8225E2F0, ++calls, ctx, base);
@@ -1163,17 +1374,74 @@ TRACE_ORIGINAL(8225E3C8)
 TRACE_ORIGINAL(8225CDD8)
 extern "C" PPC_FUNC(__imp__sub_82252878);
 PPC_FUNC(sub_82252878) {
+    const auto resource=ctx.r3.u32,caller=uint32_t(ctx.lr);
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest,
+        "sub_82252878", 0x82252878, caller, resource, "guest geometry resource");
     DarkRecomp::Native::StoredUpload upload;
     if (DarkRecomp::Native::enginePreviewEnabled()) {
-        try { upload = DarkRecomp::Native::storedGeometryCache().begin(base, ctx.r3.u32); }
+        try { upload = DarkRecomp::Native::storedGeometryCache().begin(base, resource); }
         catch (...) { upload.failed = true; }
     }
     ScopedPointer<DarkRecomp::Native::StoredUpload> scope(preparingGeometry, &upload);
-    __imp__sub_82252878(ctx, base);
+    {
+        // Separate original conversion/allocation/provider work from the
+        // native observer's cache capture and publication on this same call.
+        DarkRecomp::Native::StallProfiler::Scope stallOriginal(DarkRecomp::Native::StallProfiler::Section::Guest,
+            "sub_82252878 original preparation", 0x82252878, caller, resource, "guest geometry resource");
+        __imp__sub_82252878(ctx, base);
+    }
     if (upload.geometry) DarkRecomp::Native::storedGeometryCache().finish(std::move(upload), base);
+}
+// The original stored preparation can spend time in its graphics heap/holder
+// helpers before it reaches the converted vertex/index observers. Observe
+// those helpers only inside this preparation, preserving every original call
+// and register effect; unrelated allocator calls keep their original path.
+#define PROFILE_STORED_HELPER(address) \
+    extern "C" PPC_FUNC(__imp__sub_##address); \
+    PPC_FUNC(sub_##address) { \
+        if (preparingGeometry) { \
+            DarkRecomp::Native::StallProfiler::Scope stallHelper( \
+                DarkRecomp::Native::StallProfiler::Section::Guest, "stored helper sub_" #address, \
+                0x##address, uint32_t(ctx.lr), ctx.r3.u32, "guest graphics heap or holder"); \
+            __imp__sub_##address(ctx, base); \
+        } else __imp__sub_##address(ctx, base); \
+    }
+PROFILE_STORED_HELPER(8225FDA0)
+PROFILE_STORED_HELPER(8225F8D0)
+PROFILE_STORED_HELPER(8225FF00)
+PROFILE_STORED_HELPER(82250098)
+PROFILE_STORED_HELPER(82253688)
+#undef PROFILE_STORED_HELPER
+// The original resource job wait can execute queued work while it waits.
+// Keep the complete original path and attribute it as guest work, so a long
+// producer frame identifies the job rather than resembling a passive wait.
+extern "C" PPC_FUNC(__imp__sub_821F1548);
+PPC_FUNC(sub_821F1548) {
+    DarkRecomp::Native::StallProfiler::Scope stallJob(DarkRecomp::Native::StallProfiler::Section::Guest,
+        "guest resource job wait/execute", 0x821F1548, uint32_t(ctx.lr), ctx.r3.u32, "guest resource job ID");
+    __imp__sub_821F1548(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_82232258);
+PPC_FUNC(sub_82232258) {
+    using DarkRecomp::Native::StallProfiler::Scope;
+    using DarkRecomp::Native::StallProfiler::Section;
+    ResourceJobSnapshot job;
+    std::optional<Scope> dependency;
+    if (DarkRecomp::Native::StallProfiler::enabled()) {
+        uint8_t pointer[4];
+        if (jobBytes(base, ctx.r4.u32, pointer, sizeof(pointer)))
+            job = resourceJobSnapshot(base, jobWord(pointer));
+        if (job.available && job.dependency != 0xffff)
+            dependency.emplace(Section::Guest, "resource job execution dependency", 0x82232258,
+                uint32_t(ctx.lr), job.dependency, "guest dependency job ID");
+    }
+    Scope execution(Section::Guest, resourceJobFunction(ctx.r3.u32), 0x82232258,
+        uint32_t(ctx.lr), job.id, job.available ? "guest resource job ID" : nullptr);
+    __imp__sub_82232258(ctx, base);
 }
 extern "C" PPC_FUNC(__imp__sub_82762328);
 PPC_FUNC(sub_82762328) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82762328", 0x82762328, uint32_t(ctx.lr));
     const bool observe = enabled.load(std::memory_order_relaxed) && uint32_t(ctx.lr) == 0x82252C84;
     const std::array<uint32_t, 8> args{ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                                        ctx.r7.u32, ctx.r8.u32, ctx.r22.u32, uint32_t(ctx.lr)};
@@ -1189,6 +1457,7 @@ PPC_FUNC(sub_82762328) {
 }
 extern "C" PPC_FUNC(__imp__sub_82899BF0);
 PPC_FUNC(sub_82899BF0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82899BF0", 0x82899BF0, uint32_t(ctx.lr));
     const bool stored = uint32_t(ctx.lr) == 0x82252DD4;
     const uint32_t destination = ctx.r3.u32, bytes = ctx.r5.u32, resource = ctx.r22.u32;
     __imp__sub_82899BF0(ctx, base);
@@ -1201,6 +1470,7 @@ PPC_FUNC(sub_82899BF0) {
 }
 extern "C" PPC_FUNC(__imp__sub_82765410);
 PPC_FUNC(sub_82765410) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82765410", 0x82765410, uint32_t(ctx.lr));
     const bool stored = uint32_t(ctx.lr) == 0x8225342C;
     const uint32_t destination = ctx.r4.u32, countAddress = ctx.r5.u32, resource = ctx.r22.u32;
     const uint32_t capacity = stored ? word(base, countAddress) : 0;
@@ -1215,6 +1485,7 @@ PPC_FUNC(sub_82765410) {
 extern "C" PPC_FUNC(__imp__sub_8224A2E8);
 extern "C" PPC_FUNC(__imp__sub_8224DAE0);
 PPC_FUNC(sub_8224DAE0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8224DAE0", 0x8224DAE0, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::descriptor);
     DarkRecomp::Native::EngineDescriptorObservation observation;
     const bool observe = uint32_t(ctx.lr) == 0x82248E98 &&
@@ -1231,6 +1502,7 @@ PPC_FUNC(sub_8224DAE0) {
 }
 extern "C" PPC_FUNC(__imp__sub_8224A0A8);
 PPC_FUNC(sub_8224A0A8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8224A0A8", 0x8224A0A8, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::conversion);
     DarkRecomp::Native::EngineConversionObservation observation;
     const bool observe = uint32_t(ctx.lr) == 0x822490B8 &&
@@ -1245,6 +1517,7 @@ PPC_FUNC(sub_8224A0A8) {
     }
 }
 PPC_FUNC(sub_8224A2E8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8224A2E8", 0x8224A2E8, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::textures);
     // Direct engine preparation boundary. The original still performs all
     // descriptor/device writes exactly once; host observation is read-only.
@@ -1261,12 +1534,22 @@ PPC_FUNC(sub_8224A2E8) {
 }
 extern "C" PPC_FUNC(__imp__sub_82868FE8);
 PPC_FUNC(sub_82868FE8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82868FE8", 0x82868FE8, uint32_t(ctx.lr));
     DarkRecomp::Native::EngineCpuScope profile(DarkRecomp::Native::EnginePhase::indexed);
     captureWorldBoundary(0x82868FE8,ctx,base);
     if (uint32_t(ctx.lr)==0x8225DD38 && ctx.r4.u32==4 && !ctx.r5.u32) {
         const auto mode=_mm_getcsr();
         DarkRecomp::Native::previewObserveImmediateWorld(base,ctx.r3.u32,ctx.r30.u32,ctx.r7.u32);
         _mm_setcsr(mode);
+    }
+    if(drawingDecodedGeometry && uint32_t(ctx.lr)==0x8225E200) {
+        const auto indices=drawingDecodedGeometry->consume(uint32_t(ctx.lr),ctx.r4.u32,
+            ctx.r5.u32,ctx.r6.u32,ctx.r7.u32);
+        if(indices) {
+            const auto mode=_mm_getcsr();
+            DarkRecomp::Native::previewObserveImmediateWorld(base,ctx.r3.u32,indices,ctx.r7.u32);
+            _mm_setcsr(mode);
+        }
     }
     // Observe the engine's actual indexed call, after its early-out checks
     // and buffer binding. This does not interpret the Xbox command stream.
@@ -1293,7 +1576,7 @@ PPC_FUNC(sub_82868FE8) {
         }
         if (owned) {
             const auto floatingPointMode=_mm_getcsr();
-            DarkRecomp::Native::previewObserveWorld(base,owned);
+            DarkRecomp::Native::previewObserveWorld(base,std::move(owned));
             _mm_setcsr(floatingPointMode);
         }
     }
@@ -1345,6 +1628,7 @@ PPC_FUNC(sub_82868FE8) {
 }
 extern "C" PPC_FUNC(__imp__sub_828630D8);
 PPC_FUNC(sub_828630D8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_828630D8", 0x828630D8, uint32_t(ctx.lr));
     captureWorldBoundary(0x828630D8,ctx,base);
     // The original constructs omitted rectangles, intersects viewport/scissor,
     // and rejects empty regions. Capture at its completed clipping boundary.
@@ -1363,6 +1647,7 @@ void ObserveEngineClearRegionMidAsmHook(PPCRegister& device,PPCRegister& flags,P
 }
 extern "C" PPC_FUNC(__imp__sub_82865FD0);
 PPC_FUNC(sub_82865FD0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82865FD0", 0x82865FD0, uint32_t(ctx.lr));
     captureWorldBoundary(0x82865FD0,ctx,base);
     const auto mxcsr=_mm_getcsr();
     DarkRecomp::Native::previewObserveResolve(base,ctx.r3.u32,ctx.r4.u32,ctx.r5.u32,ctx.r6.u32,ctx.r7.u32,
@@ -1371,21 +1656,46 @@ PPC_FUNC(sub_82865FD0) {
     __imp__sub_82865FD0(ctx,base);
 }
 extern "C" PPC_FUNC(__imp__sub_82867620);
+// Original completed LUT emitters, after D3D's conversion for the display.
+// Queue immutable state in command order, including menu/video-only frames.
+extern "C" PPC_FUNC(__imp__sub_828709C0);
+PPC_FUNC(sub_828709C0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_828709C0", 0x828709C0, uint32_t(ctx.lr));
+    DarkRecomp::Native::previewObserveDisplayGamma(base,ctx.r4.u32,true);
+    __imp__sub_828709C0(ctx,base);
+}
+extern "C" PPC_FUNC(__imp__sub_828708E0);
+PPC_FUNC(sub_828708E0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_828708E0", 0x828708E0, uint32_t(ctx.lr));
+    DarkRecomp::Native::previewObserveDisplayGamma(base,ctx.r4.u32,false);
+    __imp__sub_828708E0(ctx,base);
+}
 PPC_FUNC(sub_82867620) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82867620", 0x82867620, uint32_t(ctx.lr));
     captureWorldBoundary(0x82867620,ctx,base);
     const auto mxcsr=_mm_getcsr();
     if(DarkRecomp::Native::previewWorldActive()) {
         DarkRecomp::Native::previewObservePresent(base,ctx.r4.u32);
         DarkRecomp::Native::previewEndFrame();
+        // World frames finish at the original SDK swap entry. Count this
+        // producer stream separately from host presentation/queue retries.
+        DarkRecomp::Native::StallProfiler::frameBoundary("guest");
     }
     _mm_setcsr(mxcsr);
     __imp__sub_82867620(ctx,base);
 }
 extern "C" PPC_FUNC(__imp__sub_82241A68);
 PPC_FUNC(sub_82241A68) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82241A68", 0x82241A68, uint32_t(ctx.lr));
     static std::atomic<uint64_t> calls{0};
     if (enabled) capture(0x82241A68, ++calls, ctx, base);
-    if(!DarkRecomp::Native::previewWorldActive()) DarkRecomp::Native::previewEndFrame();
+    // Before world submission takes over, the outer engine pageflip entry is
+    // the existing frame terminator. This path also runs with preview disabled.
+    // Boundaries are entry-to-entry: original pageflip/SDK waits remain counted.
+    if(!DarkRecomp::Native::previewWorldActive()) {
+        DarkRecomp::Native::previewEndFrame();
+        DarkRecomp::Native::StallProfiler::frameBoundary("guest");
+    }
     __imp__sub_82241A68(ctx, base);
 }
 TRACE_ORIGINAL(82241940)
@@ -1418,6 +1728,7 @@ static void publishImageUpload(DarkRecomp::Native::TextureUpload& upload,uint8_t
 // before the original callback; queued commands retain their owned images.
 extern "C" PPC_FUNC(__imp__sub_82256008);
 PPC_FUNC(sub_82256008) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82256008", 0x82256008, uint32_t(ctx.lr));
     if(DarkRecomp::Native::enginePreviewEnabled()) {
         std::array<uint8_t,2> id{};
         if(DarkRecomp::Native::copyRenderMemory(base,uint64_t(ctx.r3.u32)+168,id.data(),id.size()))
@@ -1427,6 +1738,7 @@ PPC_FUNC(sub_82256008) {
 }
 extern "C" PPC_FUNC(__imp__sub_82257450);
 PPC_FUNC(sub_82257450) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82257450", 0x82257450, uint32_t(ctx.lr));
     if (!enabled && !DarkRecomp::Native::enginePreviewEnabled()) { __imp__sub_82257450(ctx, base); return; }
     static std::atomic<uint64_t> calls{0};
     const uint32_t owner=ctx.r3.u32,metadata=word(base,owner+168);
@@ -1440,6 +1752,7 @@ PPC_FUNC(sub_82257450) {
 }
 extern "C" PPC_FUNC(__imp__sub_82258BA0);
 PPC_FUNC(sub_82258BA0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82258BA0", 0x82258BA0, uint32_t(ctx.lr));
     if(!DarkRecomp::Native::enginePreviewEnabled()) {__imp__sub_82258BA0(ctx,base);return;}
     const uint32_t owner=ctx.r3.u32,metadata=word(base,owner+168),resource=uploadResource(base,owner);
     const unsigned faces=((metadata>>8)&255u)==1?6:1,count=ctx.r10.u32;
@@ -1459,6 +1772,7 @@ PPC_FUNC(sub_82258BA0) {
 }
 extern "C" PPC_FUNC(__imp__sub_828AE188);
 PPC_FUNC(sub_828AE188) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_828AE188", 0x828AE188, uint32_t(ctx.lr));
     // Record owned CImage bytes before the original temporary endian swaps.
     // Offset queries also occur for skipped metadata, before the copy branch.
     const uint32_t caller=uint32_t(ctx.lr);
@@ -1473,6 +1787,7 @@ PPC_FUNC(sub_828AE188) {
 }
 extern "C" PPC_FUNC(__imp__sub_8226A7E0);
 PPC_FUNC(sub_8226A7E0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8226A7E0", 0x8226A7E0, uint32_t(ctx.lr));
     const uint32_t caller=uint32_t(ctx.lr);
     const bool initial=caller==0x822581F0,incremental=caller==0x822594E0;
     auto* upload=preparingImage;
@@ -1491,6 +1806,7 @@ struct PromptFetchScope {
 // commits too so stale origins cannot survive and uploads demote.
 extern "C" PPC_FUNC(__imp__sub_827A4130);
 PPC_FUNC(sub_827A4130) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_827A4130", 0x827A4130, uint32_t(ctx.lr));
     const uint32_t container = ctx.r3.u32, actualIndex = ctx.r4.u32;
     __imp__sub_827A4130(ctx, base);
     const uint32_t image = ctx.r3.u32;
@@ -1500,6 +1816,7 @@ PPC_FUNC(sub_827A4130) {
 // Scoped capture for the 8279B6B0 path below; never used blindly elsewhere.
 extern "C" PPC_FUNC(__imp__sub_8279A7A8);
 PPC_FUNC(sub_8279A7A8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8279A7A8", 0x8279A7A8, uint32_t(ctx.lr));
     const uint32_t container = ctx.r3.u32;
     __imp__sub_8279A7A8(ctx, base);
     olderSelectedContainer = container;
@@ -1509,6 +1826,7 @@ PPC_FUNC(sub_8279A7A8) {
 #define TRACE_IMAGE_RETURN(address) \
     extern "C" PPC_FUNC(__imp__sub_##address); \
     PPC_FUNC(sub_##address) { \
+        DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_" #address, 0x##address, uint32_t(ctx.lr)); \
         const uint32_t mip = ctx.r5.u32; \
         PromptFetchScope promptScope; \
         __imp__sub_##address(ctx, base); \
@@ -1521,6 +1839,7 @@ TRACE_IMAGE_RETURN(827A42D8)
 TRACE_IMAGE_RETURN(827A4530)
 extern "C" PPC_FUNC(__imp__sub_8279B6B0);
 PPC_FUNC(sub_8279B6B0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8279B6B0", 0x8279B6B0, uint32_t(ctx.lr));
     const uint32_t container = ctx.r3.u32;
     const uint32_t mip = ctx.r5.u32;
     PromptFetchScope promptScope;
@@ -1562,6 +1881,7 @@ PPC_FUNC(sub_8279B6B0) {
 
 extern "C" PPC_FUNC(__imp__sub_8279DDC0);
 PPC_FUNC(sub_8279DDC0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_8279DDC0", 0x8279DDC0, uint32_t(ctx.lr));
     const uint32_t container = ctx.r3.u32, localId = ctx.r4.u32, request = ctx.r5.u32, caller = uint32_t(ctx.lr);
     __imp__sub_8279DDC0(ctx, base);
     DarkRecomp::Native::previewObserveVideo(base, container, localId);
@@ -1570,6 +1890,7 @@ PPC_FUNC(sub_8279DDC0) {
 }
 
 PPC_FUNC(sub_82793C48) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82793C48", 0x82793C48, uint32_t(ctx.lr));
     const uint32_t output=ctx.r3.u32,device=ctx.r4.u32,x=ctx.r5.u32,y=ctx.r6.u32,caller=uint32_t(ctx.lr);
     __imp__sub_82793C48(ctx,base);
     if(!enabled.load(std::memory_order_relaxed))return;
@@ -1585,6 +1906,7 @@ PPC_FUNC(sub_82793C48) {
 }
 extern "C" PPC_FUNC(__imp__sub_828AAAB8);
 PPC_FUNC(sub_828AAAB8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_828AAAB8", 0x828AAAB8, uint32_t(ctx.lr));
     const uint32_t user=ctx.r3.u32,output=ctx.r4.u32,caller=uint32_t(ctx.lr);
     __imp__sub_828AAAB8(ctx,base);
     if(!enabled.load(std::memory_order_relaxed) || ctx.r3.u32)return;
@@ -1606,6 +1928,7 @@ PPC_FUNC(sub_828AAAB8) {
 #define TRACE_FRAME_QUEUE(address,takesFrame) \
     extern "C" PPC_FUNC(__imp__sub_##address); \
     PPC_FUNC(sub_##address) { \
+        DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_" #address, 0x##address, uint32_t(ctx.lr)); \
         const auto mode=_mm_getcsr(); \
         const uint32_t manager=ctx.r3.u32,frame=takesFrame?0:ctx.r4.u32,caller=uint32_t(ctx.lr); \
         const auto sequence=sampleFrameQueue(0x##address,caller); \
@@ -1621,6 +1944,7 @@ TRACE_FRAME_QUEUE(825A46A0,false)
 #define TRACE_SCENE_GATE(address,frameReg) \
     extern "C" PPC_FUNC(__imp__sub_##address); \
     PPC_FUNC(sub_##address) { \
+        DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_" #address, 0x##address, uint32_t(ctx.lr)); \
         const auto mode=_mm_getcsr();const uint32_t scene=ctx.r3.u32,frame=ctx.frameReg.u32; \
         const auto sequence=sampleFrameQueue(0x##address,uint32_t(ctx.lr)); \
         captureSceneGate(sequence,0x##address,false,scene,frame,ctx,base);_mm_setcsr(mode); \
@@ -1637,6 +1961,7 @@ TRACE_SCENE_GATE(820FA490,r4)
 #define TRACE_CLIENT_GATE(address,hasFrame) \
     extern "C" PPC_FUNC(__imp__sub_##address); \
     PPC_FUNC(sub_##address) { \
+        DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_" #address, 0x##address, uint32_t(ctx.lr)); \
         const auto mode=_mm_getcsr();const uint32_t client=ctx.r3.u32,frame=hasFrame?ctx.r4.u32:0; \
         const std::array<uint32_t,6> args{ctx.r3.u32,ctx.r4.u32,ctx.r5.u32,ctx.r6.u32,ctx.r7.u32,ctx.r8.u32}; \
         const auto sequence=sampleFrameQueue(0x##address,uint32_t(ctx.lr)); \
@@ -1680,6 +2005,7 @@ void captureCinematicSync(uint64_t sequence,uint32_t function,bool returned,uint
 #define TRACE_CINEMATIC_SYNC(address,isMessage) \
     extern "C" PPC_FUNC(__imp__sub_##address); \
     PPC_FUNC(sub_##address) { \
+        DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_" #address, 0x##address, uint32_t(ctx.lr)); \
         const auto mode=_mm_getcsr();const uint32_t object=ctx.r3.u32,caller=uint32_t(ctx.lr); \
         static std::atomic<uint64_t> count{0}; \
         uint64_t sequence=enabled.load(std::memory_order_relaxed)?count.fetch_add(1,std::memory_order_relaxed)+1:0; \
@@ -1695,6 +2021,7 @@ TRACE_CINEMATIC_SYNC(826EBEE8,false)
 TRACE_CINEMATIC_SYNC(826EBCD0,false)
 extern "C" PPC_FUNC(__imp__sub_827DA190);
 PPC_FUNC(sub_827DA190) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Audio, "sub_827DA190", 0x827DA190, uint32_t(ctx.lr));
     auto* stats = DarkRecomp::Native::activeAudioRefill;
     DarkRecomp::Native::AudioRefillTimer timer(stats ? &stats->streamTicks : nullptr,
                                               stats ? &stats->maxStreamTicks : nullptr);
@@ -1735,6 +2062,7 @@ PPC_FUNC(sub_827DA190) {
 }
 extern "C" PPC_FUNC(__imp__sub_82496BA0);
 PPC_FUNC(sub_82496BA0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_82496BA0", 0x82496BA0, uint32_t(ctx.lr));
     const auto mode=_mm_getcsr();const uint32_t client=ctx.r3.u32;
     const auto sequence=sampleFrameQueue(0x82496BA0,uint32_t(ctx.lr));
     if(sequence)try {
@@ -1772,6 +2100,7 @@ PPC_FUNC(sub_82496BA0) {
 extern "C" PPC_FUNC(__imp__sub_823075F8);
 extern "C" PPC_FUNC(__imp__sub_827F15E0);
 PPC_FUNC(sub_827F15E0) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Audio, "sub_827F15E0", 0x827F15E0, uint32_t(ctx.lr));
     const auto mode=_mm_getcsr();const auto sound=ctx.r3.u32,id=ctx.r4.u32,caller=uint32_t(ctx.lr);
     static std::atomic<uint32_t> count{0};
     const bool record=enabled.load(std::memory_order_relaxed) && caller==0x82496C5C && count.fetch_add(1)<1024;
@@ -1797,6 +2126,7 @@ PPC_FUNC(sub_827F15E0) {
     _mm_setcsr(originalMode);
 }
 PPC_FUNC(sub_823075F8) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_823075F8", 0x823075F8, uint32_t(ctx.lr));
     const auto mode=_mm_getcsr();
     const uint32_t state=ctx.r3.u32,tick=ctx.r4.u32,caller=uint32_t(ctx.lr);
     const double fraction=ctx.f1.f64;
@@ -1819,6 +2149,7 @@ PPC_FUNC(sub_823075F8) {
 }
 extern "C" PPC_FUNC(__imp__sub_825A3298);
 PPC_FUNC(sub_825A3298) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_825A3298", 0x825A3298, uint32_t(ctx.lr));
     const auto mode=_mm_getcsr();const uint32_t frame=ctx.r3.u32,caller=uint32_t(ctx.lr);
     const auto sequence=sampleFrameQueue(0x825A3298,caller);
     captureFrameQueue(sequence,0x825A3298,false,0,frame,caller,ctx,base);_mm_setcsr(mode);
@@ -1832,6 +2163,7 @@ extern "C" PPC_FUNC(__imp__sub_825DD940);
 extern "C" PPC_FUNC(__imp__sub_825DD948);
 extern "C" PPC_FUNC(__imp__sub_825DD950);
 PPC_FUNC(sub_825DD940) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_825DD940", 0x825DD940, uint32_t(ctx.lr));
     const auto mode=_mm_getcsr();const auto id=word(base,ctx.r6.u32);
     _mm_setcsr(mode);__imp__sub_825DD940(ctx,base);
     const auto returnedMode=_mm_getcsr();
@@ -1839,10 +2171,12 @@ PPC_FUNC(sub_825DD940) {
     _mm_setcsr(returnedMode);
 }
 PPC_FUNC(sub_825DD948) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_825DD948", 0x825DD948, uint32_t(ctx.lr));
     __imp__sub_825DD948(ctx,base);const auto mode=_mm_getcsr();
     DarkRecomp::Native::previewEndHistogram();_mm_setcsr(mode);
 }
 PPC_FUNC(sub_825DD950) {
+    DarkRecomp::Native::StallProfiler::Scope stallCall(DarkRecomp::Native::StallProfiler::Section::Guest, "sub_825DD950", 0x825DD950, uint32_t(ctx.lr));
     const auto mode=_mm_getcsr();const auto data=ctx.r6.u32;
     const auto first=word(base,data),count=word(base,data+4),output=word(base,data+8);
     _mm_setcsr(mode);__imp__sub_825DD950(ctx,base);
@@ -1860,5 +2194,24 @@ PPC_FUNC(sub_825DD950) {
             if(report)std::fputc('\n',stderr);
         }
     }
+    _mm_setcsr(returnedMode);
+}
+
+extern "C" PPC_FUNC(__imp__sub_827646F0);
+// CXR_Model_Flare's original callback normalizes this count by its query
+// patch area. Xbox GetData cannot measure the native depth buffer, so bracket
+// the original colorless patch and publish the last completed GPU result.
+// Keep the guest query lifecycle and register effects, including its fallback
+// while the first asynchronous native measurement is still unavailable.
+PPC_FUNC(sub_827646F0) {
+    const uint32_t id=ctx.r4.u32;
+    const auto originalMode=_mm_getcsr();
+    DarkRecomp::Native::previewBeginFlare(id);_mm_setcsr(originalMode);
+    __imp__sub_827646F0(ctx,base);
+    const auto returnedMode=_mm_getcsr();
+    DarkRecomp::Native::previewEndFlare();
+    uint64_t samples=0;
+    const bool measured=DarkRecomp::Native::previewReadFlare(id,samples);
+    if(measured)ctx.f1.f64=double(float(samples));
     _mm_setcsr(returnedMode);
 }

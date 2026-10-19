@@ -1,7 +1,7 @@
 # Correctness profile: preserve the full guest register state across calls.
 # Host compilation is still optimized; guest ABI shortcuts are disabled.
 [main]
-file_path = "../Darkness/_uncrypted.xex"
+file_path = "../Darkness/default.xex"
 switch_table_file_path = "../Darkness/darkness_switch_tables.toml"
 skip_lr = false
 skip_msr = false
@@ -15,6 +15,56 @@ savegprlr_14_address = 0x828999F0
 restgprlr_14_address = 0x82899A40
 savefpr_14_address = 0x8289A190
 restfpr_14_address = 0x8289A1DC
+
+# Evaluate the original god-mode predicates for the selected server player.
+# Only the loaded register changes; actor flags and checkpoints remain intact.
+[[midasm_hook]]
+name = "ApplyDeveloperInvincibilityMidAsmHook"
+address = 0x8214EC50
+registers = ["r31", "r29", "r11"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperInvincibilityMidAsmHook"
+address = 0x82154660
+registers = ["r31", "r29", "r11"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperInvincibilityMidAsmHook"
+address = 0x82162204
+registers = ["r26", "r30", "r11"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperInvincibilityMidAsmHook"
+address = 0x82189B08
+registers = ["r30", "r15", "r11"]
+
+# Use the original player-only mode 4 movement and commit paths for noclip.
+# Override consumed mode registers; serialized movement flags stay untouched.
+[[midasm_hook]]
+name = "ApplyDeveloperNoclipMidAsmHook"
+address = 0x82133E54
+registers = ["r31", "r21", "r16"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperNoclipMidAsmHook"
+address = 0x82137824
+registers = ["r31", "r29", "r11"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperNoclipMidAsmHook"
+address = 0x82175F9C
+registers = ["r29", "r31", "r11"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperNoclipStateMidAsmHook"
+address = 0x821720E8
+registers = ["r31", "r11"]
+
+# Original noclip also disables the selected player's outer collision sweep.
+[[midasm_hook]]
+name = "ApplyDeveloperNoclipCollisionMidAsmHook"
+address = 0x82472E1C
+registers = ["r24", "r11"]
 
 
 [[midasm_hook]]
@@ -64,3 +114,31 @@ registers = ["r31", "r29", "r30", "r21", "f1"]
 name = "ApplyNativeMouseLookMidAsmHook"
 address = 0x823FD07C
 registers = ["r31", "r1", "f13", "f12"]
+
+# Original player-control movement values, after their authored state loads.
+# Scale horizontal movement registers without changing state or elapsed time.
+[[midasm_hook]]
+name = "ApplyDeveloperHorizontalSpeedMidAsmHook"
+address = 0x82134474
+registers = ["r31", "r21", "f13", "f11"]
+
+# Walking interpolates state+10020 and +10024; scale each endpoint once.
+[[midasm_hook]]
+name = "ApplyDeveloperHorizontalSpeedMidAsmHook"
+address = 0x82135018
+registers = ["r31", "r21", "f13", "f0"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperForwardSpeedMidAsmHook"
+address = 0x82135020
+registers = ["r31", "r21", "f12"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperHorizontalSpeedMidAsmHook"
+address = 0x82135B08
+registers = ["r31", "r21", "f0", "f13"]
+
+[[midasm_hook]]
+name = "ApplyDeveloperHorizontalSpeedMidAsmHook"
+address = 0x82135C8C
+registers = ["r31", "r21", "f0", "f13"]
