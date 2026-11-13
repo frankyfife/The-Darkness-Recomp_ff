@@ -38,8 +38,17 @@ the expected folder layout and help with startup problems.
 - Full gameplay with keyboard, mouse, and controller input, XMA audio, saves,
   and persistent achievement tracking.
 - Resolution, FOV, original Xbox gamma calibration and color profiles, bloom,
-  frame cap, VSync, FXAA/SMAA/MSAA antialiasing, and 16x texture filtering.
+  frame cap, VSync, FXAA/SMAA/MSAA antialiasing, 16x texture filtering, and a
+  draw distance for props in large open views (Near by default; Original restores
+  the unlimited original).
 - Remappable keys and mouse buttons, clickable menus, and adjustable subtitle size.
+- **Experimental Alternate Movement** with faster response and stronger air steering,
+  selected live in **Options > Controls > Movement Style**. Original is the default;
+  occasional contact/camera snags remain under investigation. F5 developer options
+  have a 0.25x-4x speed slider with its 1x default marked in the center.
+  Video Settings has an FOV slider from Original to 120 degrees.
+- Optional light flicker reduction, applied live from Video Settings or selected
+  in the settings launcher; original light animation remains the default.
 - Language selection and support for the original disc revision and the
   [Russian localization identified in issue #37](https://github.com/portingpete/The-Darkness-Recomp/issues/37).
 
@@ -217,10 +226,10 @@ commands install the missing generator patches and regenerate the output.
 For Windows, install Git, Visual Studio 2022 with the **C++ and ClangCL tools**,
 CMake 3.24+, Python 3.11+, MSYS2 MinGW64 GCC and `make` at `C:\msys64`, and
 standalone LLVM at `C:\Program Files\LLVM` (including `llvm-lib.exe` for audio).
-The resource-worker notification helper also requires Rust with the
-`x86_64-pc-windows-msvc` target and `rustc` on PATH (tested with Rust 1.90).
-It has no Cargo dependencies. Configure `-DDARK_RUST_RESOURCE_WAIT=OFF` to
-build the original polling path without Rust.
+Alternate movement and the resource-worker notification helper require Rust with
+the `x86_64-pc-windows-msvc` target and `rustc` on PATH (tested with Rust 1.90).
+They have no Cargo dependencies. Configure `-DDARK_RUST_RESOURCE_WAIT=OFF` to
+use the original resource polling path; movement still requires Rust.
 If MSYS2 is installed elsewhere, set `MSYS2_ROOT` before building, e.g.
 `$env:MSYS2_ROOT = 'D:\msys64'`.
 Allow approximately 15 GB free. The first build requires an internet connection.
@@ -284,6 +293,7 @@ the problem. Do not post game files.
 - `Launch.cmd mute` — Play muted
 - `Launch.cmd preview` — Engine preview build (muted by default)
 - `Launch.cmd stutter` — Play with sound while recording slow-frame timings
+- `LaunchFrameDrops.cmd` (`Launch.cmd frame-drops`) — Short run that records every frame for frame-drop analysis
 - `Launch.cmd performance` / `render-profile` / `steady-60` — Diagnostic recording runs
 - `Launch.cmd help` — Full usage
 
@@ -299,8 +309,15 @@ then close the game. The newest `build_native/run/desktop-*/runtime.log` include
 `[WAIT]` details, and the largest slow-frame contributors. The launcher uses
 your saved game settings. Profiling is disabled by default; set
 `DARKRECOMP_STALL_PROFILE=1` to enable it for another launch, or use
-`tools/run_native.py --stall-profile` for a bounded development run. Build with
+`tools/run_native.py --stall-profile` for a bounded development run. Calls made
+for every world draw are not timed at level 1, so busy scenes keep their normal
+speed while profiled; `DARKRECOMP_STALL_PROFILE=2` times them too (about 20%
+slower engine frames in busy views). Build with
 `-DDARK_STALL_PROFILER=OFF` to exclude the profiler completely.
+For engine freezes that last longer than a frame, `DARKRECOMP_STALL_WATCH=80`
+adds a `[StallWatch]` report per stall over 80 ms. Each report gives every
+thread's Windows scheduling state (running, ready or waiting, and why), its CPU
+time within the sampled window and the guest call stacks (see `RENDERING.md`).
 
 </details>
 
@@ -316,6 +333,9 @@ ctest --test-dir build_native -C Release --output-on-failure
 ```
 
 **Release packaging**
+
+Before publishing, complete the [release validation gates](https://github.com/portingpete/The-Darkness-Recomp/blob/main/docs/RELEASING.md),
+including a cold-cache Proton/DXVK game run for Linux/Steam Deck artifacts.
 
 Maintainers can build, test, and package a Windows ZIP with:
 

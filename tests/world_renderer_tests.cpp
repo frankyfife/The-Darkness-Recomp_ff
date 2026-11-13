@@ -689,6 +689,37 @@ static void deadNormalContract(WorldRendererD3D11& renderer) {
         for(size_t i=0;i<missing.size();i+=8)if(missing[i] || missing[i+1])++colored;
         require(colored>0,"Proven tuple rendered two empty frames instead of meaningful pixels");
     }
+    // Repeats (SimpleMesh::repeat): drawn right after a complete draw of the
+    // same WorldDraw, a repeat binds only its own geometry (drawRepeat). Its
+    // pixels must equal those of the equivalent complete draw.
+    {
+        auto shifted=[&](float dx) {
+            auto g=geometry(false);
+            for(unsigned i=0;i<3;++i) {
+                auto* v=g->vertices.data()+size_t(i)*g->stride;
+                const uint32_t x=(uint32_t(v[0])<<24)|(uint32_t(v[1])<<16)|(uint32_t(v[2])<<8)|v[3];
+                put(v,std::bit_cast<uint32_t>(std::bit_cast<float>(x)+dx));
+            }
+            return g;
+        };
+        draw.fragmentFlags=65;
+        draw.geometry.vertices=draw.geometry.indices=shifted(0);draw.geometry.indexCount=3;draw.geometry.firstIndex=0;
+        WorldGeometry second{shifted(-.125f),nullptr,0,3,0};second.indices=second.vertices;
+        auto complete=draw;complete.geometry=second;
+        renderer.clear(clear);
+        require(renderer.draw(draw) && renderer.draw(complete),"Complete draws for the repeat comparison rejected");
+        const auto expectedPixels=renderer.readSurface(901,false);
+        renderer.clear(clear);
+        const auto shortDraws=renderer.shortPathDraws();
+        require(renderer.draw(draw) && renderer.draw(draw,&second,true),"Repeat after its WorldDraw rejected");
+        require(renderer.shortPathDraws()==shortDraws+1,"A repeat right after its WorldDraw took the full path");
+        const auto repeatPixels=renderer.readSurface(901,false);
+        require(repeatPixels==expectedPixels,"A repeat drawn with its geometry only differs from the complete draw");
+        auto anchorOnly=draw;
+        renderer.clear(clear);
+        require(renderer.draw(anchorOnly),"Anchor draw rejected");
+        require(renderer.readSurface(901,false)!=repeatPixels,"The repeat's geometry did not reach the target");
+    }
     // Normal-dependent outputs must still reject a missing normal stream. These
     // attempts reuse the fully valid bindings above, so they fail at the step6
     // normal check rather than an unrelated texture/decode rejection.
@@ -1825,7 +1856,7 @@ static void worldRendererDebugContract(ID3D11Device* device) {
 int main(int argc,char** argv) {
     ComPtr<ID3D11Device> device;
     try {
-        bool warp=false,cpuOnly=false,colorGradeOnly=false,guiFadeOnly=false,resolutionSwitchOnly=false,frontbufferOnly=false,clipPlanesOnly=false,bloomOnly=false,postCopyOnly=false,finalCaptureOnly=false,armBloomOnly=false,textureBudgetOnly=false,subtitleFontOnly=false;
+        bool warp=false,cpuOnly=false,colorGradeOnly=false,guiFadeOnly=false,resolutionSwitchOnly=false,frontbufferOnly=false,clipPlanesOnly=false,bloomOnly=false,postCopyOnly=false,finalCaptureOnly=false,armBloomOnly=false,textureBudgetOnly=false,subtitleFontOnly=false,screenFogCompilerOnly=false;
         for(int i=1;i<argc;++i) {
             if(std::strcmp(argv[i],"--warp")==0)warp=true;
             else if(std::strcmp(argv[i],"--cpu-only")==0)cpuOnly=true;
@@ -1840,10 +1871,14 @@ int main(int argc,char** argv) {
             else if(std::strcmp(argv[i],"--arm-bloom-only")==0)armBloomOnly=true;
             else if(std::strcmp(argv[i],"--texture-budget-only")==0)textureBudgetOnly=true;
             else if(std::strcmp(argv[i],"--subtitle-font-only")==0)subtitleFontOnly=true;
-            else throw std::runtime_error("Unknown argument; expected --warp, --cpu-only, --color-grade-only, --gui-fade-only, --resolution-switch-only, --frontbuffer-only, --clip-planes-only, --bloom-only, --post-copy-only, --final-capture-only, --arm-bloom-only, --texture-budget-only or --subtitle-font-only");
+            else if(std::strcmp(argv[i],"--screen-fog-compiler-only")==0)screenFogCompilerOnly=true;
+            else throw std::runtime_error("Unknown argument; expected --warp, --cpu-only, --color-grade-only, --gui-fade-only, --resolution-switch-only, --frontbuffer-only, --clip-planes-only, --bloom-only, --post-copy-only, --final-capture-only, --arm-bloom-only, --texture-budget-only, --subtitle-font-only or --screen-fog-compiler-only");
         }
-        require(unsigned(cpuOnly)+unsigned(colorGradeOnly)+unsigned(guiFadeOnly)+unsigned(resolutionSwitchOnly)+unsigned(frontbufferOnly)+unsigned(clipPlanesOnly)+unsigned(bloomOnly)+unsigned(postCopyOnly)+unsigned(finalCaptureOnly)+unsigned(armBloomOnly)+unsigned(textureBudgetOnly)+unsigned(subtitleFontOnly)<=1,
+        require(unsigned(cpuOnly)+unsigned(colorGradeOnly)+unsigned(guiFadeOnly)+unsigned(resolutionSwitchOnly)+unsigned(frontbufferOnly)+unsigned(clipPlanesOnly)+unsigned(bloomOnly)+unsigned(postCopyOnly)+unsigned(finalCaptureOnly)+unsigned(armBloomOnly)+unsigned(textureBudgetOnly)+unsigned(subtitleFontOnly)+unsigned(screenFogCompilerOnly)<=1,
             "Focused contract modes are mutually exclusive");
+        if(screenFogCompilerOnly) {
+            WorldRendererD3D11::validateScreenFogShaderCompiler();return 0;
+        }
         if(!colorGradeOnly && !guiFadeOnly && !resolutionSwitchOnly && !frontbufferOnly && !clipPlanesOnly && !bloomOnly && !postCopyOnly && !finalCaptureOnly && !armBloomOnly && !textureBudgetOnly && !subtitleFontOnly) {
             constantCopyContract();lightingValidationContract();promptWorldContract();
             formats();paletteUsageContract();paletteArithmeticContract();worldPositionUsageContract();worldWaterUsageContract();worldShadowInputContract();

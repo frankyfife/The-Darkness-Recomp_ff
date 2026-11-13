@@ -1,5 +1,6 @@
 #include "display_settings.h"
 #include "runtime/native/fov_settings.h"
+#include "runtime/native/draw_distance.h"
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
@@ -85,7 +86,16 @@ GraphicsSettings loadGraphicsSettings(const std::filesystem::path& path) noexcep
             readUnsigned(path, L"SubtitleScalePercent", defaults.subtitleScalePercent,
                          kMinimumSubtitleScalePercent, kMaximumSubtitleScalePercent),
             DisplayAspectMode(readUnsigned(path, L"AspectMode", unsigned(defaults.aspectMode),
-                                           0, unsigned(DisplayAspectMode::Stretch4x3)))};
+                                           0, unsigned(DisplayAspectMode::Stretch4x3))),
+            readUnsigned(path, L"ReduceLightFlicker", defaults.reduceLightFlicker, 0, 1) != 0};
+}
+
+unsigned loadDrawDistance(const std::filesystem::path& path) noexcept {
+    return readUnsigned(path, L"DrawDistance", kDefaultDrawDistance, 0, kMaximumDrawDistance);
+}
+
+bool saveDrawDistance(const std::filesystem::path& path, unsigned units) noexcept {
+    return validDrawDistance(units) && writeUnsigned(path, L"DrawDistance", units);
 }
 
 namespace {
@@ -116,6 +126,7 @@ bool saveSettings(const std::filesystem::path& path, float fov, const GraphicsSe
             !writeUnsigned(staging, L"AnisotropyLevels", settings.anisotropyLevels) ||
             !writeUnsigned(staging, L"SubtitleScalePercent", settings.subtitleScalePercent) ||
             !writeUnsigned(staging, L"AspectMode", unsigned(settings.aspectMode)) ||
+            !writeUnsigned(staging, L"ReduceLightFlicker", settings.reduceLightFlicker) ||
             (language && !saveGameLanguage(staging, *language))) return false;
         WritePrivateProfileStringW(nullptr, nullptr, nullptr, temporary);
         return MoveFileExW(temporary, path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;

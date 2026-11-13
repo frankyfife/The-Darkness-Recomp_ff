@@ -2,14 +2,17 @@
 #include "runtime/native/audio_driver.h"
 #include "runtime/native/display_mode.h"
 #include "runtime/native/thread_topology.h"
+#include "runtime/native/application_poll.h"
 #include "runtime/native/objects.h"
 #include "renderer/engine/simple_mesh.h"
+#include "app/windows/stall_watch.h"
 #include "ppc_recomp_shared.h"
 #include <atomic>
 #include <memory>
 #include <future>
 #include <objbase.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <fstream>
@@ -54,6 +57,7 @@ static void check(bool success, const char* message) { if (!success) throw std::
 #include "achievement_guest_tests.h"
 #include "fov_camera_tests.h"
 #include "video_settings_tests.h"
+#include "light_flicker_tests.h"
 #include "developer_tools_tests.h"
 #include "developer_invincibility_tests.h"
 #include "developer_noclip_tests.h"
@@ -294,8 +298,75 @@ static void testInflate(PPCContext& ctx, const char* fixturePath) {
     PPC_LOOKUP_FUNC(base, PPC_CODE_BASE + 4) = freeOriginal;
     puts("Original game decompressor matches independent stored, fixed and dynamic DEFLATE fixtures.");
 }
+// DARKRECOMP_STALL_WATCH walks other threads' guest stacks while they run. A
+// broken back chain must stop the walk without faulting or consuming a guard.
+static void testStallWatchStackWalk() {
+    auto* base = memory->base();
+    const uint32_t stack = memory->allocate(3 * 4096, 4096);
+    check(stack != 0, "Stack walk fixture allocation failed");
+    memset(base + stack, 0, 3 * 4096);
+    const uint32_t sp0 = stack + 0x100, sp1 = stack + 0x200, sp2 = stack + 0x300;
+    memory->write32(sp0, sp1); memory->write32(sp1 - 8, 0x82000010);
+    memory->write32(sp1, sp2); memory->write32(sp2 - 8, 0x82000020);
+    memory->write32(sp2, 0);
+    uint32_t frames[8]{};
+    check(StallWatch::walkGuestStack(base, sp0, frames, 8) == 2 && frames[0] == 0x82000010 &&
+          frames[1] == 0x82000020, "Stack walk did not follow the back chain");
+    check(StallWatch::walkGuestStack(base, sp0, frames, 1) == 1, "Stack walk exceeded its capacity");
+    const uint32_t page = stack + 0x2000;
+    memory->write32(sp2, page + 0x10);
+    for (const DWORD protection : {DWORD(PAGE_READWRITE | PAGE_GUARD), DWORD(PAGE_NOACCESS)}) {
+        DWORD saved = 0, ignored = 0;
+        MEMORY_BASIC_INFORMATION before{};
+        check(VirtualQuery(base + page, &before, sizeof(before)) &&
+              !(before.Protect & (PAGE_GUARD | PAGE_NOACCESS)), "Stack walk fixture was not initially readable");
+        // Model a protection change after a successful permissions query but
+        // before the diagnostic's process-memory read.
+        check(VirtualProtect(base + page, 4096, protection, &saved), "Cannot protect stack walk fixture");
+        uint32_t readValue = 0;
+        SIZE_T bytesRead = 0;
+        check(!ReadProcessMemory(GetCurrentProcess(), base + page, &readValue, sizeof(readValue), &bytesRead),
+              "Process memory read accepted a protected page");
+        check(StallWatch::walkGuestStack(base, sp0, frames, 8) == 2, "Stack walk read a protected guest page");
+        MEMORY_BASIC_INFORMATION info{};
+        check(VirtualQuery(base + page, &info, sizeof(info)) && info.Protect == protection,
+              "Stack walk consumed a guest PAGE_GUARD");
+        check(VirtualProtect(base + page, 4096, saved, &ignored), "Cannot restore stack walk fixture");
+    }
+    uint32_t word = 0;
+    check(!StallWatch::readGuestWord(base, stack + 2, word) && !StallWatch::readGuestWord(base, 0xFFFFFFFC, word),
+          "Unaligned or out-of-range guest word was read");
+    memory->release(stack);
+    puts("Stall watchdog stack walk stops at broken chains without faults or consumed guards.");
+}
+static void testStallWatchLifecycle(PPCContext& ctx) {
+    const char* oldValue = std::getenv("DARKRECOMP_STALL_WATCH");
+    const std::string previous = oldValue ? oldValue : "";
+    check(_putenv_s("DARKRECOMP_STALL_WATCH", "10") == 0, "Cannot configure watchdog fixture");
+    StallWatch::initializeFromEnvironment(memory->base());
+    const bool started = StallWatch::enabled();
+    if (started) {
+        StallWatch::registerThread(&ctx, "fixture-engine");
+        StallWatch::engineFrame();
+        Sleep(40);
+        StallWatch::engineFrame();
+        Sleep(20);
+        StallWatch::shutdown();
+    }
+    _putenv_s("DARKRECOMP_STALL_WATCH", previous.c_str());
+    check(started && !StallWatch::enabled(), "Stall watchdog did not start and stop");
+    puts("Stall watchdog sampling and owned shutdown passed.");
+}
 static void testWorkerScheduling(PPCContext& ctx, uint32_t scratch) {
     auto* base = memory->base();
+    check(StallWatch::testSlotLifecycle(&ctx), "Stall watchdog slot failure or reuse corrupted metadata");
+    check(StallWatch::testFrameThreshold(), "Stall watchdog frame threshold wrapped or fired early");
+    check(StallWatch::testTrackAccounting(), "Stall watchdog mixed thread lifetimes or overflowed tracking");
+    check(hostThreadPriority(1, true) == 0 && hostThreadPriority(2, true) == 0 &&
+          hostThreadPriority(-1, true) == -1 && hostThreadPriority(-7, true) == -2 &&
+          hostThreadPriority(1, false) == 1 && hostThreadPriority(9, false) == 2 &&
+          hostThreadPriority(1, true, true) == 1,
+          "Resource-pool host priority policy is wrong");
     check(memory->read32(resourcePoolThreadVtable + 48) == resourcePoolThreadCallback,
           "Resource pool scheduling fixture does not match the retail callback");
     check(resourcePoolThreadRole(resourcePoolThreadEntry, resourcePoolThreadVtable, resourcePoolThreadCallback) &&
@@ -365,9 +436,13 @@ static void testWorkerScheduling(PPCContext& ctx, uint32_t scratch) {
         check(base[processorByte] == (fixture.initialMask == 32 ? 5 : 4),
               "Worker creation changed its guest PCR identity");
         const int priority = fixture.initialMask == 32 ? 0 : 1;
+        // Resource-pool workers keep the guest value but never run above the engine.
+        const char* priorityOverride = std::getenv("DARK_POOL_PRIORITY");
+        const bool keepGuestPriority = priorityOverride && std::strcmp(priorityOverride, "guest") == 0;
+        const int hostPriority = fixture.resource && !keepGuestPriority ? 0 : priority;
         ctx.r3.u64 = threadObject; ctx.r4.s64 = priority;
         __imp__KeSetBasePriorityThread(ctx, base);
-        check(ctx.r3.s32 == 0 && GetThreadPriority(native->handle) == priority,
+        check(ctx.r3.s32 == 0 && GetThreadPriority(native->handle) == hostPriority && native->priority == priority,
               "Resource policy priority fixture failed");
         // Mutating the argument after creation must not reclassify the worker.
         const bool qualified = fixture.resource || fixture.application;
@@ -384,7 +459,7 @@ static void testWorkerScheduling(PPCContext& ctx, uint32_t scratch) {
             check(GetThreadGroupAffinity(native->handle, &actual), "Cannot inspect resource worker affinity");
             const DWORD_PTR expected = qualified ? allowed : nativeGuestAffinity(guestMask, allowed, actual.Group);
             check(actual.Mask == expected && native->priority == priority &&
-                  GetThreadPriority(native->handle) == priority,
+                  GetThreadPriority(native->handle) == hostPriority,
                   "Resource scheduling repinned a qualified worker, broadened another worker, or changed priority");
             previous = guestMask;
         }
@@ -439,6 +514,14 @@ static void testSynchronization(PPCContext& ctx, uint32_t scratch) {
         check(mapGuestProcessors({{0,0,0,0},{0,1,0,0},{0,2,1,0},{0,3,1,0}},0,15)==
               std::array<unsigned,6>{0,2,0,2,0,2},"Small host did not prefer different physical cores");
         check(guestProcessorMask(63,mapGuestProcessors({},0,0))==0,"Empty host topology produced a processor mask");
+        // Issue #162: only the unpaced pump pass inside 825A4278 yields; 0 restores the original loop.
+        check(applicationPollModeFrom(nullptr)==ApplicationPollMode::yield &&
+              applicationPollModeFrom("0")==ApplicationPollMode::original &&
+              applicationPollModeFrom("1")==ApplicationPollMode::yield &&
+              applicationPollModeFrom("00")==ApplicationPollMode::yield,"Application poll mode parsing changed");
+        check(applicationPollPass(true,0x825A4388) && !applicationPollPass(false,0x825A4388) &&
+              !applicationPollPass(true,0x825A42A0) && !applicationPollPass(true,0x825A42E4),
+              "Application poll yields outside the unpaced pump pass");
     }
     auto* base = memory->base();
     auto wait = [&](uint32_t handle) {
@@ -526,6 +609,8 @@ static void testSynchronization(PPCContext& ctx, uint32_t scratch) {
     check(memory->allocatedBytes() == allocatedBefore, "Closed and terminated thread leaked its guest allocation");
     PPC_LOOKUP_FUNC(base, probeAddress) = original;
     testWorkerScheduling(ctx, scratch);
+    testStallWatchStackWalk();
+    testStallWatchLifecycle(ctx);
 }
 static void testVsnprintf(PPCContext& ctx) {
     auto* base = memory->base();
@@ -1666,14 +1751,22 @@ int main(int argc, char** argv) {
     try {
         check(argc >= 2, "Game directory required");
         const bool videoFileTest = argc == 4 && strcmp(argv[2], "--video-mod-files") == 0;
+        const bool graphicsTest = argc == 3 && (strcmp(argv[2], "--light-flicker") == 0 ||
+                                                strcmp(argv[2], "--video-settings") == 0);
         std::filesystem::path videoTestUserData;
-        if (videoFileTest) {
+        if (videoFileTest || graphicsTest) {
             wchar_t temporary[MAX_PATH]{};
             check(GetTempPathW(MAX_PATH, temporary) != 0, "Video test temp directory unavailable");
             videoTestUserData = std::filesystem::path(temporary) /
                 (L"DarkVideoGuest-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
             check(std::filesystem::create_directory(videoTestUserData), "New video test user-data directory required");
             std::printf("[VideoModTest] Isolated user data: %ls\n", videoTestUserData.c_str());
+        }
+        if (videoTestUserData.empty()) {
+            if (const wchar_t* isolated = _wgetenv(L"DARK_NATIVE_TEST_USER_DATA"); isolated && *isolated) {
+                videoTestUserData = isolated;
+                DarkRecomp::Native::Storage::SetSaveRootOverride(videoTestUserData / L"saves");
+            }
         }
         Memory addressSpace;
         memory = &addressSpace;
@@ -1730,6 +1823,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && strcmp(argv[2], "--video-settings") == 0) {
             testVideoSettings(ctx);
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "--light-flicker") == 0) {
+            testLightFlicker(ctx);
             return 0;
         }
         if (argc == 3 && strcmp(argv[2], "--texture-upload") == 0) {
@@ -2397,6 +2494,16 @@ int main(int argc, char** argv) {
             ctx.r3.u64 = input; __imp__VdQueryVideoMode(ctx, memory->base());
             check(memory->read32(input) == width && memory->read32(input + 4) == 720,
                   "Ultrawide VdQueryVideoMode ABI mismatch");
+            // D3D's swap reads display sizes from X_DISPLAY_INFO; a stale
+            // stack word there once reached a divide in the scaler rebuild.
+            std::memset(memory->base() + input, 0xCD, 0x60);
+            ctx.r3.u64 = input; __imp__VdGetCurrentDisplayInformation(ctx, memory->base());
+            auto read16 = [&](uint32_t offset) { const uint8_t* at = memory->base() + input + offset; return uint32_t(at[0]) << 8 | at[1]; };
+            check(ctx.r3.u64 == 0 && read16(0x00) == width && read16(0x02) == 720 &&
+                  read16(0x48) == width && read16(0x4A) == 720 && read16(0x56) == width &&
+                  memory->read32(input + 0x4C) == 0x42700000 && memory->read32(input + 0x08 + 0x10) == width &&
+                  memory->base()[input + 0x58] == 0xCD,
+                  "VdGetCurrentDisplayInformation ABI mismatch");
         }
         // The original selected-mode indirection, with an untouched neighbor
         // and metadata canary. Logical mode identifiers must remain unchanged.

@@ -5,6 +5,7 @@
 #include "runtime/native/language_settings.h"
 #include "runtime/native/native_menu_text.h"
 #include "runtime/native/input.h"
+#include "runtime/native/movement_settings.h"
 #include <fstream>
 #include <utility>
 
@@ -65,6 +66,7 @@ static void testVideoSettings(PPCContext& ctx) {
     initializeNativeMenuText(false, 1);
     initializeVideoSettingsMenu();
     check(!graphicsSettings().motionBlur, "motion blur must default to Off");
+    check(!graphicsSettings().reduceLightFlicker, "light flicker reduction must default to Off");
     check(graphicsSettings().antialiasing == AntialiasingMode::Off, "antialiasing must default to Off");
     check(graphicsSettings().brightnessPercent == 100, "brightness must default to neutral");
     check(graphicsSettings().subtitleScalePercent == 100, "subtitles must default to the original size");
@@ -278,6 +280,35 @@ static void testVideoSettings(PPCContext& ctx) {
           graphicsSettings() == beforeMouseGraphics && fieldOfViewSetting() == beforeMouseFov &&
           !takeDisplaySettingsSaveRequest(), "mouse setting altered graphics preferences or value-button width");
     mouseInput.setMouseSensitivity(previousMouseSensitivity);
+    const auto previousMovement = movementStyle();
+    setMovementStyle(MovementStyle::Original);
+    string(block + 0x3800, "darkrecomp.movement_style");
+    call = ctx; call.r3.u64 = button; call.r4.u64 = block + 0x3200;
+    call.r5.u64 = block + 0x3000; call.r6.u64 = block + 0x3800;
+    sub_8239F0E0(call, base);
+    takeMovementStyleSaveRequest();
+    key(227);
+    check(movementStyle() == MovementStyle::Alternate && takeMovementStyleSaveRequest() &&
+          videoSettingLabel("darkrecomp.movement_style").find("ALTERNATE MOVEMENT") != std::string::npos,
+          "Original Controls dispatch must select and persist Alternate Movement");
+    check(videoSettingLabel("darkrecomp.movement_style").size() == 26, "Full alternate label retains eleven-cell hit width");
+    key(227 | 0x8000);
+    check(movementStyle() == MovementStyle::Alternate && !takeMovementStyleSaveRequest(), "release cycled movement twice");
+    key(228);
+    check(movementStyle() == MovementStyle::Original && takeMovementStyleSaveRequest(), "Confirm selects Original");
+    call = ctx; call.r3.u64 = button;
+    sub_823981D8(call, base);
+    check(movementStyle() == MovementStyle::Alternate && takeMovementStyleSaveRequest(), "Click selects Alternate");
+    key(226);
+    check(movementStyle() == MovementStyle::Original && takeMovementStyleSaveRequest(), "Left cycles movement backwards");
+    check(!changeVideoSetting("darkrecomp.movement_style", 0) && !takeMovementStyleSaveRequest(), "Invalid movement direction");
+    reportMovementStyleSave(false);
+    check(videoSettingLabel("darkrecomp.movement_style").find("SAVE FAILED") != std::string::npos &&
+          videoSettingLabel("darkrecomp.movement_style").size() == 26, "Movement save failure must retain menu width");
+    reportMovementStyleSave(true);
+    check(graphicsSettings() == beforeMouseGraphics && fieldOfViewSetting() == beforeMouseFov &&
+          !takeDisplaySettingsSaveRequest(), "Movement menu must not change display preferences");
+    setMovementStyle(previousMovement);
     string(block + 0x3500, "darkrecomp.antialiasing");
     call = ctx;
     call.r3.u64 = button; call.r4.u64 = block + 0x3200;
@@ -459,6 +490,21 @@ static void testVideoSettings(PPCContext& ctx) {
           "invalid language direction changed settings");
     check(!changeVideoSetting("cg_prevmenu()", 1) && graphicsSettings() == before,
           "non-PC script was consumed by native settings");
+    auto flickerSettings = graphicsSettings(); flickerSettings.reduceLightFlicker = false;
+    check(setGraphicsSettings(flickerSettings), "seed original flicker setting");
+    (void)takeDisplaySettingsSaveRequest();
+    for (int direction : {1, -1}) {
+        check(changeVideoSetting("darkrecomp.reduce_light_flicker", direction) &&
+              graphicsSettings().reduceLightFlicker && takeDisplaySettingsSaveRequest() &&
+              videoSettingLabel("darkrecomp.reduce_light_flicker").find("ON") != std::string::npos,
+              "light flicker reduction did not enable immediately and request persistence");
+        check(changeVideoSetting("darkrecomp.reduce_light_flicker", direction) &&
+              graphicsSettings() == flickerSettings && takeDisplaySettingsSaveRequest() &&
+              videoSettingLabel("darkrecomp.reduce_light_flicker").find("OFF") != std::string::npos,
+              "light flicker reduction did not restore original settings");
+    }
+    check(!changeVideoSetting("darkrecomp.reduce_light_flicker", 0) && graphicsSettings() == flickerSettings &&
+          !takeDisplaySettingsSaveRequest(), "invalid flicker setting direction changed state");
     for (const auto action : {"darkrecomp.vsync", "darkrecomp.mode", "darkrecomp.fps", "darkrecomp.resolution", "darkrecomp.aspect"}) {
         check(changeVideoSetting(action, 1) && validGraphicsSettings(graphicsSettings()), "native option change failed");
         check(!videoSettingLabel(action).empty(), "native option has no label");
@@ -491,13 +537,20 @@ static void testVideoSettings(PPCContext& ctx) {
     changeVideoSetting("darkrecomp.fov", -1);
     check(fieldOfViewSetting() == 0, "FOV Original is unreachable");
     changeVideoSetting("darkrecomp.fov", -1);
-    check(fieldOfViewSetting() == 120, "FOV wrap failed");
+    check(fieldOfViewSetting() == 0, "FOV slider must clamp at Original instead of wrapping");
+    check(nativeMenuSliderPosition("darkrecomp.fov") == 0, "Original FOV must be the left endpoint");
+    changeVideoSetting("darkrecomp.fov", 1);
+    check(fieldOfViewSetting() > 86 && fieldOfViewSetting() < 88, "FOV slider must increase from original baseline");
+    check(setNativeMenuSliderPosition("darkrecomp.fov", 1) && fieldOfViewSetting() == 120,
+          "FOV slider maximum");
+    check(setNativeMenuSliderPosition("darkrecomp.fov", 0) && fieldOfViewSetting() == 0,
+          "FOV slider must restore untouched Original handling");
     reportDisplaySettingsSave(false);
     check(videoSettingLabel("darkrecomp.bloom").find("SAVE FAILED") != std::string::npos, "save failure is invisible in menu");
     reportDisplaySettingsSave(true);
     // The engine gives small text two glyphs per cell. Dynamic values must
     // fit the authored eight-cell column without a font change or word wrap.
-    for (const auto action : {"darkrecomp.fov", "darkrecomp.bloom", "darkrecomp.vsync",
+    for (const auto action : {"darkrecomp.fov", "darkrecomp.bloom", "darkrecomp.reduce_light_flicker", "darkrecomp.vsync",
                               "darkrecomp.fps", "darkrecomp.resolution", "darkrecomp.mode", "darkrecomp.aspect", "darkrecomp.motionblur", "darkrecomp.antialiasing", "darkrecomp.brightness", "darkrecomp.language", "darkrecomp.subtitle_scale"}) {
         for (int i = 0; i < 128; ++i) {
             for (bool saved : {true, false}) {
